@@ -6,64 +6,47 @@ from decimal import Decimal
 
 
 @dataclass
-class LedgerEntry:
+class User:
     id: int
-    user_id: int | None
-    account_type: str
-    account_owner_id: int | None
-    asset: str
-    amount: Decimal
-    entry_type: str
-    ref_type: str
-    ref_id: int
+    telegram_id: int
+    username: str | None
+    is_frozen: bool = False
     created_at: datetime = field(default_factory=datetime.utcnow)
 
 
 @dataclass
-class EscrowLock:
-    escrow_id: int
-    user_id: int
+class BotTenant:
+    id: int
+    owner_user_id: int
+    display_name: str
+    service_fee_percent: Decimal
+    bot_token_hash: str
+    is_active: bool = True
+    created_at: datetime = field(default_factory=datetime.utcnow)
+
+
+@dataclass
+class Escrow:
+    id: int
+    tenant_bot_id: int
     asset: str
     amount: Decimal
+    buyer_user_id: int
+    seller_user_id: int
     status: str
+    description: str
+    created_at: datetime = field(default_factory=datetime.utcnow)
 
 
 @dataclass
-class WalletAddress:
-    id: int
-    user_id: int
-    asset: str
-    chain_family: str
-    address: str
-    derivation_index: int | None
-
-
-@dataclass
-class XrpRoute:
-    user_id: int
-    xrp_receive_address: str
-    destination_tag: str
-
-
-@dataclass
-class Deposit:
+class LedgerEntry:
     id: int
     user_id: int
     asset: str
     amount: Decimal
-    txid: str
-    chain_family: str
-    unique_key: str
-    confirmations: int
-    status: str
-
-
-@dataclass
-class Withdrawal:
-    id: int
-    user_id: int | None
-    asset: str
-    amount: Decimal
-    destination_address: str
-    status: str
-    txid: str | None = None
+    direction: str
+    entry_type: str
+    reference_type: str
+    reference_id: int
+    idempotency_key: str
+    created_at: datetime = field(default_factory=datetime.utcnow)
