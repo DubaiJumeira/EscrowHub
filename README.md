@@ -1,41 +1,65 @@
-# Telegram Crypto Escrow Platform
+# Telegram Crypto Escrow Platform (Multi-tenant Starter)
 
-Updated escrow architecture with final fee rules and multi-tenant bot context.
+Production-oriented refactor for a Telegram escrow platform with shared backend engine.
 
-## Final fee rules
+## What is implemented now
 
-- Platform mandatory base fee: **3%** (seller pays)
-- Tenant bot optional extra fee: **0% to 3%**
-- Total fee = platform fee + bot extra fee
-- Distribution on release:
-  - platform gets full base 3%
-  - bot owner gets full extra fee
-  - seller receives `amount - total_fee`
+- Multi-layer architecture (`apps`, `core`, `infra`, `config`, `docs`).
+- Base escrow fee policy: **3%**.
+- Tenant/bot service fee with revenue split:
+  - **30% platform owner**
+  - **70% tenant bot owner**
+- Minimum escrow validation: **$40 USD equivalent** through `PriceService` abstraction.
+- Ledger-style wallet service with available/locked balances and immutable-style entries.
+- Escrow engine scaffolding for create/release/dispute flows.
+- Migration-ready SQL schema for users, bots, escrows, ledger, disputes, withdrawals, admin actions.
 
-## Core modules
+## Required menu layout
 
-- `escrow_service.py` - escrow lifecycle/business logic
-- `fee_service.py` - fee calculations and payout breakdown
-- `wallet_service.py` - deposit addresses, internal ledger, locked balances, withdrawals via signer boundary
-- `price_service.py` - price abstraction + $40 minimum escrow validation
-- `tenant_service.py` - bot tenant config + fee settings
-- `bot.py` - Telegram handlers and menu flows
+`/start` menu in `apps/bot_main/handlers.py`:
 
-## Supported assets
+- Row 1: `Profile`, `Escrow Menu`
+- Row 2: `Check User`
+- Row 3: `Support Team`
 
-BTC, ETH, LTC, USDT, USDC, SOL, XRP
+## Supported assets (design-level)
 
-## Database
+BTC, ETH, LTC, USDT, USDC, SOL, XRP.
 
-Schema is in `infra/db/schema.sql` and includes:
-- bots tenant config
-- escrows
-- wallet addresses (+ XRP destination tags)
-- immutable ledger entries
-- deposits and withdrawals
+Chain integration is abstracted via adapters in `infra/chain_adapters/` with a mock implementation for development.
+
+## Project structure
+
+```text
+/apps/bot_main
+/apps/bot_tenant_router
+/core/escrow_engine
+/core/wallet_engine
+/core/fees
+/core/reputation
+/core/pricing
+/infra/db
+/infra/chain_adapters
+/config
+/docs
+/tests
+```
 
 ## Run tests
 
 ```bash
 python -m pytest -q
 ```
+
+## Run the Telegram app entrypoint
+
+```bash
+export TELEGRAM_BOT_TOKEN="<your-token>"
+python bot.py
+```
+
+## Notes
+
+- `bot.py` and `escrow_service.py` are preserved as compatibility entrypoints while refactoring to modular services.
+- Do not hardcode secrets; use environment variables and secret management.
+- See `docs/ARCHITECTURE.md` for architecture details, pseudocode, schema summary, and staged rollout plan.
