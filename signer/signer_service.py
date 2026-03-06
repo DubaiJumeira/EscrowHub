@@ -78,11 +78,16 @@ class LocalSignerProvider(SignerProvider):
 
 class SignerService:
     def __init__(self) -> None:
-        mode = os.getenv("SIGNER_MODE", "local")
+        mode = os.getenv("SIGNER_MODE", "vault")
         if mode not in {"local", "vault"}:
             raise RuntimeError("SIGNER_MODE must be local or vault")
-        if os.getenv("APP_ENV", "dev") == "production" and mode != "vault":
-            raise RuntimeError("production requires SIGNER_MODE=vault")
+        app_env = os.getenv("APP_ENV", "dev")
+        if app_env == "production" and mode != "vault":
+            raise RuntimeError("Invalid signer config: production requires SIGNER_MODE=vault")
+        if mode == "vault" and (not os.getenv("VAULT_ADDR") or not os.getenv("VAULT_TOKEN")):
+            raise RuntimeError("Vault signer selected but VAULT_ADDR/VAULT_TOKEN missing")
+        if mode == "local" and app_env == "production":
+            raise RuntimeError("Local signer is forbidden in production")
         self.provider: SignerProvider = VaultSignerProvider() if mode == "vault" else LocalSignerProvider()
 
     def _sign_with_asset(self, asset: str, payload: str) -> str:
