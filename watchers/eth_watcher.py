@@ -1,29 +1,28 @@
 from __future__ import annotations
 
-import logging
+from decimal import Decimal
 
-from infra.chain_adapters.eth_rpc import EthRpcAdapter
-from infra.db.database import get_connection, init_db
 from wallet_service import WalletService
 
-LOGGER = logging.getLogger(__name__)
+REQUIRED_CONFIRMATIONS = 12
 
 
-def run_once(address_user_map: dict[str, int]) -> int:
-    conn = get_connection()
-    init_db(conn)
-    try:
-        wallet = WalletService(conn)
-        adapter = EthRpcAdapter(address_user_map)
-        credited = 0
-        for dep in adapter.fetch_deposits():
-            if wallet.credit_deposit_if_confirmed(dep.user_id, dep.asset, dep.amount, dep.txid, dep.unique_key, "ETHEREUM", dep.confirmations, dep.finalized):
-                credited += 1
-        conn.commit()
-        return credited
-    except Exception:
-        conn.rollback()
-        LOGGER.exception("eth watcher failed")
-        raise
-    finally:
-        conn.close()
+class EthWatcher:
+    """Ethereum watcher skeleton supporting ETH + ERC-20 deposit idempotency."""
+
+    def __init__(self, wallet_service: WalletService) -> None:
+        self.wallet_service = wallet_service
+
+    def process_erc20_transfer(self, user_id: int, asset: str, amount: Decimal, txhash: str, log_index: int, confirmations: int) -> bool:
+        unique_key = f"{txhash}:{log_index}"
+        finalized = confirmations >= REQUIRED_CONFIRMATIONS
+        return self.wallet_service.credit_deposit_if_confirmed(
+            user_id=user_id,
+            asset=asset,
+            amount=Decimal(amount),
+            txid=txhash,
+            chain_family="ETHEREUM",
+            unique_key=unique_key,
+            confirmations=confirmations,
+            finalized=finalized,
+        )

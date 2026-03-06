@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal
 
 
@@ -9,48 +10,43 @@ class User:
     id: int
     telegram_id: int
     username: str | None
-    frozen: int
+    is_frozen: bool = False
+    created_at: datetime = field(default_factory=datetime.utcnow)
 
 
 @dataclass
-class TenantBot:
+class BotTenant:
     id: int
     owner_user_id: int
-    bot_extra_fee_percent: Decimal
-    support_contact: str | None
     display_name: str
+    service_fee_percent: Decimal
+    bot_token_hash: str
+    is_active: bool = True
+    created_at: datetime = field(default_factory=datetime.utcnow)
 
 
 @dataclass
-class WalletAddress:
+class Escrow:
     id: int
-    user_id: int
+    tenant_bot_id: int
     asset: str
-    chain_family: str
-    address: str
-    derivation_index: int | None
-    destination_tag: str | None
+    amount: Decimal
+    buyer_user_id: int
+    seller_user_id: int
+    status: str
+    description: str
+    created_at: datetime = field(default_factory=datetime.utcnow)
 
 
 @dataclass
-class Deposit:
+class LedgerEntry:
     id: int
     user_id: int
     asset: str
     amount: Decimal
-    txid: str
-    unique_key: str
-    chain_family: str
-    confirmations: int
-    status: str
-
-
-@dataclass
-class Withdrawal:
-    id: int
-    user_id: int | None
-    asset: str
-    amount: Decimal
-    destination_address: str
-    status: str
-    txid: str | None
+    direction: str
+    entry_type: str
+    reference_type: str
+    reference_id: int
+    idempotency_key: str
+    created_at: datetime = field(default_factory=datetime.utcnow)

@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-from infra.chain_adapters.sol_rpc import SolRpcAdapter
 
+class SolWatcher:
+    """SOL watcher placeholder. Idempotency key format: signature:instruction_index."""
 
-def run_once() -> int:
-    # TODO: Implement finalized signature scan and idempotency key signature:instruction_index
-    adapter = SolRpcAdapter()
-    _ = adapter.fetch_deposits()
-    return 0
+    def run_once(self) -> None:
+        return
