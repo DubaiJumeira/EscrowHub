@@ -1,0 +1,135 @@
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  telegram_id INTEGER UNIQUE NOT NULL,
+  username TEXT,
+  frozen INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS bots (
+  id INTEGER PRIMARY KEY,
+  owner_user_id INTEGER NOT NULL,
+  bot_extra_fee_percent TEXT NOT NULL DEFAULT '0',
+  support_contact TEXT,
+  display_name TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(owner_user_id) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS wallet_addresses (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  asset TEXT NOT NULL,
+  chain_family TEXT NOT NULL,
+  address TEXT NOT NULL,
+  derivation_index INTEGER,
+  destination_tag TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(user_id, asset),
+  FOREIGN KEY(user_id) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS deposits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  asset TEXT NOT NULL,
+  amount TEXT NOT NULL,
+  txid TEXT NOT NULL,
+  unique_key TEXT UNIQUE NOT NULL,
+  chain_family TEXT NOT NULL,
+  confirmations INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(user_id) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS withdrawals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER,
+  asset TEXT NOT NULL,
+  amount TEXT NOT NULL,
+  destination_address TEXT NOT NULL,
+  status TEXT NOT NULL,
+  txid TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(user_id) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS escrows (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  bot_id INTEGER NOT NULL,
+  buyer_id INTEGER NOT NULL,
+  seller_id INTEGER NOT NULL,
+  asset TEXT NOT NULL,
+  amount TEXT NOT NULL,
+  status TEXT NOT NULL,
+  description TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(bot_id) REFERENCES bots(id)
+);
+
+CREATE TABLE IF NOT EXISTS escrow_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  escrow_id INTEGER NOT NULL,
+  event_type TEXT NOT NULL,
+  data_json TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS disputes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  escrow_id INTEGER NOT NULL,
+  opened_by_user_id INTEGER NOT NULL,
+  reason TEXT NOT NULL,
+  status TEXT NOT NULL,
+  resolution_json TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  resolved_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS escrow_locks (
+  escrow_id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  asset TEXT NOT NULL,
+  amount TEXT NOT NULL,
+  status TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ledger_entries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_type TEXT NOT NULL,
+  account_owner_id INTEGER,
+  user_id INTEGER,
+  asset TEXT NOT NULL,
+  amount TEXT NOT NULL,
+  entry_type TEXT NOT NULL,
+  ref_type TEXT NOT NULL,
+  ref_id INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS admin_actions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  admin_user_id INTEGER NOT NULL,
+  action_type TEXT NOT NULL,
+  data_json TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+
+CREATE TABLE IF NOT EXISTS chain_scan_state (
+  chain_family TEXT PRIMARY KEY,
+  cursor TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS sweeps (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  asset TEXT NOT NULL,
+  amount TEXT NOT NULL,
+  to_cold_address TEXT NOT NULL,
+  txid TEXT,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
