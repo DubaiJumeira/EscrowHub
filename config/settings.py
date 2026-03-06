@@ -5,11 +5,13 @@ import os
 
 class Settings:
     environment = os.getenv("APP_ENV", "dev")
-    database_url = os.getenv("DATABASE_URL", "postgresql://escrow:escrow@localhost:5432/escrow")
-    encryption_key = os.getenv("ENCRYPTION_KEY", "")
+    sqlite_db_path = os.getenv("SQLITE_DB_PATH", "./escrowhub.db")
     telegram_main_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    admin_user_ids = os.getenv("ADMIN_USER_IDS", "")
 
-    btc_watcher_enabled = os.getenv("BTC_WATCHER_ENABLED", "true")
-    eth_watcher_enabled = os.getenv("ETH_WATCHER_ENABLED", "true")
-    watcher_poll_interval_seconds = int(os.getenv("WATCHER_POLL_INTERVAL_SECONDS", "30"))
-    moderator_username = os.getenv("MODERATOR_USERNAME", "")
+    eth_rpc_url = os.getenv("ETH_RPC_URL", "")
+    sol_rpc_url = os.getenv("SOL_RPC_URL", "")
+    xrp_rpc_url = os.getenv("XRP_RPC_URL", "")
+
+    signer_mode = os.getenv("SIGNER_MODE", "local")
+    vault_addr = os.getenv("VAULT_ADDR", "")
