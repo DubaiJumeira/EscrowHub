@@ -24,7 +24,6 @@ CREATE TABLE IF NOT EXISTS wallet_addresses (
   address TEXT NOT NULL,
   derivation_index INTEGER,
   destination_tag TEXT,
-  derivation_path TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(user_id, asset),
   FOREIGN KEY(user_id) REFERENCES users(id)
@@ -115,5 +114,22 @@ CREATE TABLE IF NOT EXISTS admin_actions (
   admin_user_id INTEGER NOT NULL,
   action_type TEXT NOT NULL,
   data_json TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+
+CREATE TABLE IF NOT EXISTS chain_scan_state (
+  chain_family TEXT PRIMARY KEY,
+  cursor TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS sweeps (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  asset TEXT NOT NULL,
+  amount TEXT NOT NULL,
+  to_cold_address TEXT NOT NULL,
+  txid TEXT,
+  status TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );

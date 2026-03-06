@@ -1,55 +1,63 @@
 # EscrowHub v1 Runbook
 
 ## Required environment variables
+- `SQLITE_DB_PATH` (or migrate SQL to PostgreSQL externally)
 - `TELEGRAM_BOT_TOKEN`
-- `ADMIN_USER_IDS` (comma-separated Telegram IDs)
+- `ADMIN_USER_IDS` (comma-separated)
 - `APP_ENV` (`dev` or `production`)
-- `SQLITE_DB_PATH` (or external DB wiring)
-- `HD_WALLET_SEED_HEX` (**required for HD derivation/signing**)
-- `XRP_HOT_WALLET_ADDRESS` (**required in production for XRP deposits**)
-- `ETH_RPC_URL` (Alchemy/Infura RPC)
-- `BLOCKSTREAM_BASE_URL` (optional override)
-- `BTC_CONFIRMATIONS` / `LTC_CONFIRMATIONS` (default 3)
-- `ETH_CONFIRMATIONS` (default 12)
+- `DISPUTE_FEE_POLICY` (`waive_all` default)
+
+### Chain/RPC
+- `BLOCKSTREAM_BASE_URL`
+- `BTC_CONFIRMATIONS`, `LTC_CONFIRMATIONS`
+- `ETH_RPC_URL`, `ETH_CONFIRMATIONS`
+- `USDT_ERC20_CONTRACT`, `USDC_ERC20_CONTRACT`
 - `SOL_RPC_URL`
 - `XRP_RPC_URL`
-- `SIGNER_PROVIDER` (`hd`, `mock`, or `vault`)
-- `VAULT_ADDR`, `VAULT_TOKEN`, `VAULT_SIGN_PATH` (when `SIGNER_PROVIDER=vault`)
 
-## Seed backup policy (critical)
-- Never commit or store `HD_WALLET_SEED_HEX` in code or DB.
-- Store seed backup in offline encrypted secret manager/HSM process.
-- Rotate operational access credentials, not seed itself, unless emergency recovery protocol is triggered.
+### Signer (Vault)
+- `SIGNER_MODE=local|vault` (production must use `vault`)
+- `VAULT_ADDR`, `VAULT_TOKEN`, `VAULT_NAMESPACE` (optional)
+- `VAULT_TRANSIT_MOUNT` (default `transit`)
+- `VAULT_ETH_KEY_NAME`
 
-## Start bot backend
+### Cold sweep
+- `COLD_WALLET_ADDRESS_<ASSET>` (e.g. `COLD_WALLET_ADDRESS_ETH`)
+- `HOT_WALLET_TARGET_<ASSET>`
+- `HOT_WALLET_BUFFER_<ASSET>`
+
+## Vault Transit setup (ETH signing digest)
+```bash
+vault secrets enable transit
+vault write -f transit/keys/escrowhub-eth type=ecdsa-p256
+```
+Configure:
+```bash
+export SIGNER_MODE=vault
+export VAULT_TRANSIT_MOUNT=transit
+export VAULT_ETH_KEY_NAME=escrowhub-eth
+```
+
+## Start bot
 ```bash
 python bot.py
 ```
 
-## Run watchers
+## Watchers
 ```bash
-python -c "from watchers.eth_watcher import run_once; print(run_once({}))"
-python -c "from watchers.btc_watcher import run_once; print(run_once('BTC', {}))"
-python -c "from watchers.btc_watcher import run_once; print(run_once('LTC', {}))"
-python -c "from watchers.xrp_watcher import run_once; print(run_once({'12345': 12345}))"
-python -c "from watchers.sol_watcher import run_once; print(run_once())"
+python -c "from watchers.eth_watcher import run_once; print(run_once({'0xyourhotaddr':123}))"
+python -c "from watchers.btc_watcher import run_once; print(run_once('BTC', {'bc1...':123}))"
+python -c "from watchers.btc_watcher import run_once; print(run_once('LTC', {'ltc1...':123}))"
+python -c "from watchers.sol_watcher import run_once; print(run_once({'solAddr':123}))"
+python -c "from watchers.xrp_watcher import run_once; print(run_once('rHotWallet', {'123':123}))"
 ```
 
-## Run signer worker
+## Signer worker
 ```bash
 python -c "from infra.db.database import get_connection, init_db; from wallet_service import WalletService; from signer.signer_service import SignerService; c=get_connection(); init_db(c); w=WalletService(c); print(SignerService().process_pending_withdrawals(w)); c.commit(); c.close()"
 ```
 
-## Security notes
-- Telegram/backend process must never store private keys.
-- Signer should run as a separate process.
-- In production, missing `hdwallet`/solana libs or missing XRP hot wallet env must fail fast.
-
-## Derivation paths
-- BTC: `m/84'/0'/{user_id}'/0/0`
-- LTC: `m/84'/2'/{user_id}'/0/0`
-- ETH/USDT/USDC: `m/44'/60'/{user_id}'/0/0`
-- XRP: shared hot wallet + destination tag = user_id
-- SOL: `m/44'/501'/{user_id}'/0'` (TODO for full audited production support)
-
-Only address metadata (`address`, `derivation_index`, `derivation_path`, `destination_tag`) is stored in DB. No private keys are stored.
+## Sweep job
+```bash
+python -c "from watchers.sweep_job import run_once; print(run_once())"
+```

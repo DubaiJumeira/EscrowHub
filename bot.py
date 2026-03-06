@@ -123,6 +123,35 @@ async def resolve_dispute(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         conn.close()
 
 
+async def admin_disputes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.effective_message.reply_text("Admin only")
+        return
+    conn = get_connection()
+    init_db(conn)
+    try:
+        rows = conn.execute("SELECT id, escrow_id, reason, status FROM disputes WHERE status='open'").fetchall()
+        msg = "\n".join([f"dispute#{r['id']} escrow#{r['escrow_id']} {r['reason']}" for r in rows]) or "No open disputes"
+        await update.effective_message.reply_text(msg)
+    finally:
+        conn.close()
+
+
+async def freeze_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.effective_message.reply_text("Admin only")
+        return
+    conn = get_connection()
+    init_db(conn)
+    try:
+        tid = int(context.args[0])
+        conn.execute("UPDATE users SET frozen=1 WHERE telegram_id=?", (tid,))
+        conn.commit()
+        await update.effective_message.reply_text(f"User {tid} frozen")
+    finally:
+        conn.close()
+
+
 async def run_signer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_IDS:
         await update.effective_message.reply_text("Admin only")
@@ -174,6 +203,8 @@ def main() -> None:
     app.add_handler(CommandHandler("release", release))
     app.add_handler(CommandHandler("dispute", dispute))
     app.add_handler(CommandHandler("resolve_dispute", resolve_dispute))
+    app.add_handler(CommandHandler("admin_disputes", admin_disputes))
+    app.add_handler(CommandHandler("freeze_user", freeze_user))
     app.add_handler(CommandHandler("run_signer", run_signer))
     app.add_handler(CommandHandler("check_user", check_user))
     app.add_handler(CommandHandler("support", support_team))

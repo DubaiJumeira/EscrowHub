@@ -30,7 +30,6 @@ class WalletAddress:
     address: str
     derivation_index: int | None
     destination_tag: str | None
-    derivation_path: str | None
 
 
 @dataclass
