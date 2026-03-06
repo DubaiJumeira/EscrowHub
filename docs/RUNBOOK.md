@@ -1,11 +1,18 @@
 # EscrowHub v1 Runbook
 
 ## Required environment variables
-- `SQLITE_DB_PATH` (or migrate SQL to PostgreSQL externally)
+- `SQLITE_DB_PATH`
 - `TELEGRAM_BOT_TOKEN`
-- `ADMIN_USER_IDS` (comma-separated)
+- `ADMIN_USER_IDS`
 - `APP_ENV` (`dev` or `production`)
 - `DISPUTE_FEE_POLICY` (`waive_all` default)
+
+### HD wallet derivation
+- `HD_WALLET_SEED_HEX` (required)
+- BTC BIP84 path: `m/84'/0'/{user_id}'/0/0`
+- ETH BIP44 path: `m/44'/60'/{user_id}'/0/0`
+
+⚠️ Changing `HD_WALLET_SEED_HEX` changes all derived deposit addresses.
 
 ### Chain/RPC
 - `BLOCKSTREAM_BASE_URL`
@@ -16,23 +23,30 @@
 - `XRP_RPC_URL`
 
 ### Signer (Vault)
-- `SIGNER_MODE=local|vault` (production must use `vault`)
+- `SIGNER_MODE=local|vault` (production requires `vault`)
 - `VAULT_ADDR`, `VAULT_TOKEN`, `VAULT_NAMESPACE` (optional)
 - `VAULT_TRANSIT_MOUNT` (default `transit`)
 - `VAULT_ETH_KEY_NAME`
 
-### Cold sweep
-- `COLD_WALLET_ADDRESS_<ASSET>` (e.g. `COLD_WALLET_ADDRESS_ETH`)
+### Cold wallet addresses (addresses only; keys must stay offline)
+- `COLD_WALLET_ADDRESS_BTC`
+- `COLD_WALLET_ADDRESS_ETH`
+- `COLD_WALLET_ADDRESS_SOL`
+- `COLD_WALLET_ADDRESS_XRP`
+- `COLD_WALLET_ADDRESS_LTC`
 - `HOT_WALLET_TARGET_<ASSET>`
 - `HOT_WALLET_BUFFER_<ASSET>`
+
+## Security notes
+- Never commit `HD_WALLET_SEED_HEX`.
+- Never store private keys/xprvs/seeds in DB.
+- Cold wallet private keys must remain offline.
+- Signer handles hot-wallet/Vault-backed signing only.
 
 ## Vault Transit setup (ETH signing digest)
 ```bash
 vault secrets enable transit
 vault write -f transit/keys/escrowhub-eth type=ecdsa-p256
-```
-Configure:
-```bash
 export SIGNER_MODE=vault
 export VAULT_TRANSIT_MOUNT=transit
 export VAULT_ETH_KEY_NAME=escrowhub-eth
@@ -61,3 +75,8 @@ python -c "from infra.db.database import get_connection, init_db; from wallet_se
 ```bash
 python -c "from watchers.sweep_job import run_once; print(run_once())"
 ```
+
+## Seed rotation
+1. Create new environment and set new `HD_WALLET_SEED_HEX`.
+2. Do not reuse old addresses across environments.
+3. Migrate balances operationally before switching production traffic.

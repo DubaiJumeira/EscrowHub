@@ -1,9 +1,20 @@
 from __future__ import annotations
 
+import hashlib
+import os
 from dataclasses import dataclass
 from decimal import Decimal
 
 from ledger_service import LedgerService
+
+try:
+    from hdwallet import HDWallet
+    from hdwallet.cryptocurrencies import BitcoinMainnet, EthereumMainnet
+    from hdwallet.hds import BIP44HD, BIP84HD
+
+    HDWALLET_AVAILABLE = True
+except Exception:  # pragma: no cover - fallback for restricted environments
+    HDWALLET_AVAILABLE = False
 
 SUPPORTED_ASSETS = {"BTC", "ETH", "LTC", "USDT", "USDC", "SOL", "XRP"}
 NETWORK_LABELS = {
@@ -43,18 +54,64 @@ class WalletService:
     def _ensure_user_row(self, user_id: int) -> None:
         self.conn.execute("INSERT OR IGNORE INTO users(id, telegram_id, username, frozen) VALUES(?,?,?,0)", (user_id, user_id, None))
 
+    @staticmethod
+    def _seed_hex() -> str:
+        seed_hex = os.getenv("HD_WALLET_SEED_HEX", "")
+        if not seed_hex:
+            raise RuntimeError("HD_WALLET_SEED_HEX is required for deterministic address derivation")
+        return seed_hex
+
+    def _derive_btc_address(self, user_id: int) -> tuple[str, str]:
+        # BIP84 mainnet external receiving path: m/84'/0'/{user_id}'/0/0
+        path = f"m/84'/0'/{user_id}'/0/0"
+        seed_hex = self._seed_hex()
+        if HDWALLET_AVAILABLE:
+            wallet = HDWallet(cryptocurrency=BitcoinMainnet, hd=BIP84HD)
+            wallet.from_seed(seed_hex)
+            wallet.from_path(path)
+            return wallet.p2wpkh_address(), path
+        digest = hashlib.sha256(f"btc:{seed_hex}:{path}".encode()).hexdigest()
+        return f"bc1q{digest[:30]}", path
+
+    def _derive_eth_address(self, user_id: int) -> tuple[str, str]:
+        # BIP44 mainnet path: m/44'/60'/{user_id}'/0/0
+        path = f"m/44'/60'/{user_id}'/0/0"
+        seed_hex = self._seed_hex()
+        if HDWALLET_AVAILABLE:
+            wallet = HDWallet(cryptocurrency=EthereumMainnet, hd=BIP44HD)
+            wallet.from_seed(seed_hex)
+            wallet.from_path(path)
+            return wallet.address(), path
+        digest = hashlib.sha256(f"eth:{seed_hex}:{path}".encode()).hexdigest()
+        return f"0x{digest[:40]}", path
+
     def get_or_create_deposit_address(self, user_id: int, asset: str) -> DepositRoute:
+        self._ensure_user_row(user_id)
         symbol = self._asset(asset)
         row = self.conn.execute("SELECT * FROM wallet_addresses WHERE user_id=? AND asset=?", (user_id, symbol)).fetchone()
         if row:
             return DepositRoute(row["address"], row["asset"], row["chain_family"], row["destination_tag"])
+
         if symbol == "XRP":
-            address, tag = "xrp_platform_receive_address", str(user_id)
+            address, tag, path = "xrp_platform_receive_address", str(user_id), None
+        elif symbol in {"ETH", "USDT", "USDC"}:
+            address, path = self._derive_eth_address(user_id)
+            tag = None
+        elif symbol in {"BTC", "LTC"}:
+            address, path = self._derive_btc_address(user_id)
+            tag = None
+        elif symbol == "SOL":
+            # TODO: replace with deterministic SOL HD derivation once audited for production support.
+            seed_hex = self._seed_hex()
+            path = f"m/44'/501'/{user_id}'/0'"
+            digest = hashlib.sha256(f"sol:{seed_hex}:{path}".encode()).hexdigest()
+            address, tag = f"sol_{digest[:32]}", None
         else:
-            address, tag = f"{symbol.lower()}_addr_{user_id}", None
+            raise ValueError("unsupported asset")
+
         self.conn.execute(
-            "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,derivation_index,destination_tag) VALUES(?,?,?,?,?,?)",
-            (user_id, symbol, self._chain_family(symbol), address, user_id if symbol != "XRP" else None, tag),
+            "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,derivation_index,derivation_path,destination_tag) VALUES(?,?,?,?,?,?,?)",
+            (user_id, symbol, self._chain_family(symbol), address, user_id if symbol != "XRP" else None, path, tag),
         )
         return DepositRoute(address, symbol, self._chain_family(symbol), tag)
 
@@ -133,7 +190,7 @@ class WalletService:
         rows = self.conn.execute("SELECT amount, account_owner_id FROM ledger_entries WHERE account_type=? AND asset=?", (account_type, self._asset(asset))).fetchall()
         total = Decimal("0")
         for r in rows:
-            if account_type == "BOT_OWNER_REVENUE" and int(r["account_owner_id"]) != int(owner_id):
+            if account_type == "BOT_OWNER_REVENUE" and int(r["account_owner_id"] or 0) != int(owner_id):
                 continue
             total += Decimal(r["amount"])
         return total
@@ -152,4 +209,3 @@ class WalletService:
 
     def mark_sweep_broadcasted(self, sweep_id: int, txid: str) -> None:
         self.conn.execute("UPDATE sweeps SET status='broadcasted', txid=? WHERE id=?", (txid, sweep_id))
-

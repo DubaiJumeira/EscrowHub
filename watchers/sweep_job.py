@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 import os
 from decimal import Decimal
 
 from infra.db.database import get_connection, init_db
 from signer.signer_service import SignerService
 from wallet_service import SUPPORTED_ASSETS, WalletService
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _target(asset: str) -> Decimal:
@@ -34,11 +37,13 @@ def run_once() -> int:
             balance = wallet.account_revenue_balance("PLATFORM_REVENUE", None, asset)
             threshold = _target(asset) + _buffer(asset)
             if balance <= threshold:
+                LOGGER.info("Sweep skip %s balance=%s threshold=%s", asset, balance, threshold)
                 continue
             amount = balance - _target(asset)
             sweep_id = wallet.create_platform_sweep(asset, amount, cold)
             txid = signer._sign_with_asset(asset, f"sweep:{asset}:{amount}:{cold}")
             wallet.mark_sweep_broadcasted(sweep_id, txid)
+            LOGGER.info("Sweep %s amount=%s txid=%s", asset, amount, txid)
             count += 1
         conn.commit()
         return count
