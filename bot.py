@@ -11,7 +11,6 @@ from infra.db.database import get_connection, init_db
 from signer.signer_service import SignerService
 from tenant_service import TenantService
 from wallet_service import NETWORK_LABELS, WalletService
-from watcher_status_service import read_watcher_status
 
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()}
 
@@ -124,6 +123,35 @@ async def resolve_dispute(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         conn.close()
 
 
+async def admin_disputes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.effective_message.reply_text("Admin only")
+        return
+    conn = get_connection()
+    init_db(conn)
+    try:
+        rows = conn.execute("SELECT id, escrow_id, reason, status FROM disputes WHERE status='open'").fetchall()
+        msg = "\n".join([f"dispute#{r['id']} escrow#{r['escrow_id']} {r['reason']}" for r in rows]) or "No open disputes"
+        await update.effective_message.reply_text(msg)
+    finally:
+        conn.close()
+
+
+async def freeze_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.effective_message.reply_text("Admin only")
+        return
+    conn = get_connection()
+    init_db(conn)
+    try:
+        tid = int(context.args[0])
+        conn.execute("UPDATE users SET frozen=1 WHERE telegram_id=?", (tid,))
+        conn.commit()
+        await update.effective_message.reply_text(f"User {tid} frozen")
+    finally:
+        conn.close()
+
+
 async def run_signer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_IDS:
         await update.effective_message.reply_text("Admin only")
@@ -136,33 +164,6 @@ async def run_signer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     finally:
         conn.close()
 
-
-
-
-async def watcher_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.effective_message.reply_text("Admin only")
-        return
-    conn, _, _, _ = _services()
-    try:
-        status = read_watcher_status(conn, ["btc_watcher", "eth_watcher"])
-        b = status["btc_watcher"]
-        e = status["eth_watcher"]
-        msg = (
-            f"BTC watcher\n"
-            f"- last run: {b['last_run_at']}\n"
-            f"- last success: {b['last_success_at']}\n"
-            f"- consecutive failures: {b['consecutive_failures']}\n"
-            f"- last error: {b['last_error']}\n\n"
-            f"ETH watcher\n"
-            f"- last run: {e['last_run_at']}\n"
-            f"- last success: {e['last_success_at']}\n"
-            f"- consecutive failures: {e['consecutive_failures']}\n"
-            f"- last error: {e['last_error']}"
-        )
-        await update.effective_message.reply_text(msg)
-    finally:
-        conn.close()
 
 async def check_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text("Check User: reputation/trade stats are tracked in DB services.")
@@ -202,8 +203,9 @@ def main() -> None:
     app.add_handler(CommandHandler("release", release))
     app.add_handler(CommandHandler("dispute", dispute))
     app.add_handler(CommandHandler("resolve_dispute", resolve_dispute))
+    app.add_handler(CommandHandler("admin_disputes", admin_disputes))
+    app.add_handler(CommandHandler("freeze_user", freeze_user))
     app.add_handler(CommandHandler("run_signer", run_signer))
-    app.add_handler(CommandHandler("watcher_status", watcher_status))
     app.add_handler(CommandHandler("check_user", check_user))
     app.add_handler(CommandHandler("support", support_team))
     app.add_handler(CallbackQueryHandler(on_menu_click))
