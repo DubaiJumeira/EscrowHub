@@ -18,6 +18,3 @@ class ChainDeposit:
 class ChainAdapter:
     def fetch_deposits(self) -> list[ChainDeposit]:
         raise NotImplementedError
-
-    def broadcast_raw_transaction(self, asset: str, raw_tx_hex: str) -> str:
-        raise NotImplementedError
