@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -29,6 +30,7 @@ class EscrowService:
         self.tenant_service = TenantService(conn)
         self.fee_service = FeeService()
         self.price_service = price_service or StaticPriceService({"BTC": Decimal("65000"), "ETH": Decimal("3500"), "LTC": Decimal("80"), "USDT": Decimal("1"), "USDC": Decimal("1"), "SOL": Decimal("150"), "XRP": Decimal("0.55")})
+        self.dispute_fee_policy = os.getenv("DISPUTE_FEE_POLICY", "waive_all")
 
     def create_escrow(self, bot_id: int, buyer_id: int, seller_id: int, asset: str, amount: Decimal, description: str) -> EscrowView:
         tenant = self.tenant_service.get_tenant(bot_id)
@@ -73,8 +75,11 @@ class EscrowService:
         if resolution == "release_seller":
             tenant = self.tenant_service.get_tenant(int(row["bot_id"]))
             amount = Decimal(row["amount"])
-            fees = self.fee_service.apply_payouts(amount, tenant.bot_extra_fee_percent)
-            self.wallet_service.release_escrow(escrow_id, int(row["seller_id"]), fees.platform_fee, fees.bot_fee, fees.seller_payout, tenant.owner_user_id, row["asset"])
+            if self.dispute_fee_policy == "waive_all":
+                self.wallet_service.release_escrow(escrow_id, int(row["seller_id"]), Decimal("0"), Decimal("0"), amount, tenant.owner_user_id, row["asset"])
+            else:
+                fees = self.fee_service.apply_payouts(amount, tenant.bot_extra_fee_percent)
+                self.wallet_service.release_escrow(escrow_id, int(row["seller_id"]), fees.platform_fee, fees.bot_fee, fees.seller_payout, tenant.owner_user_id, row["asset"])
         elif resolution == "refund_buyer":
             self.wallet_service.cancel_escrow_lock(escrow_id)
         elif resolution == "split":
