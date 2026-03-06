@@ -15,10 +15,6 @@ from wallet_service import NETWORK_LABELS, WalletService
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()}
 
 
-def is_admin_user(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-
 def _services():
     conn = get_connection()
     init_db(conn)
@@ -113,7 +109,7 @@ async def dispute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def resolve_dispute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin_user(update.effective_user.id):
+    if update.effective_user.id not in ADMIN_IDS:
         await update.effective_message.reply_text("Admin only")
         return
     conn, _, tenant, escrow = _services()
@@ -128,7 +124,7 @@ async def resolve_dispute(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def admin_disputes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin_user(update.effective_user.id):
+    if update.effective_user.id not in ADMIN_IDS:
         await update.effective_message.reply_text("Admin only")
         return
     conn = get_connection()
@@ -142,7 +138,7 @@ async def admin_disputes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def freeze_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin_user(update.effective_user.id):
+    if update.effective_user.id not in ADMIN_IDS:
         await update.effective_message.reply_text("Admin only")
         return
     conn = get_connection()
@@ -156,23 +152,8 @@ async def freeze_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         conn.close()
 
 
-async def unfreeze_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin_user(update.effective_user.id):
-        await update.effective_message.reply_text("Admin only")
-        return
-    conn = get_connection()
-    init_db(conn)
-    try:
-        tid = int(context.args[0])
-        conn.execute("UPDATE users SET frozen=0 WHERE telegram_id=?", (tid,))
-        conn.commit()
-        await update.effective_message.reply_text(f"User {tid} unfrozen")
-    finally:
-        conn.close()
-
-
 async def run_signer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin_user(update.effective_user.id):
+    if update.effective_user.id not in ADMIN_IDS:
         await update.effective_message.reply_text("Admin only")
         return
     conn, wallet, _, _ = _services()
@@ -224,7 +205,6 @@ def main() -> None:
     app.add_handler(CommandHandler("resolve_dispute", resolve_dispute))
     app.add_handler(CommandHandler("admin_disputes", admin_disputes))
     app.add_handler(CommandHandler("freeze_user", freeze_user))
-    app.add_handler(CommandHandler("unfreeze_user", unfreeze_user))
     app.add_handler(CommandHandler("run_signer", run_signer))
     app.add_handler(CommandHandler("check_user", check_user))
     app.add_handler(CommandHandler("support", support_team))

@@ -29,7 +29,6 @@ class WalletAddress:
     chain_family: str
     address: str
     derivation_index: int | None
-    derivation_path: str | None
     destination_tag: str | None
 
 
@@ -55,19 +54,3 @@ class Withdrawal:
     destination_address: str
     status: str
     txid: str | None
-
-
-@dataclass
-class ChainScanState:
-    chain_family: str
-    cursor: str
-
-
-@dataclass
-class Sweep:
-    id: int
-    asset: str
-    amount: Decimal
-    to_cold_address: str
-    txid: str | None
-    status: str

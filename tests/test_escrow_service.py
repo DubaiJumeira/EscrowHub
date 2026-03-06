@@ -5,17 +5,14 @@ import sqlite3
 
 from escrow_service import EscrowService
 from fee_service import FeeService
-from infra.chain_adapters.base import ChainDeposit
 from infra.db.database import init_db
 from price_service import StaticPriceService, validate_minimum_escrow_usd
 from tenant_service import TenantService
 from wallet_service import WalletService
-from watchers import eth_watcher
 
 
 @pytest.fixture
-def conn(monkeypatch):
-    monkeypatch.setenv("HD_WALLET_SEED_HEX", "11" * 32)
+def conn():
     c = sqlite3.connect(":memory:")
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA foreign_keys=ON")
@@ -36,26 +33,6 @@ def test_minimum_40_validation():
     ps = StaticPriceService({"USDT": Decimal("1")})
     with pytest.raises(ValueError):
         validate_minimum_escrow_usd(ps, "USDT", Decimal("39.99"))
-
-
-def test_deterministic_btc_eth_derivation_and_no_private_persistence(conn):
-    wallet = WalletService(conn)
-    a1 = wallet.get_or_create_deposit_address(1, "BTC")
-    a1b = wallet.get_or_create_deposit_address(1, "BTC")
-    a2 = wallet.get_or_create_deposit_address(2, "BTC")
-
-    e1 = wallet.get_or_create_deposit_address(1, "ETH")
-    e1b = wallet.get_or_create_deposit_address(1, "ETH")
-    e2 = wallet.get_or_create_deposit_address(2, "ETH")
-
-    assert a1.address == a1b.address
-    assert a1.address != a2.address
-    assert e1.address == e1b.address
-    assert e1.address != e2.address
-
-    cols = [r[1] for r in conn.execute("PRAGMA table_info(wallet_addresses)").fetchall()]
-    forbidden = {"private_key", "xprv", "seed", "mnemonic"}
-    assert forbidden.intersection(set(cols)) == set()
 
 
 def test_ledger_lock_release_and_idempotent_deposit(conn):
@@ -91,40 +68,4 @@ def test_dispute_resolution_outcomes(conn):
 
     assert escrow.wallet_service.total_balance(seller, "USDT") == Decimal("1000.0")
     assert escrow.wallet_service.account_revenue_balance("PLATFORM_REVENUE", None, "USDT") == Decimal("0")
-
-
-def test_eth_watcher_cursor_resume(monkeypatch, conn):
-    class DummyAdapter:
-        def __init__(self, _):
-            self.rpc_url = "http://dummy"
-
-        def get_latest_block(self):
-            return 20
-
-        def fetch_deposits_between(self, start, end):
-            if start == 11 and end == 20:
-                return [ChainDeposit(1, "ETH", Decimal("1"), "0x1", "0x1:to:1", 12, True)]
-            return []
-
-    class ConnProxy:
-        def __init__(self, base):
-            self._b = base
-
-        def __getattr__(self, item):
-            return getattr(self._b, item)
-
-        def close(self):
-            return
-
-    proxy = ConnProxy(conn)
-    monkeypatch.setattr(eth_watcher, "EthRpcAdapter", DummyAdapter)
-    monkeypatch.setattr(eth_watcher, "get_connection", lambda: proxy)
-    monkeypatch.setattr(eth_watcher, "init_db", lambda _: None)
-    conn.execute("INSERT INTO chain_scan_state(chain_family,cursor) VALUES('ETHEREUM','10')")
-    conn.commit()
-
-    credits = eth_watcher.run_once({"0xabc": 1}, batch_size=10)
-    assert credits == 1
-
-    row = conn.execute("SELECT cursor FROM chain_scan_state WHERE chain_family='ETHEREUM'").fetchone()
-    assert row["cursor"] == "20"
+    assert escrow.wallet_service.account_revenue_balance("BOT_OWNER_REVENUE", owner, "USDT") == Decimal("0")

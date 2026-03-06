@@ -23,7 +23,6 @@ CREATE TABLE IF NOT EXISTS wallet_addresses (
   chain_family TEXT NOT NULL,
   address TEXT NOT NULL,
   derivation_index INTEGER,
-  derivation_path TEXT,
   destination_tag TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(user_id, asset),
