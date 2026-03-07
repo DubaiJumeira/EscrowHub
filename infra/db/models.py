@@ -30,6 +30,7 @@ class WalletAddress:
     address: str
     derivation_index: int | None
     destination_tag: str | None
+    derivation_path: str | None
 
 
 @dataclass
@@ -54,3 +55,13 @@ class Withdrawal:
     destination_address: str
     status: str
     txid: str | None
+
+
+@dataclass
+class Review:
+    id: int
+    reviewer_id: int
+    reviewed_id: int
+    escrow_id: int
+    rating: int
+    created_at: str

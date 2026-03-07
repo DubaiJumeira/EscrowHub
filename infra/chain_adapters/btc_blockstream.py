@@ -1,10 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 from decimal import Decimal
-
-import json
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from infra.chain_adapters.base import ChainAdapter, ChainDeposit
 
@@ -26,6 +25,11 @@ class BlockstreamUtxoAdapter(ChainAdapter):
                 conf = tx.get("status", {}).get("confirmations", 0)
                 for idx, vout in enumerate(tx.get("vout", [])):
                     if vout.get("scriptpubkey_address") == address:
-                        sats = Decimal(vout["value"]) / Decimal("100000000")
-                        out.append(ChainDeposit(user_id, self.asset, sats, txid, f"{txid}:{idx}", conf, conf >= self.min_conf))
+                        amount = Decimal(vout["value"]) / Decimal("100000000")
+                        out.append(ChainDeposit(user_id, self.asset, amount, txid, f"{txid}:{idx}", conf, conf >= self.min_conf))
         return out
+
+    def broadcast_raw_transaction(self, asset: str, raw_tx_hex: str) -> str:
+        req = Request(f"{self.base}/tx", method="POST", data=raw_tx_hex.encode())
+        with urlopen(req, timeout=20) as resp:
+            return resp.read().decode().strip()

@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS wallet_addresses (
   address TEXT NOT NULL,
   derivation_index INTEGER,
   destination_tag TEXT,
+  derivation_path TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(user_id, asset),
   FOREIGN KEY(user_id) REFERENCES users(id)
@@ -62,7 +63,7 @@ CREATE TABLE IF NOT EXISTS escrows (
   seller_id INTEGER NOT NULL,
   asset TEXT NOT NULL,
   amount TEXT NOT NULL,
-  status TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending','active','completed','cancelled','disputed')),
   description TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -118,18 +119,22 @@ CREATE TABLE IF NOT EXISTS admin_actions (
 );
 
 
-CREATE TABLE IF NOT EXISTS chain_scan_state (
-  chain_family TEXT PRIMARY KEY,
-  cursor TEXT NOT NULL,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE IF NOT EXISTS watcher_status (
+  watcher_name TEXT PRIMARY KEY,
+  last_run_at TEXT,
+  last_success_at TEXT,
+  last_error TEXT,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT
 );
 
-CREATE TABLE IF NOT EXISTS sweeps (
+
+CREATE TABLE IF NOT EXISTS reviews (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  asset TEXT NOT NULL,
-  amount TEXT NOT NULL,
-  to_cold_address TEXT NOT NULL,
-  txid TEXT,
-  status TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  reviewer_id INTEGER NOT NULL,
+  reviewed_id INTEGER NOT NULL,
+  escrow_id INTEGER NOT NULL,
+  rating INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(reviewer_id, escrow_id)
 );
