@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 import sqlite3
 
-from bot import _notify_safe, _render_user_profile, _user_profile
+from bot import _clear_draft_flow, _is_user_frozen, _notify_safe, _render_user_profile, _user_profile
 from escrow_service import EscrowService
 from fee_service import FeeService
 from hd_wallet import HDWalletDeriver
@@ -14,6 +14,7 @@ from signer.signer_service import HDWalletSignerProvider
 from tenant_service import TenantService
 from wallet_service import WalletService
 from watchers.eth_watcher import run_once as run_eth_once
+from watchers.notify import notify_deposit_credited
 from watcher_status_service import read_watcher_status, upsert_watcher_status
 
 
@@ -235,3 +236,35 @@ def test_check_user_profile_render_uses_db_metrics(conn):
     assert "@seller" in rendered
     assert "Rating: 5.00" in rendered
     assert "Deals: 1" in rendered
+
+
+def test_cancel_flow_clears_only_draft_keys():
+    context = SimpleNamespace(user_data={
+        "seller_id": 1,
+        "amount": Decimal("10"),
+        "custom": "keep",
+    })
+    removed = _clear_draft_flow(context)
+    assert removed is True
+    assert "seller_id" not in context.user_data
+    assert "amount" not in context.user_data
+    assert context.user_data["custom"] == "keep"
+
+
+def test_is_user_frozen_reads_db_flag(conn):
+    conn.execute("INSERT INTO users(telegram_id, username, frozen) VALUES(?,?,?)", (999, "frozen_user", 1))
+    assert _is_user_frozen(conn, 999) is True
+    assert _is_user_frozen(conn, 1000) is False
+
+
+def test_deposit_notify_failure_is_swallowed(monkeypatch, conn):
+    conn.execute("INSERT INTO users(id, telegram_id, username, frozen) VALUES(?,?,?,0)", (42, 42, "u42"))
+
+    class Boom:
+        def __call__(self, *args, **kwargs):
+            raise RuntimeError("net down")
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:abc")
+    monkeypatch.setattr("watchers.notify.request.urlopen", Boom())
+
+    notify_deposit_credited(conn, 42, "USDT", Decimal("5"), Decimal("10"))

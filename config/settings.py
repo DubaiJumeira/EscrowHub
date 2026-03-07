@@ -12,5 +12,5 @@ class Settings:
     btc_watcher_enabled = os.getenv("BTC_WATCHER_ENABLED", "true")
     eth_watcher_enabled = os.getenv("ETH_WATCHER_ENABLED", "true")
     watcher_poll_interval_seconds = int(os.getenv("WATCHER_POLL_INTERVAL_SECONDS", "30"))
-    MODERATOR_USERNAME = os.getenv("MODERATOR_USERNAME", "")
+    MODERATOR_USERNAME = os.getenv("MODERATOR_USERNAME", "").lstrip("@")
     moderator_username = MODERATOR_USERNAME

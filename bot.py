@@ -114,6 +114,46 @@ def _format_db_timestamp(ts: str | None) -> str:
         return ts
 
 
+DRAFT_FLOW_KEYS = {
+    "seller_id",
+    "seller_username",
+    "seller_telegram_id",
+    "seller_profile_text",
+    "buyer_id",
+    "amount",
+    "asset",
+    "conditions",
+    "escrow_id",
+    "created_label",
+    "previous_view",
+}
+
+
+def _is_user_frozen(conn, telegram_user_id: int) -> bool:
+    row = conn.execute("SELECT frozen FROM users WHERE telegram_id=?", (telegram_user_id,)).fetchone()
+    return bool(row and int(row["frozen"]))
+
+
+async def _require_not_frozen(update: Update, conn) -> bool:
+    if _is_user_frozen(conn, update.effective_user.id):
+        msg = update.effective_message
+        if msg:
+            await msg.reply_text("Your account is frozen. Please contact support.")
+        elif update.callback_query:
+            await update.callback_query.edit_message_text("Your account is frozen. Please contact support.")
+        return False
+    return True
+
+
+def _clear_draft_flow(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    removed = False
+    for key in DRAFT_FLOW_KEYS:
+        if key in context.user_data:
+            removed = True
+            context.user_data.pop(key, None)
+    return removed
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text("Welcome to EscrowHub", reply_markup=_start_menu())
 
@@ -135,6 +175,60 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         conn.close()
 
 
+
+
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    conn, wallet, tenant, _ = _services()
+    try:
+        user_id = tenant.ensure_user(update.effective_user.id, update.effective_user.username)
+        lines = ["Your balances:"]
+        for asset in ["USDT", "USDC", "BTC", "ETH", "LTC", "SOL", "XRP"]:
+            available = wallet.available_balance(user_id, asset)
+            locked = wallet.locked_balance(user_id, asset)
+            lines.append(f"- {asset}: available={available} | locked={locked}")
+        await update.effective_message.reply_text("\n".join(lines))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    conn, _, tenant, _ = _services()
+    try:
+        user_id = tenant.ensure_user(update.effective_user.id, update.effective_user.username)
+        rows = conn.execute(
+            """
+            SELECT e.id, e.asset, e.amount, e.status, e.created_at,
+                   CASE WHEN e.buyer_id=? THEN su.username ELSE bu.username END AS counterparty
+            FROM escrows e
+            LEFT JOIN users bu ON bu.id=e.buyer_id
+            LEFT JOIN users su ON su.id=e.seller_id
+            WHERE e.buyer_id=? OR e.seller_id=?
+            ORDER BY e.id DESC
+            LIMIT 10
+            """,
+            (user_id, user_id, user_id),
+        ).fetchall()
+        if not rows:
+            await update.effective_message.reply_text("No deal history yet.")
+            return
+        lines = ["Recent deals:"]
+        for r in rows:
+            created = _format_db_timestamp(r["created_at"])
+            counterparty = r["counterparty"] or "unknown"
+            lines.append(f"#{r['id']} | {r['status']} | {r['amount']} {r['asset']} | @{counterparty} | {created}")
+        await update.effective_message.reply_text("\n".join(lines))
+    finally:
+        conn.close()
+
+
+async def cancel_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if _clear_draft_flow(context):
+        await update.effective_message.reply_text("Current draft deal has been cancelled.", reply_markup=_start_menu())
+        return ConversationHandler.END
+    await update.effective_message.reply_text("There is no active draft deal to cancel.")
+    return ConversationHandler.END
+
 async def deal_check_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not context.args:
         await update.effective_message.reply_text("Usage: /check_user <@username|telegram_id>")
@@ -144,6 +238,8 @@ async def deal_check_user(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     conn, _, tenant, _ = _services()
     try:
         tenant.ensure_user(update.effective_user.id, update.effective_user.username)
+        if not await _require_not_frozen(update, conn):
+            return ConversationHandler.END
         if lookup.startswith("@"):
             row = conn.execute("SELECT * FROM users WHERE username=?", (lookup[1:],)).fetchone()
         else:
@@ -185,6 +281,9 @@ async def deal_search_result_cb(update: Update, context: ContextTypes.DEFAULT_TY
     conn, wallet, tenant, _ = _services()
     try:
         buyer_id = tenant.ensure_user(update.effective_user.id, update.effective_user.username)
+        if _is_user_frozen(conn, update.effective_user.id):
+            await query.edit_message_text("Your account is frozen. Please contact support.")
+            return ConversationHandler.END
         context.user_data["buyer_id"] = buyer_id
         seller_id = context.user_data.get("seller_id")
         if seller_id and int(seller_id) == int(buyer_id):
@@ -218,6 +317,8 @@ async def deal_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     conn, wallet, tenant, escrow_service = _services()
     try:
         buyer_id = context.user_data.get("buyer_id") or tenant.ensure_user(update.effective_user.id, update.effective_user.username)
+        if not await _require_not_frozen(update, conn):
+            return ConversationHandler.END
         seller_id = context.user_data.get("seller_id")
         asset = context.user_data.get("asset", "USDT")
 
@@ -260,6 +361,8 @@ async def deal_conditions_input(update: Update, context: ContextTypes.DEFAULT_TY
     conn, _, tenant, escrow = _services()
     try:
         buyer_id = context.user_data.get("buyer_id") or tenant.ensure_user(update.effective_user.id, update.effective_user.username)
+        if not await _require_not_frozen(update, conn):
+            return ConversationHandler.END
         seller_id = int(context.user_data["seller_id"])
         seller_username = context.user_data.get("seller_username", "unknown")
         amount = Decimal(context.user_data["amount"])
@@ -306,6 +409,9 @@ async def deal_pending_actions(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     action = query.data
+    if action != "deal_back_to_pending" and "escrow_id" not in context.user_data:
+        await query.edit_message_text("Deal context expired. Run /check_user again.", reply_markup=_start_menu())
+        return ConversationHandler.END
 
     if action == "deal_cancel_request":
         moderator = Settings.MODERATOR_USERNAME or Settings.moderator_username or "moderator"
@@ -316,13 +422,29 @@ async def deal_pending_actions(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return DEAL_CANCEL_INFO
 
-    if action in {"deal_back_pending", "deal_back_to_pending"}:
+    if action == "deal_back_pending":
+        return await _show_pending_list(query, context)
+
+    if action == "deal_back_to_pending":
         return await _show_pending_view(query, context)
 
     if action == "deal_view_counterparty":
         context.user_data["previous_view"] = "counterparty"
+        seller_id = context.user_data.get("seller_id")
+        if not seller_id:
+            await query.edit_message_text("Deal context expired. Run /check_user again.", reply_markup=_start_menu())
+            return ConversationHandler.END
+        conn, _, _, _ = _services()
+        try:
+            row = conn.execute("SELECT * FROM users WHERE id=?", (int(seller_id),)).fetchone()
+            if not row:
+                await query.edit_message_text("Counter-party not found", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="deal_back_to_pending")]]))
+                return DEAL_PENDING_VIEW
+            profile_txt = _render_user_profile(_user_profile(conn, row))
+        finally:
+            conn.close()
         await query.edit_message_text(
-            f"Counter-party: @{context.user_data.get('seller_username','unknown')}",
+            profile_txt,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="deal_back_to_pending")]]),
         )
         return DEAL_PENDING_VIEW
@@ -341,6 +463,27 @@ async def deal_pending_actions(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 
+
+
+
+async def _show_pending_list(query, context: ContextTypes.DEFAULT_TYPE) -> int:
+    conn, _, tenant, escrow = _services()
+    try:
+        user_id = context.user_data.get("buyer_id") or tenant.ensure_user(query.from_user.id, query.from_user.username)
+        rows = escrow.list_pending_escrows(user_id)
+    finally:
+        conn.close()
+
+    if not rows:
+        await query.edit_message_text("No pending deals.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="deal_back_to_pending")]]))
+        return DEAL_PENDING_VIEW
+
+    lines = ["Pending deals:"]
+    for r in rows[:10]:
+        lines.append(f"#{r['id']} | {r['amount']} {r['asset']} | status={r['status']} | {_format_db_timestamp(r['created_at'])}")
+    lines.append("Tap Back to return to current deal view.")
+    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="deal_back_to_pending")]]))
+    return DEAL_PENDING_VIEW
 
 async def deal_cancel_info_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -388,6 +531,8 @@ async def deal_release_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     conn, _, tenant, escrow = _services()
     try:
         buyer_id = context.user_data.get("buyer_id") or tenant.ensure_user(update.effective_user.id, update.effective_user.username)
+        if not await _require_not_frozen(update, conn):
+            return ConversationHandler.END
         if "escrow_id" not in context.user_data:
             await query.edit_message_text("Deal context expired. Run /check_user again.", reply_markup=_start_menu())
             return ConversationHandler.END
@@ -613,13 +758,16 @@ def main() -> None:
             DEAL_RATE_SELLER: [CallbackQueryHandler(deal_rate_seller, pattern=r"^deal_(rate_seller:\d+|finish)$")],
             DEAL_RATE_BUYER: [CallbackQueryHandler(deal_rate_seller, pattern="^deal_finish$")],
         },
-        fallbacks=[CommandHandler("start", start)],
+        fallbacks=[CommandHandler("start", start), CommandHandler("cancel", cancel_flow)],
         per_chat=True,
         per_user=True,
     )
 
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("balance", balance))
+    app.add_handler(CommandHandler("history", history))
+    app.add_handler(CommandHandler("cancel", cancel_flow))
     app.add_handler(CommandHandler("watcher_status", watcher_status))
     app.add_handler(CommandHandler("run_signer", run_signer))
     app.add_handler(CommandHandler("support", support_team))
