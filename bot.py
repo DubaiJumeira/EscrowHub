@@ -74,7 +74,8 @@ def _user_profile(conn, user_row) -> dict:
     user_id = int(user_row["id"])
     completed_deals = conn.execute("SELECT COUNT(*) c FROM escrows WHERE status='completed' AND (buyer_id=? OR seller_id=?)", (user_id, user_id)).fetchone()["c"]
     disputes = conn.execute("SELECT COUNT(*) c FROM disputes d JOIN escrows e ON e.id=d.escrow_id WHERE (e.buyer_id=? OR e.seller_id=?)", (user_id, user_id)).fetchone()["c"]
-    rating = conn.execute("SELECT AVG(rating) r FROM reviews WHERE reviewed_id=?", (user_id,)).fetchone()["r"]
+    review_stats = conn.execute("SELECT AVG(rating) r, COUNT(*) c FROM reviews WHERE reviewed_id=?", (user_id,)).fetchone()
+    rating = review_stats["r"]
     spent = conn.execute("SELECT COALESCE(SUM(CAST(amount AS REAL)),0) v FROM escrows WHERE buyer_id=? AND status='completed'", (user_id,)).fetchone()["v"]
     earned = conn.execute("SELECT COALESCE(SUM(CAST(amount AS REAL)),0) v FROM escrows WHERE seller_id=? AND status='completed'", (user_id,)).fetchone()["v"]
 
@@ -84,6 +85,7 @@ def _user_profile(conn, user_row) -> dict:
         "registered_date": user_row["created_at"],
         "trust_level": trust_level,
         "rating": float(rating) if rating is not None else 0.0,
+        "review_count": int(review_stats["c"] or 0),
         "deals": int(completed_deals),
         "spent": Decimal(str(spent)),
         "earned": Decimal(str(earned)),
@@ -93,13 +95,14 @@ def _user_profile(conn, user_row) -> dict:
 
 
 def _render_user_profile(profile: dict) -> str:
+    rating_line = "Rating: Too few reviews" if profile.get("review_count", 0) < 3 else f"Rating: {profile['rating']:.1f}/5 from {profile['review_count']} reviews"
     return (
         f"@{profile['username']}\n"
         "Seller found\n"
-        f"Registered date: {profile['registered_date']}\n"
+        f"Registered date: {_date_short(profile['registered_date'])}\n"
         f"Trust level: {profile['trust_level']}\n"
-        f"Rating: {profile['rating']:.2f}\n"
-        f"Deals: {profile['deals']}\n"
+        f"{rating_line}\n"
+        f"Completed deals: {profile['deals']}\n"
         f"Total Spent: {profile['spent']}\n"
         f"Total Earned: {profile['earned']}"
     )
@@ -140,11 +143,10 @@ def _is_user_frozen(conn, telegram_user_id: int) -> bool:
 
 async def _require_not_frozen(update: Update, conn) -> bool:
     if _is_user_frozen(conn, update.effective_user.id):
-        msg = update.effective_message
-        if msg:
-            await msg.reply_text("Your account is frozen. Please contact support.")
-        elif update.callback_query:
+        if update.callback_query:
             await update.callback_query.edit_message_text("Your account is frozen. Please contact support.")
+        elif update.effective_message:
+            await update.effective_message.reply_text("Your account is frozen. Please contact support.")
         return False
     return True
 
@@ -285,7 +287,7 @@ def _render_self_profile(conn, telegram_user, user_id: int, wallet: WalletServic
     for asset in ["USDT", "USDC", "BTC", "ETH", "LTC", "SOL", "XRP"]:
         a = wallet.available_balance(user_id, asset)
         l = wallet.locked_balance(user_id, asset)
-        lines.append(f"• {asset}: {a} (locked {l})")
+        lines.append(f"• {asset}: available {a} | locked {l}")
     trust = "High" if successful >= 20 else "Medium" if successful >= 5 else "Low"
     lines.append(f"Registered: {_date_short(registered)}")
     lines.append(f"Trust level: {trust}")
@@ -660,6 +662,8 @@ async def escrow_menu_actions(update: Update, context: ContextTypes.DEFAULT_TYPE
     lines = [title + ":"]
     if not rows:
         lines.append("None")
+        if title == "Active escrows":
+            lines.append("No active state transitions are currently used in the default buyer flow.")
     else:
         for r in rows[:10]:
             lines.append(f"#{r['id']} | {r['amount']} {r['asset']} | {r['status']} | {_format_db_timestamp(r['created_at'])}")
@@ -1109,6 +1113,17 @@ async def deal_rate_seller(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         conn.close()
 
 
+
+
+async def deal_rate_buyer_wait(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    if query.data == "deal_finish":
+        await query.edit_message_text("Done. Back to main menu.", reply_markup=_start_menu())
+        return ConversationHandler.END
+    await query.edit_message_text("Waiting for seller rating. You can return to main menu.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to Main Menu", callback_data="deal_finish")]]))
+    return DEAL_RATE_BUYER
+
 async def seller_rate_buyer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -1263,7 +1278,7 @@ def main() -> None:
             DEAL_CANCEL_INFO: [CallbackQueryHandler(deal_cancel_info_actions, pattern="^deal_back_to_pending$")],
             DEAL_RELEASE_CONFIRM: [CallbackQueryHandler(deal_release_confirm, pattern="^deal_(release_confirm|back_to_pending)$")],
             DEAL_RATE_SELLER: [CallbackQueryHandler(deal_rate_seller, pattern=r"^deal_(rate_seller:\d+|finish)$")],
-            DEAL_RATE_BUYER: [CallbackQueryHandler(deal_rate_seller, pattern="^deal_finish$")],
+            DEAL_RATE_BUYER: [CallbackQueryHandler(deal_rate_buyer_wait, pattern="^deal_finish$")],
         },
         fallbacks=[CommandHandler("start", start), CommandHandler("cancel", cancel_flow)],
         per_chat=True,

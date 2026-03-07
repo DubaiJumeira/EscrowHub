@@ -234,8 +234,8 @@ def test_check_user_profile_render_uses_db_metrics(conn):
     rendered = _render_user_profile(profile)
 
     assert "@seller" in rendered
-    assert "Rating: 5.00" in rendered
-    assert "Deals: 1" in rendered
+    assert "Rating: Too few reviews" in rendered
+    assert "Completed deals: 1" in rendered
 
 
 def test_cancel_flow_clears_only_draft_keys():
