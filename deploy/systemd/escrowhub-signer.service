@@ -1,0 +1,16 @@
+[Unit]
+Description=EscrowHub Signer Worker
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/escrowhub
+EnvironmentFile=/etc/escrowhub/escrowhub.env
+ExecStart=/usr/bin/python3 run_signer.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
