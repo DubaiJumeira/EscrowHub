@@ -6,6 +6,7 @@ from decimal import Decimal
 import os
 import re
 
+from config.settings import Settings
 from hd_wallet import HDWalletDeriver
 from ledger_service import LedgerService
 
@@ -36,11 +37,18 @@ class WalletService:
         self.ledger = LedgerService(conn)
         self.hd = HDWalletDeriver()
 
+
+    @staticmethod
+    def _ensure_asset_enabled(symbol: str) -> None:
+        if symbol == "SOL" and not Settings.sol_enabled:
+            raise ValueError("SOL is temporarily unavailable")
+
     @staticmethod
     def _asset(asset: str) -> str:
         symbol = asset.upper()
         if symbol not in SUPPORTED_ASSETS:
             raise ValueError(f"unsupported asset: {symbol}")
+        WalletService._ensure_asset_enabled(symbol)
         return symbol
 
     def _chain_family(self, asset: str) -> str:

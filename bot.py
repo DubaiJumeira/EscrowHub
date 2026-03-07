@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import os
+import time
+from collections import defaultdict, deque
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
@@ -47,6 +49,44 @@ def _parse_admin_ids() -> set[int]:
 
 
 ADMIN_IDS = _parse_admin_ids()
+
+BASE_ASSETS = ["USDT", "USDC", "BTC", "ETH", "LTC", "SOL", "XRP"]
+
+
+def _enabled_assets() -> list[str]:
+    return [a for a in BASE_ASSETS if a != "SOL" or Settings.sol_enabled]
+
+
+_RATE_BUCKETS: dict[tuple[int, str], deque[float]] = defaultdict(deque)
+
+
+def _is_rate_limited(user_id: int, action: str, limit: int, window_s: int) -> bool:
+    now = time.time()
+    key = (int(user_id), action)
+    bucket = _RATE_BUCKETS[key]
+    while bucket and (now - bucket[0]) > window_s:
+        bucket.popleft()
+    if len(bucket) >= limit:
+        return True
+    bucket.append(now)
+    return False
+
+
+async def _enforce_rate_limit(query, user_id: int, action: str, limit: int = 4, window_s: int = 10) -> bool:
+    if not _is_rate_limited(user_id, action, limit, window_s):
+        return False
+    try:
+        await query.answer("Too many requests. Please slow down.", show_alert=False)
+    except Exception:
+        pass
+    return True
+
+
+def _runtime_bot_id(conn, tenant: TenantService) -> int:
+    bot_id = int(Settings.bot_id)
+    if not tenant.get_tenant(bot_id):
+        raise ValueError(f"Tenant bot {bot_id} is not configured")
+    return bot_id
 
 (
     DEAL_SEARCH_RESULT,
@@ -305,7 +345,7 @@ def _render_self_profile(conn, telegram_user, user_id: int, wallet: WalletServic
         f"First Name: {first_name}",
         "Balance:",
     ]
-    for asset in ["USDT", "USDC", "BTC", "ETH", "LTC", "SOL", "XRP"]:
+    for asset in _enabled_assets():
         a = wallet.available_balance(user_id, asset)
         l = wallet.locked_balance(user_id, asset)
         lines.append(f"• {asset}: available {a} | locked {l}")
@@ -357,7 +397,7 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         user_id = tenant.ensure_user(update.effective_user.id, update.effective_user.username)
         lines = ["Your balances:"]
-        for asset in ["USDT", "USDC", "BTC", "ETH", "LTC", "SOL", "XRP"]:
+        for asset in _enabled_assets():
             available = wallet.available_balance(user_id, asset)
             locked = wallet.locked_balance(user_id, asset)
             lines.append(f"- {asset}: available={available} | locked={locked}")
@@ -439,7 +479,7 @@ async def profile_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data == "profile_deposit":
-        keyboard = [[InlineKeyboardButton(asset, callback_data=f"dep_asset:{asset}")] for asset in ["USDT", "BTC", "ETH", "LTC", "USDC", "SOL", "XRP"]]
+        keyboard = [[InlineKeyboardButton(asset, callback_data=f"dep_asset:{asset}")] for asset in _enabled_assets()]
         keyboard.append([InlineKeyboardButton("Cancel", callback_data="profile_open")])
         await query.edit_message_text("Deposit currency:", reply_markup=InlineKeyboardMarkup(keyboard))
         return
@@ -449,7 +489,11 @@ async def profile_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         conn, wallet, tenant, _ = _services()
         try:
             user_id = tenant.ensure_user(query.from_user.id, query.from_user.username)
-            route = wallet.get_or_create_deposit_address(user_id, asset)
+            try:
+                route = wallet.get_or_create_deposit_address(user_id, asset)
+            except ValueError as exc:
+                await query.edit_message_text(str(exc), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="profile_deposit")]]))
+                return
             lines = [f"Deposit {asset}", f"Address: {route.address}"]
             if route.destination_tag:
                 lines.append(f"Destination tag: {route.destination_tag}")
@@ -492,7 +536,7 @@ async def withdraw_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if _is_user_frozen(conn, query.from_user.id):
             await _show_frozen_callback(query)
             return ConversationHandler.END
-        available_assets = [a for a, minimum in WITHDRAW_MINIMUMS.items() if wallet.available_balance(user_id, a) >= minimum]
+        available_assets = [a for a, minimum in WITHDRAW_MINIMUMS.items() if a in _enabled_assets() and wallet.available_balance(user_id, a) >= minimum]
     finally:
         conn.close()
 
@@ -587,6 +631,8 @@ async def withdraw_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="wd_back_amount")]]),
         )
         return WD_ENTER_ADDRESS
+    if await _enforce_rate_limit(query, query.from_user.id, "withdraw_confirm", limit=3, window_s=20):
+        return WD_CONFIRM
 
     conn, wallet, tenant, _ = _services()
     try:
@@ -594,7 +640,12 @@ async def withdraw_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if _is_user_frozen(conn, query.from_user.id):
             await _show_frozen_callback(query)
             return ConversationHandler.END
-        wallet.request_withdrawal(user_id, context.user_data["wd_asset"], Decimal(context.user_data["wd_amount"]), context.user_data["wd_address"])
+        try:
+            wallet.request_withdrawal(user_id, context.user_data["wd_asset"], Decimal(context.user_data["wd_amount"]), context.user_data["wd_address"])
+        except ValueError as exc:
+            conn.rollback()
+            await query.edit_message_text(str(exc), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to Profile", callback_data="profile_open")]]))
+            return ConversationHandler.END
         conn.commit()
     finally:
         conn.close()
@@ -705,6 +756,8 @@ async def escrow_menu_actions(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def escrow_history_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
+    if await _enforce_rate_limit(query, query.from_user.id, "escrow_history", limit=12, window_s=10):
+        return
     data = query.data
     conn, _, tenant, escrow = _services()
     try:
@@ -870,7 +923,7 @@ async def deal_search_result_cb(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("You cannot create a deal with yourself", reply_markup=_start_menu())
             return ConversationHandler.END
         balances = []
-        for asset in ["USDT", "BTC", "ETH", "LTC", "USDC", "SOL", "XRP"]:
+        for asset in _enabled_assets():
             bal = wallet.available_balance(buyer_id, asset)
             if bal > 0:
                 balances.append(f"{asset}: {bal}")
@@ -949,7 +1002,16 @@ async def deal_conditions_input(update: Update, context: ContextTypes.DEFAULT_TY
         asset = context.user_data.get("asset", "USDT")
         context.user_data["conditions"] = conditions
 
-        view = escrow.create_escrow(bot_id=1, buyer_id=buyer_id, seller_id=seller_id, asset=asset, amount=amount, description=conditions)
+        if _is_rate_limited(update.effective_user.id, "create_escrow", limit=2, window_s=20):
+            await update.effective_message.reply_text("Too many requests. Please slow down.")
+            return DEAL_ENTER_CONDITIONS
+        try:
+            runtime_bot_id = _runtime_bot_id(conn, tenant)
+            view = escrow.create_escrow(bot_id=runtime_bot_id, buyer_id=buyer_id, seller_id=seller_id, asset=asset, amount=amount, description=conditions)
+        except ValueError as exc:
+            conn.rollback()
+            await update.effective_message.reply_text(str(exc))
+            return DEAL_ENTER_CONDITIONS
         context.user_data["escrow_id"] = view.escrow_id
 
         created = conn.execute("SELECT created_at FROM escrows WHERE id=?", (view.escrow_id,)).fetchone()["created_at"]
@@ -988,13 +1050,15 @@ async def deal_conditions_input(update: Update, context: ContextTypes.DEFAULT_TY
 async def deal_pending_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+    if await _enforce_rate_limit(query, query.from_user.id, "deal_pending", limit=8, window_s=10):
+        return DEAL_PENDING_VIEW
     action = query.data
     if action != "deal_back_to_pending" and "escrow_id" not in context.user_data:
         await query.edit_message_text("Deal context expired. Run /check_user again.", reply_markup=_start_menu())
         return ConversationHandler.END
 
     if action == "deal_cancel_request":
-        moderator = Settings.MODERATOR_USERNAME or Settings.moderator_username or "moderator"
+        moderator = Settings.moderator_username or "moderator"
         context.user_data["previous_view"] = "cancel_info"
         await query.edit_message_text(
             f"To cancel this deal, please contact the moderators: @{moderator}",
@@ -1104,9 +1168,10 @@ async def _show_pending_view(query, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def deal_release_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-
     if query.data == "deal_back_to_pending":
         return await _show_pending_view(query, context)
+    if await _enforce_rate_limit(query, query.from_user.id, "release_escrow", limit=2, window_s=20):
+        return DEAL_RELEASE_CONFIRM
 
     conn, _, tenant, escrow = _services()
     try:
@@ -1117,7 +1182,12 @@ async def deal_release_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.edit_message_text("Deal context expired. Run /check_user again.", reply_markup=_start_menu())
             return ConversationHandler.END
         escrow_id = int(context.user_data["escrow_id"])
-        view = escrow.release(escrow_id, actor_user_id=buyer_id)
+        try:
+            view = escrow.release(escrow_id, actor_user_id=buyer_id)
+        except ValueError as exc:
+            conn.rollback()
+            await query.edit_message_text(str(exc), reply_markup=_start_menu())
+            return ConversationHandler.END
 
         seller_username = context.user_data.get("seller_username", "unknown")
         date_row = conn.execute("SELECT updated_at FROM escrows WHERE id=?", (escrow_id,)).fetchone()["updated_at"]
@@ -1146,6 +1216,8 @@ async def deal_release_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
 async def deal_rate_seller(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+    if await _enforce_rate_limit(query, query.from_user.id, "escrow_history", limit=12, window_s=10):
+        return DEAL_RATE_SELLER
     data = query.data
 
     if data == "deal_finish":
@@ -1275,7 +1347,7 @@ async def deal_back_from_conditions(update: Update, context: ContextTypes.DEFAUL
     conn, wallet, _, _ = _services()
     try:
         balances = []
-        for asset in ["USDT", "BTC", "ETH", "LTC", "USDC", "SOL", "XRP"]:
+        for asset in _enabled_assets():
             bal = wallet.available_balance(buyer_id, asset)
             if bal > 0:
                 balances.append(f"{asset}: {bal}")

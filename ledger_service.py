@@ -14,7 +14,7 @@ class LedgerService:
             (account_type, account_owner_id, user_id, asset.upper(), str(Decimal(amount)), entry_type, ref_type, ref_id),
         )
 
-    def total_balance(self, user_id: int, asset: str) -> Decimal:
+    def _net_user_ledger_balance(self, user_id: int, asset: str) -> Decimal:
         rows = self.conn.execute(
             "SELECT amount FROM ledger_entries WHERE account_type='USER' AND account_owner_id=? AND asset=?",
             (user_id, asset.upper()),
@@ -33,12 +33,17 @@ class LedgerService:
             "SELECT amount FROM withdrawals WHERE user_id=? AND asset=? AND status='pending'",
             (user_id, asset.upper()),
         ).fetchall()
-        locked = Decimal("0")
+        reserved = Decimal("0")
         for row in locks:
-            locked += Decimal(row["amount"])
+            reserved += Decimal(row["amount"])
         for row in pending_withdrawals:
-            locked += Decimal(row["amount"])
-        return locked
+            reserved += Decimal(row["amount"])
+        return reserved
 
     def available_balance(self, user_id: int, asset: str) -> Decimal:
-        return self.total_balance(user_id, asset)
+        # Net USER ledger includes reserve debits for active escrow locks and pending withdrawals.
+        return self._net_user_ledger_balance(user_id, asset)
+
+    def total_balance(self, user_id: int, asset: str) -> Decimal:
+        # Economic total held by user = currently available + currently reserved obligations.
+        return self.available_balance(user_id, asset) + self.locked_balance(user_id, asset)
