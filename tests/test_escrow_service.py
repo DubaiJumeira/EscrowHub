@@ -4,10 +4,11 @@ from types import SimpleNamespace
 import pytest
 import sqlite3
 
-from bot import _clear_draft_flow, _is_user_frozen, _notify_safe, _render_user_profile, _user_profile
+from bot import _RATE_BUCKETS, _clear_draft_flow, _is_rate_limited, _is_user_frozen, _notify_safe, _render_user_profile, _user_profile
 from escrow_service import EscrowService
 from fee_service import FeeService
 from hd_wallet import HDWalletDeriver
+from infra.chain_adapters.eth_rpc import TRANSFER_TOPIC, EthRpcAdapter
 from infra.db.database import init_db
 from price_service import StaticPriceService, validate_minimum_escrow_usd
 from signer.signer_service import HDWalletSignerProvider
@@ -277,3 +278,46 @@ def test_wallet_resolves_telegram_id_to_internal_user_id(conn):
     wallet.credit_deposit_if_confirmed(777, "USDT", Decimal("50"), "txz", "txz:0", "ETHEREUM", 12, True)
 
     assert wallet.available_balance(internal_id, "USDT") == Decimal("50")
+
+
+def test_erc20_transfer_topic_constant_is_correct():
+    assert TRANSFER_TOPIC == "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+
+def test_eth_rpc_adapter_parses_erc20_transfer_event(monkeypatch):
+    monkeypatch.setenv("USDT_ERC20_CONTRACT", "0xdac17f958d2ee523a2206206994597c13d831ec7")
+    adapter = EthRpcAdapter({"0x1111111111111111111111111111111111111111": 99})
+    event = {
+        "address": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+        "topics": [
+            TRANSFER_TOPIC,
+            "0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "0x0000000000000000000000001111111111111111111111111111111111111111",
+        ],
+        "transactionHash": "0xabc",
+        "logIndex": "0x1",
+        "value": hex(1_500_000),
+        "confirmations": 20,
+    }
+    dep = adapter._parse_event(event)
+    assert dep is not None
+    assert dep.asset == "USDT"
+    assert dep.user_id == 99
+    assert dep.amount == Decimal("1.5")
+
+
+def test_rate_limiter_bucket_eviction(monkeypatch):
+    _RATE_BUCKETS.clear()
+    fake_time = [1000.0]
+
+    def _now():
+        return fake_time[0]
+
+    monkeypatch.setattr("bot.time.time", _now)
+    assert _is_rate_limited(1, "x", limit=2, window_s=10) is False
+    assert _is_rate_limited(1, "x", limit=2, window_s=10) is False
+    assert _is_rate_limited(1, "x", limit=2, window_s=10) is True
+    fake_time[0] = 1200.0
+    assert _is_rate_limited(2, "y", limit=2, window_s=10) is False
+    # old key should be pruned after grace window
+    assert (1, "x") not in _RATE_BUCKETS

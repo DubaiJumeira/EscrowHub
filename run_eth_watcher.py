@@ -23,6 +23,16 @@ def _address_map() -> dict[str, int]:
         return {}
 
 
+
+
+def _validate_erc20_config() -> None:
+    usdt = os.getenv("USDT_ERC20_CONTRACT", "").strip()
+    usdc = os.getenv("USDC_ERC20_CONTRACT", "").strip()
+    if not usdt:
+        LOGGER.warning("USDT_ERC20_CONTRACT is not set; USDT deposit events will be ignored")
+    if not usdc:
+        LOGGER.warning("USDC_ERC20_CONTRACT is not set; USDC deposit events will be ignored")
+
 def main() -> None:
     enabled = os.getenv("ETH_WATCHER_ENABLED", "true").lower() == "true"
     if not enabled:
@@ -30,6 +40,7 @@ def main() -> None:
         return
     interval = int(os.getenv("WATCHER_POLL_INTERVAL_SECONDS", "30"))
     LOGGER.info("starting ETH watcher loop with interval=%ss", interval)
+    _validate_erc20_config()
 
     while True:
         conn = get_connection()

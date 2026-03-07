@@ -18,9 +18,22 @@ def run_once(address_user_map: dict[str, int]) -> int:
         adapter = EthRpcAdapter(address_user_map)
         credited = 0
         for dep in adapter.fetch_deposits():
-            if wallet.credit_deposit_if_confirmed(dep.user_id, dep.asset, dep.amount, dep.txid, dep.unique_key, "ETHEREUM", dep.confirmations, dep.finalized):
-                credited += 1
-                notify_deposit_credited(conn, dep.user_id, dep.asset, dep.amount, wallet.available_balance(dep.user_id, dep.asset))
+            try:
+                did_credit = wallet.credit_deposit_if_confirmed(
+                    dep.user_id,
+                    dep.asset,
+                    dep.amount,
+                    dep.txid,
+                    dep.unique_key,
+                    "ETHEREUM",
+                    dep.confirmations,
+                    dep.finalized,
+                )
+                if did_credit:
+                    credited += 1
+                    notify_deposit_credited(conn, dep.user_id, dep.asset, dep.amount, wallet.available_balance(dep.user_id, dep.asset))
+            except Exception:
+                LOGGER.exception("failed to ingest ETH deposit event unique_key=%s", dep.unique_key)
         conn.commit()
         return credited
     except Exception:

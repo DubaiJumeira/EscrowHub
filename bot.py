@@ -58,10 +58,29 @@ def _enabled_assets() -> list[str]:
 
 
 _RATE_BUCKETS: dict[tuple[int, str], deque[float]] = defaultdict(deque)
+_MAX_RATE_BUCKETS = 10000
+_EVICTION_GRACE_S = 60
+
+
+def _prune_rate_buckets(now: float) -> None:
+    # In-process limiter only (per worker). Replaceable with shared backend later if needed.
+    stale_keys: list[tuple[int, str]] = []
+    for key, bucket in _RATE_BUCKETS.items():
+        while bucket and (now - bucket[0]) > _EVICTION_GRACE_S:
+            bucket.popleft()
+        if not bucket:
+            stale_keys.append(key)
+    for key in stale_keys:
+        _RATE_BUCKETS.pop(key, None)
 
 
 def _is_rate_limited(user_id: int, action: str, limit: int, window_s: int) -> bool:
     now = time.time()
+    _prune_rate_buckets(now)
+    if len(_RATE_BUCKETS) > _MAX_RATE_BUCKETS:
+        # deterministic shedding of oldest single-event buckets when memory grows too much
+        for key in sorted(_RATE_BUCKETS.keys())[: len(_RATE_BUCKETS) - _MAX_RATE_BUCKETS]:
+            _RATE_BUCKETS.pop(key, None)
     key = (int(user_id), action)
     bucket = _RATE_BUCKETS[key]
     while bucket and (now - bucket[0]) > window_s:
@@ -79,6 +98,13 @@ async def _enforce_rate_limit(query, user_id: int, action: str, limit: int = 4, 
         await query.answer("Too many requests. Please slow down.", show_alert=False)
     except Exception:
         pass
+    return True
+
+
+async def _enforce_text_rate_limit(update: Update, action: str, limit: int = 4, window_s: int = 10) -> bool:
+    if not _is_rate_limited(update.effective_user.id, action, limit, window_s):
+        return False
+    await update.effective_message.reply_text("Too many requests. Please slow down.")
     return True
 
 
@@ -568,6 +594,8 @@ async def withdraw_select_asset(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def withdraw_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await _enforce_text_rate_limit(update, "withdraw_amount_input", limit=6, window_s=20):
+        return WD_ENTER_AMOUNT
     asset = context.user_data.get("wd_asset")
     if not asset:
         await update.effective_message.reply_text("Withdrawal session expired")
@@ -873,6 +901,8 @@ async def escrow_history_actions(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def deal_search_input_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await _enforce_text_rate_limit(update, "deal_search_input", limit=6, window_s=15):
+        return DEAL_SEARCH_INPUT
     lookup = update.effective_message.text.strip()
     if not lookup:
         await update.effective_message.reply_text("Enter seller @username or Telegram ID:")
@@ -940,6 +970,8 @@ async def deal_search_result_cb(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def deal_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await _enforce_text_rate_limit(update, "deal_amount_input", limit=6, window_s=20):
+        return DEAL_ENTER_AMOUNT
     text = update.effective_message.text.strip()
     try:
         amount = Decimal(text)
@@ -986,6 +1018,8 @@ async def deal_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def deal_conditions_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await _enforce_text_rate_limit(update, "deal_conditions_input", limit=4, window_s=20):
+        return DEAL_ENTER_CONDITIONS
     conditions = update.effective_message.text.strip()
     if not conditions:
         await update.effective_message.reply_text("Conditions are required")
@@ -1216,7 +1250,7 @@ async def deal_release_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
 async def deal_rate_seller(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    if await _enforce_rate_limit(query, query.from_user.id, "escrow_history", limit=12, window_s=10):
+    if await _enforce_rate_limit(query, query.from_user.id, "deal_rate", limit=12, window_s=10):
         return DEAL_RATE_SELLER
     data = query.data
 
@@ -1255,12 +1289,15 @@ async def deal_rate_seller(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         conn.commit()
 
         stars = [InlineKeyboardButton("⭐", callback_data=f"deal_rate_buyer:{escrow_id}:{i}") for i in range(1, 6)]
-        await _notify_safe(
-            context,
-            context.user_data.get("seller_telegram_id"),
-            f"The buyer has released funds. Please rate your experience with @{update.effective_user.username or update.effective_user.id}",
-            InlineKeyboardMarkup([stars]),
-        )
+        try:
+            await _notify_safe(
+                context,
+                context.user_data.get("seller_telegram_id"),
+                f"The buyer has released funds. Please rate your experience with @{update.effective_user.username or update.effective_user.id}",
+                InlineKeyboardMarkup([stars]),
+            )
+        except Exception:
+            LOGGER.exception("seller rating notification failed")
         await query.edit_message_text("Your rating has been saved. Waiting for the seller's rating.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to Main Menu", callback_data="deal_finish")]]))
         return DEAL_RATE_BUYER
     finally:

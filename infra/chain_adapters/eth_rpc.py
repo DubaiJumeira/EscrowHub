@@ -7,7 +7,7 @@ from urllib.request import Request, urlopen
 
 from infra.chain_adapters.base import ChainAdapter, ChainDeposit
 
-TRANSFER_TOPIC = "0xddf252ad00000000000000000000000000000000000000000000000000000000"
+TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
 
 class EthRpcAdapter(ChainAdapter):
@@ -17,6 +17,7 @@ class EthRpcAdapter(ChainAdapter):
         self.confirmations_required = int(os.getenv("ETH_CONFIRMATIONS_REQUIRED", "12"))
         self.usdt_contract = os.getenv("USDT_ERC20_CONTRACT", "").lower()
         self.usdc_contract = os.getenv("USDC_ERC20_CONTRACT", "").lower()
+        self.network = os.getenv("ETH_NETWORK", "ethereum")
 
     def _rpc(self, method: str, params: list) -> dict:
         if not self.rpc_url:
@@ -84,11 +85,13 @@ class EthRpcAdapter(ChainAdapter):
         if amount <= Decimal("0"):
             return None
 
-        txid = event.get("txid") or event.get("transactionHash") or ""
+        txid = (event.get("txid") or event.get("transactionHash") or "").lower()
+        if not txid:
+            return None
         log_index = event.get("log_index")
         if log_index is None:
             log_index = self._hex_to_int(event.get("logIndex")) if event.get("logIndex") else 0
-        unique_key = event.get("unique_key") or f"eth:{txid}:{asset}:{log_index}:{to_addr.lower()}"
+        unique_key = event.get("unique_key") or f"{self.network}:eth:{txid}:{asset}:{log_index}:{to_addr.lower()}"
 
         confirmations = int(event.get("confirmations", 0))
         finalized = bool(event.get("finalized", confirmations >= self.confirmations_required))
