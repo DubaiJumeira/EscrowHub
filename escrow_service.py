@@ -123,12 +123,12 @@ class EscrowService:
     def list_completed_escrows_page(self, user_id: int, page: int = 1, per_page: int = 10):
         page = max(1, int(page))
         per_page = max(1, int(per_page))
-        total = self.conn.execute("SELECT COUNT(*) c FROM escrows WHERE status='completed' AND (buyer_id=? OR seller_id=?)", (user_id, user_id)).fetchone()["c"]
+        total = self.conn.execute("SELECT COUNT(*) c FROM escrows WHERE status IN ('completed','cancelled') AND (buyer_id=? OR seller_id=?)", (user_id, user_id)).fetchone()["c"]
         pages = max(1, (int(total) + per_page - 1) // per_page)
         page = min(page, pages)
         offset = (page - 1) * per_page
         rows = self.conn.execute(
-            "SELECT * FROM escrows WHERE status='completed' AND (buyer_id=? OR seller_id=?) ORDER BY id DESC LIMIT ? OFFSET ?",
+            "SELECT * FROM escrows WHERE status IN ('completed','cancelled') AND (buyer_id=? OR seller_id=?) ORDER BY id DESC LIMIT ? OFFSET ?",
             (user_id, user_id, per_page, offset),
         ).fetchall()
         return rows, page, pages
