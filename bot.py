@@ -27,7 +27,26 @@ from watcher_status_service import read_watcher_status
 LOGGER = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()}
+def _parse_admin_ids() -> set[int]:
+    raw = os.getenv("ADMIN_USER_IDS", "")
+    parsed: set[int] = set()
+    invalid: list[str] = []
+    for token in raw.split(","):
+        item = token.strip()
+        if not item:
+            continue
+        try:
+            parsed.add(int(item))
+        except ValueError:
+            invalid.append(item)
+    if invalid:
+        LOGGER.warning("Ignoring malformed ADMIN_USER_IDS values: %s", ",".join(invalid))
+    if not parsed:
+        LOGGER.warning("ADMIN_USER_IDS is empty or invalid; admin-only commands will be inaccessible")
+    return parsed
+
+
+ADMIN_IDS = _parse_admin_ids()
 
 (
     DEAL_SEARCH_RESULT,
@@ -76,8 +95,10 @@ def _user_profile(conn, user_row) -> dict:
     disputes = conn.execute("SELECT COUNT(*) c FROM disputes d JOIN escrows e ON e.id=d.escrow_id WHERE (e.buyer_id=? OR e.seller_id=?)", (user_id, user_id)).fetchone()["c"]
     review_stats = conn.execute("SELECT AVG(rating) r, COUNT(*) c FROM reviews WHERE reviewed_id=?", (user_id,)).fetchone()
     rating = review_stats["r"]
-    spent = conn.execute("SELECT COALESCE(SUM(CAST(amount AS REAL)),0) v FROM escrows WHERE buyer_id=? AND status='completed'", (user_id,)).fetchone()["v"]
-    earned = conn.execute("SELECT COALESCE(SUM(CAST(amount AS REAL)),0) v FROM escrows WHERE seller_id=? AND status='completed'", (user_id,)).fetchone()["v"]
+    spent_rows = conn.execute("SELECT amount FROM escrows WHERE buyer_id=? AND status='completed'", (user_id,)).fetchall()
+    earned_rows = conn.execute("SELECT amount FROM escrows WHERE seller_id=? AND status='completed'", (user_id,)).fetchall()
+    spent = sum((Decimal(r["amount"]) for r in spent_rows), Decimal("0"))
+    earned = sum((Decimal(r["amount"]) for r in earned_rows), Decimal("0"))
 
     trust_level = "High" if completed_deals >= 20 and disputes <= 1 else "Medium" if completed_deals >= 5 else "Low"
     return {
@@ -87,8 +108,8 @@ def _user_profile(conn, user_row) -> dict:
         "rating": float(rating) if rating is not None else 0.0,
         "review_count": int(review_stats["c"] or 0),
         "deals": int(completed_deals),
-        "spent": Decimal(str(spent)),
-        "earned": Decimal(str(earned)),
+        "spent": spent,
+        "earned": earned,
         "user_id": user_id,
         "telegram_id": int(user_row["telegram_id"]),
     }
@@ -300,13 +321,13 @@ def _render_self_profile(conn, telegram_user, user_id: int, wallet: WalletServic
     lines.append(f"Cancelled: {cancelled}")
     lines.append(f"Disputes lost: {disputes_lost}")
 
-    spent_rows = conn.execute("SELECT asset, COALESCE(SUM(CAST(amount AS REAL)),0) v FROM escrows WHERE buyer_id=? AND status='completed' GROUP BY asset", (user_id,)).fetchall()
-    earned_rows = conn.execute("SELECT asset, COALESCE(SUM(CAST(amount AS REAL)),0) v FROM escrows WHERE seller_id=? AND status='completed' GROUP BY asset", (user_id,)).fetchall()
+    spent_rows = conn.execute("SELECT asset, amount FROM escrows WHERE buyer_id=? AND status='completed'", (user_id,)).fetchall()
+    earned_rows = conn.execute("SELECT asset, amount FROM escrows WHERE seller_id=? AND status='completed'", (user_id,)).fetchall()
     lines.append("Total Spent/Earned:")
     assets = sorted({r['asset'] for r in spent_rows} | {r['asset'] for r in earned_rows})
     for asset in assets:
-        spent = next((Decimal(str(r['v'])) for r in spent_rows if r['asset'] == asset), Decimal('0'))
-        earned = next((Decimal(str(r['v'])) for r in earned_rows if r['asset'] == asset), Decimal('0'))
+        spent = sum((Decimal(r['amount']) for r in spent_rows if r['asset'] == asset), Decimal('0'))
+        earned = sum((Decimal(r['amount']) for r in earned_rows if r['asset'] == asset), Decimal('0'))
         lines.append(f"• {asset}: spent {spent} / earned {earned}")
 
     last_reviews = conn.execute(
@@ -539,6 +560,16 @@ async def withdraw_address_input(update: Update, context: ContextTypes.DEFAULT_T
     if not address:
         await update.effective_message.reply_text("Address is required")
         return WD_ENTER_ADDRESS
+    asset = context.user_data.get("wd_asset")
+    conn, wallet, _, _ = _services()
+    try:
+        try:
+            wallet.validate_withdrawal_address(asset, address)
+        except ValueError as exc:
+            await update.effective_message.reply_text(str(exc))
+            return WD_ENTER_ADDRESS
+    finally:
+        conn.close()
     context.user_data["wd_address"] = address
     await update.effective_message.reply_text(
         f"Is this address correct? {address}",
@@ -731,7 +762,46 @@ async def escrow_history_actions(update: Update, context: ContextTypes.DEFAULT_T
                 f"Outcome: {outcome}\n"
                 f"Your rating: {your_rating}"
             )
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("View Counter-Party Profile", callback_data=f"esc_hist_profile:{cp_id}:{page}:{escrow_id}")], [InlineKeyboardButton("Back", callback_data=f"esc_hist_page:{page}")]]))
+            buttons = [[InlineKeyboardButton("View Counter-Party Profile", callback_data=f"esc_hist_profile:{cp_id}:{page}:{escrow_id}")]]
+            if not rating:
+                stars = [InlineKeyboardButton(f"⭐{i}", callback_data=f"esc_hist_rate:{escrow_id}:{i}:{page}") for i in range(1, 6)]
+                buttons.append(stars)
+            buttons.append([InlineKeyboardButton("Back", callback_data=f"esc_hist_page:{page}")])
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+            return
+        if data.startswith("esc_hist_rate:"):
+            parts = _parse_callback_parts(data, "esc_hist_rate:", 5)
+            if not parts:
+                await query.edit_message_text("Rating action is stale. Please reopen history.")
+                return
+            _, _, escrow_id_str, rating_str, page = parts
+            try:
+                escrow_id = int(escrow_id_str)
+                rating_value = int(rating_str)
+            except ValueError:
+                await query.edit_message_text("Invalid rating")
+                return
+            if rating_value < 1 or rating_value > 5:
+                await query.edit_message_text("Invalid rating")
+                return
+            esc = escrow.get_escrow(escrow_id)
+            if user_id not in {int(esc["buyer_id"]), int(esc["seller_id"])}:
+                await query.edit_message_text("You are not allowed to rate this deal")
+                return
+            reviewed_id = int(esc["seller_id"]) if int(esc["buyer_id"]) == user_id else int(esc["buyer_id"])
+            existing = conn.execute("SELECT 1 FROM reviews WHERE reviewer_id=? AND escrow_id=?", (user_id, escrow_id)).fetchone()
+            if existing:
+                await query.edit_message_text("You already rated this deal.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"esc_hist_open:{escrow_id}:{page}")]]))
+                return
+            conn.execute(
+                "INSERT INTO reviews(reviewer_id,reviewed_id,escrow_id,rating) VALUES(?,?,?,?)",
+                (user_id, reviewed_id, escrow_id, rating_value),
+            )
+            conn.commit()
+            await query.edit_message_text(
+                "Your rating has been saved. Waiting for the seller's rating.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"esc_hist_open:{escrow_id}:{page}")]]),
+            )
             return
         if data.startswith("esc_hist_profile:"):
             parts = _parse_callback_parts(data, "esc_hist_profile:", 5)
@@ -1082,7 +1152,15 @@ async def deal_rate_seller(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.edit_message_text("Done. Back to main menu.", reply_markup=_start_menu())
         return ConversationHandler.END
 
-    rating = int(data.split(":")[1])
+    parts = _parse_callback_parts(data or "", "deal_rate_seller:", 2)
+    if not parts:
+        await query.edit_message_text("Invalid rating")
+        return DEAL_RATE_SELLER
+    try:
+        rating = int(parts[1])
+    except ValueError:
+        await query.edit_message_text("Invalid rating")
+        return DEAL_RATE_SELLER
     if rating < 1 or rating > 5:
         await query.edit_message_text("Invalid rating")
         return DEAL_RATE_SELLER
@@ -1094,8 +1172,12 @@ async def deal_rate_seller(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return ConversationHandler.END
         seller_id = int(context.user_data["seller_id"])
         escrow_id = int(context.user_data["escrow_id"])
+        existing = conn.execute("SELECT 1 FROM reviews WHERE reviewer_id=? AND escrow_id=?", (buyer_id, escrow_id)).fetchone()
+        if existing:
+            await query.edit_message_text("You already rated this deal.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to Main Menu", callback_data="deal_finish")]]))
+            return DEAL_RATE_BUYER
         conn.execute(
-            "INSERT OR IGNORE INTO reviews(reviewer_id,reviewed_id,escrow_id,rating) VALUES(?,?,?,?)",
+            "INSERT INTO reviews(reviewer_id,reviewed_id,escrow_id,rating) VALUES(?,?,?,?)",
             (buyer_id, seller_id, escrow_id, rating),
         )
         conn.commit()
@@ -1107,7 +1189,7 @@ async def deal_rate_seller(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"The buyer has released funds. Please rate your experience with @{update.effective_user.username or update.effective_user.id}",
             InlineKeyboardMarkup([stars]),
         )
-        await query.edit_message_text("Seller rating saved. Waiting seller rating.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to Main Menu", callback_data="deal_finish")]]))
+        await query.edit_message_text("Your rating has been saved. Waiting for the seller's rating.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to Main Menu", callback_data="deal_finish")]]))
         return DEAL_RATE_BUYER
     finally:
         conn.close()
@@ -1127,9 +1209,17 @@ async def deal_rate_buyer_wait(update: Update, context: ContextTypes.DEFAULT_TYP
 async def seller_rate_buyer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    _, escrow_id_str, rating_str = query.data.split(":")
-    escrow_id = int(escrow_id_str)
-    rating = int(rating_str)
+    parts = _parse_callback_parts(query.data or "", "deal_rate_buyer:", 3)
+    if not parts:
+        await query.edit_message_text("Invalid rating")
+        return
+    _, escrow_id_str, rating_str = parts
+    try:
+        escrow_id = int(escrow_id_str)
+        rating = int(rating_str)
+    except ValueError:
+        await query.edit_message_text("Invalid rating")
+        return
 
     conn, _, tenant, _ = _services()
     try:
@@ -1145,12 +1235,16 @@ async def seller_rate_buyer_callback(update: Update, context: ContextTypes.DEFAU
         if not seller_match:
             await query.edit_message_text("Only the seller can rate this buyer")
             return
+        existing = conn.execute("SELECT 1 FROM reviews WHERE reviewer_id=? AND escrow_id=?", (reviewer_id, escrow_id)).fetchone()
+        if existing:
+            await query.edit_message_text("You already rated this deal")
+            return
         conn.execute(
-            "INSERT OR IGNORE INTO reviews(reviewer_id,reviewed_id,escrow_id,rating) VALUES(?,?,?,?)",
+            "INSERT INTO reviews(reviewer_id,reviewed_id,escrow_id,rating) VALUES(?,?,?,?)",
             (reviewer_id, int(esc["buyer_id"]), escrow_id, rating),
         )
         conn.commit()
-        await query.edit_message_text("Thank you. Your rating was saved.")
+        await query.edit_message_text("Your rating has been saved. Waiting for the seller's rating.")
     finally:
         conn.close()
 

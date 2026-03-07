@@ -23,7 +23,7 @@ class SignedTransaction:
 
 
 class SignerProvider:
-    def sign_and_broadcast(self, asset: str, destination_address: str, amount: str) -> str:
+    def sign_and_broadcast(self, asset: str, destination_address: str, amount: str, user_id: int | None = None) -> str:
         raise NotImplementedError
 
 
@@ -33,7 +33,7 @@ class VaultSignerProvider(SignerProvider):
         self.token = os.getenv("VAULT_TOKEN", "")
         self.path = os.getenv("VAULT_SIGN_PATH", "transit/sign/escrowhub")
 
-    def sign_and_broadcast(self, asset: str, destination_address: str, amount: str) -> str:
+    def sign_and_broadcast(self, asset: str, destination_address: str, amount: str, user_id: int | None = None) -> str:
         if not self.addr or not self.token:
             raise RuntimeError("Vault signer configuration missing")
         payload = {"input": f"{asset}:{destination_address}:{amount}"}
@@ -85,8 +85,10 @@ class HDWalletSignerProvider(SignerProvider):
         signed = self._sign(raw, key.private_key_hex)
         return SignedTransaction(asset=symbol, raw_tx_hex=signed.raw_tx_hex, txid=signed.txid)
 
-    def sign_and_broadcast(self, asset: str, destination_address: str, amount: str) -> str:
-        signed = self.sign_transaction(asset, user_id=0, destination_address=destination_address, amount=amount)
+    def sign_and_broadcast(self, asset: str, destination_address: str, amount: str, user_id: int | None = None) -> str:
+        if user_id is None:
+            raise ValueError("user context is required for withdrawal signing")
+        signed = self.sign_transaction(asset, user_id=int(user_id), destination_address=destination_address, amount=amount)
         symbol = asset.upper()
         if symbol in {"BTC", "LTC"}:
             adapter = BlockstreamUtxoAdapter(symbol, {})
@@ -100,7 +102,7 @@ class HDWalletSignerProvider(SignerProvider):
 
 
 class MockSignerProvider(SignerProvider):
-    def sign_and_broadcast(self, asset: str, destination_address: str, amount: str) -> str:
+    def sign_and_broadcast(self, asset: str, destination_address: str, amount: str, user_id: int | None = None) -> str:
         return f"mock_{asset.lower()}_{destination_address[-6:]}_{amount}"
 
 
@@ -117,7 +119,16 @@ class SignerService:
     def process_pending_withdrawals(self, wallet_service) -> int:
         processed = 0
         for w in wallet_service.pending_withdrawals():
-            txid = self.provider.sign_and_broadcast(w["asset"], w["destination_address"], str(w["amount"]))
-            wallet_service.mark_withdrawal_broadcasted(w["id"], txid)
-            processed += 1
+            try:
+                txid = self.provider.sign_and_broadcast(
+                    w["asset"],
+                    w["destination_address"],
+                    str(w["amount"]),
+                    user_id=int(w["user_id"]),
+                )
+                wallet_service.mark_withdrawal_broadcasted(w["id"], txid)
+                processed += 1
+            except Exception as exc:
+                LOGGER.exception("withdrawal processing failed id=%s", w["id"])
+                wallet_service.mark_withdrawal_failed(int(w["id"]), str(exc))
         return processed

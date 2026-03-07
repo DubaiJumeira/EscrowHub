@@ -40,18 +40,35 @@ class EscrowService:
         if buyer_id == seller_id:
             raise ValueError("buyer cannot create deal with self")
         validate_minimum_escrow_usd(self.price_service, asset, Decimal(amount))
-        if self.wallet_service.available_balance(buyer_id, asset) < Decimal(amount):
-            raise ValueError("insufficient available balance")
-
-        fees = self.fee_service.calculate_total_fees(Decimal(amount), tenant.bot_extra_fee_percent)
-        cur = self.conn.execute(
-            "INSERT INTO escrows(bot_id,buyer_id,seller_id,asset,amount,status,description) VALUES(?,?,?,?,?,?,?)",
-            (bot_id, buyer_id, seller_id, asset.upper(), str(Decimal(amount)), "pending", description),
-        )
-        escrow_id = int(cur.lastrowid)
-        self.wallet_service.lock_for_escrow(escrow_id, buyer_id, asset, Decimal(amount))
-        self._event(escrow_id, "created", {"amount": str(amount), "asset": asset.upper(), "status": "pending"})
-        return EscrowView(escrow_id, bot_id, buyer_id, seller_id, asset.upper(), Decimal(amount), "pending", fees, description)
+        amount = Decimal(amount)
+        fees = self.fee_service.calculate_total_fees(amount, tenant.bot_extra_fee_percent)
+        managed_tx = not bool(getattr(self.conn, "in_transaction", False))
+        if managed_tx:
+            self.conn.execute("BEGIN IMMEDIATE")
+        else:
+            self.conn.execute("SAVEPOINT escrow_create")
+        try:
+            if self.wallet_service.available_balance(buyer_id, asset) < amount:
+                raise ValueError("insufficient available balance")
+            cur = self.conn.execute(
+                "INSERT INTO escrows(bot_id,buyer_id,seller_id,asset,amount,status,description) VALUES(?,?,?,?,?,?,?)",
+                (bot_id, buyer_id, seller_id, asset.upper(), str(amount), "pending", description),
+            )
+            escrow_id = int(cur.lastrowid)
+            self.wallet_service.lock_for_escrow(escrow_id, buyer_id, asset, amount)
+            self._event(escrow_id, "created", {"amount": str(amount), "asset": asset.upper(), "status": "pending"})
+            if managed_tx:
+                self.conn.commit()
+            else:
+                self.conn.execute("RELEASE SAVEPOINT escrow_create")
+        except Exception:
+            if managed_tx:
+                self.conn.rollback()
+            else:
+                self.conn.execute("ROLLBACK TO SAVEPOINT escrow_create")
+                self.conn.execute("RELEASE SAVEPOINT escrow_create")
+            raise
+        return EscrowView(escrow_id, bot_id, buyer_id, seller_id, asset.upper(), amount, "pending", fees, description)
 
     def release(self, escrow_id: int, actor_user_id: int) -> EscrowView:
         row = self._escrow(escrow_id)
@@ -72,6 +89,8 @@ class EscrowService:
         row = self._escrow(escrow_id)
         if row["status"] not in {"pending", "active"}:
             raise ValueError("only pending/active escrow can be disputed")
+        if int(opened_by_user_id) not in {int(row["buyer_id"]), int(row["seller_id"])}:
+            raise ValueError("only escrow participants can open disputes")
         self.conn.execute("UPDATE escrows SET status='disputed', updated_at=CURRENT_TIMESTAMP WHERE id=?", (escrow_id,))
         self.conn.execute("INSERT INTO disputes(escrow_id,opened_by_user_id,reason,status) VALUES(?,?,?,?)", (escrow_id, opened_by_user_id, reason, "open"))
         self._event(escrow_id, "disputed", {"reason": reason})
@@ -92,11 +111,16 @@ class EscrowService:
             lock = self.conn.execute("SELECT * FROM escrow_locks WHERE escrow_id=?", (escrow_id,)).fetchone()
             if not lock or lock["status"] != "locked":
                 raise ValueError("escrow lock missing")
-            seller_part = Decimal(row["amount"]) * Decimal(split_percent) / Decimal("100")
-            buyer_part = Decimal(row["amount"]) - seller_part
+            locked_amount = Decimal(lock["amount"])
+            seller_part = locked_amount * Decimal(split_percent) / Decimal("100")
+            buyer_part = locked_amount - seller_part
+            tenant = self.tenant_service.get_tenant(int(row["bot_id"]))
+            split_fees = self.fee_service.apply_payouts(seller_part, tenant.bot_extra_fee_percent)
             self.conn.execute("UPDATE escrow_locks SET status='released' WHERE escrow_id=?", (escrow_id,))
-            self.wallet_service.ledger.add_entry("USER", int(row["seller_id"]), int(row["seller_id"]), row["asset"], seller_part, "ESCROW_RELEASE", "escrow", escrow_id)
+            self.wallet_service.ledger.add_entry("USER", int(row["seller_id"]), int(row["seller_id"]), row["asset"], split_fees.seller_payout, "ESCROW_RELEASE", "escrow", escrow_id)
             self.wallet_service.ledger.add_entry("USER", int(row["buyer_id"]), int(row["buyer_id"]), row["asset"], buyer_part, "ADJUSTMENT", "escrow", escrow_id)
+            self.wallet_service.ledger.add_entry("PLATFORM_REVENUE", None, None, row["asset"], split_fees.platform_fee, "PLATFORM_FEE", "escrow", escrow_id)
+            self.wallet_service.ledger.add_entry("BOT_OWNER_REVENUE", tenant.owner_user_id, tenant.owner_user_id, row["asset"], split_fees.bot_fee, "BOT_FEE", "escrow", escrow_id)
         else:
             raise ValueError("invalid resolution")
 

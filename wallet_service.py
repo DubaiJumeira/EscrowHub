@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 import os
+import re
 
 from hd_wallet import HDWalletDeriver
 from ledger_service import LedgerService
@@ -120,14 +121,13 @@ class WalletService:
         if self.available_balance(resolved_user_id, asset) < Decimal(amount):
             raise ValueError("insufficient available balance")
         self.conn.execute("INSERT INTO escrow_locks(escrow_id,user_id,asset,amount,status) VALUES(?,?,?,?,?)", (escrow_id, resolved_user_id, self._asset(asset), str(Decimal(amount)), "locked"))
-        self.ledger.add_entry("USER", resolved_user_id, resolved_user_id, asset, Decimal("0"), "ESCROW_LOCK", "escrow", escrow_id)
+        self.ledger.add_entry("USER", resolved_user_id, resolved_user_id, asset, -Decimal(amount), "ESCROW_LOCK", "escrow", escrow_id)
 
     def release_escrow(self, escrow_id: int, seller_id: int, platform_fee: Decimal, bot_fee: Decimal, seller_payout: Decimal, bot_owner_id: int, asset: str) -> None:
         lock = self.conn.execute("SELECT * FROM escrow_locks WHERE escrow_id=?", (escrow_id,)).fetchone()
         if not lock or lock["status"] != "locked":
             raise ValueError("escrow lock missing")
         self.conn.execute("UPDATE escrow_locks SET status='released' WHERE escrow_id=?", (escrow_id,))
-        self.ledger.add_entry("USER", int(lock["user_id"]), int(lock["user_id"]), asset, -Decimal(lock["amount"]), "ESCROW_RELEASE", "escrow", escrow_id)
         self.ledger.add_entry("USER", seller_id, seller_id, asset, Decimal(seller_payout), "ESCROW_RELEASE", "escrow", escrow_id)
         self.ledger.add_entry("PLATFORM_REVENUE", None, None, asset, Decimal(platform_fee), "PLATFORM_FEE", "escrow", escrow_id)
         self.ledger.add_entry("BOT_OWNER_REVENUE", bot_owner_id, bot_owner_id, asset, Decimal(bot_fee), "BOT_FEE", "escrow", escrow_id)
@@ -137,19 +137,44 @@ class WalletService:
         if not lock or lock["status"] != "locked":
             raise ValueError("escrow lock missing")
         self.conn.execute("UPDATE escrow_locks SET status='released' WHERE escrow_id=?", (escrow_id,))
-        self.ledger.add_entry("USER", int(lock["user_id"]), int(lock["user_id"]), lock["asset"], Decimal("0"), "ADJUSTMENT", "escrow", escrow_id)
+        self.ledger.add_entry("USER", int(lock["user_id"]), int(lock["user_id"]), lock["asset"], Decimal(lock["amount"]), "ESCROW_UNLOCK", "escrow", escrow_id)
+
+
+    def _validate_withdrawal_address(self, asset: str, destination_address: str) -> None:
+        symbol = self._asset(asset)
+        address = (destination_address or "").strip()
+        if not address:
+            raise ValueError("destination address is required")
+
+        patterns = {
+            "ETH": r"^0x[a-fA-F0-9]{40}$",
+            "USDT": r"^0x[a-fA-F0-9]{40}$",
+            "USDC": r"^0x[a-fA-F0-9]{40}$",
+            "BTC": r"^(bc1[ac-hj-np-z02-9]{11,71}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})$",
+            "LTC": r"^(ltc1[ac-hj-np-z02-9]{11,71}|[LM3][a-km-zA-HJ-NP-Z1-9]{26,34})$",
+            "SOL": r"^[1-9A-HJ-NP-Za-km-z]{32,44}$",
+            "XRP": r"^r[1-9A-HJ-NP-Za-km-z]{24,34}$",
+        }
+        if not re.match(patterns[symbol], address):
+            network = NETWORK_LABELS.get(symbol, symbol)
+            raise ValueError(f"Invalid destination address for {network}")
+
+    def validate_withdrawal_address(self, asset: str, destination_address: str) -> None:
+        self._validate_withdrawal_address(asset, destination_address)
 
     def request_withdrawal(self, user_id: int, asset: str, amount: Decimal, destination_address: str):
+        symbol = self._asset(asset)
+        self._validate_withdrawal_address(symbol, destination_address)
         resolved_user_id = self._ensure_user_row(user_id)
-        if self.available_balance(resolved_user_id, asset) < Decimal(amount):
+        if self.available_balance(resolved_user_id, symbol) < Decimal(amount):
             raise ValueError("insufficient available balance")
         cur = self.conn.execute(
             "INSERT INTO withdrawals(user_id,asset,amount,destination_address,status) VALUES(?,?,?,?,?)",
-            (resolved_user_id, self._asset(asset), str(Decimal(amount)), destination_address, "pending"),
+            (resolved_user_id, symbol, str(Decimal(amount)), destination_address, "pending"),
         )
         wid = int(cur.lastrowid)
         self.ledger.add_entry("USER", resolved_user_id, resolved_user_id, asset, -Decimal(amount), "WITHDRAWAL_RESERVE", "withdrawal", wid)
-        return {"id": wid, "asset": self._asset(asset), "amount": Decimal(amount), "destination_address": destination_address}
+        return {"id": wid, "asset": symbol, "amount": Decimal(amount), "destination_address": destination_address}
 
     def pending_withdrawals(self):
         return self.conn.execute("SELECT * FROM withdrawals WHERE status='pending'").fetchall()
@@ -158,6 +183,13 @@ class WalletService:
         row = self.conn.execute("SELECT * FROM withdrawals WHERE id=?", (withdrawal_id,)).fetchone()
         self.conn.execute("UPDATE withdrawals SET status='broadcasted', txid=? WHERE id=?", (txid, withdrawal_id))
         self.ledger.add_entry("USER", row["user_id"], row["user_id"], row["asset"], Decimal("0"), "WITHDRAWAL_SENT", "withdrawal", withdrawal_id)
+
+    def mark_withdrawal_failed(self, withdrawal_id: int, reason: str) -> None:
+        row = self.conn.execute("SELECT * FROM withdrawals WHERE id=?", (withdrawal_id,)).fetchone()
+        if not row:
+            return
+        self.conn.execute("UPDATE withdrawals SET status=?, txid=? WHERE id=?", ("failed", f"ERROR: {reason}"[:255], withdrawal_id))
+        self.ledger.add_entry("USER", row["user_id"], row["user_id"], row["asset"], Decimal(row["amount"]), "WITHDRAWAL_RELEASE", "withdrawal", withdrawal_id)
 
     def account_revenue_balance(self, account_type: str, owner_id: int | None, asset: str) -> Decimal:
         rows = self.conn.execute("SELECT amount, account_owner_id FROM ledger_entries WHERE account_type=? AND asset=?", (account_type, self._asset(asset))).fetchall()

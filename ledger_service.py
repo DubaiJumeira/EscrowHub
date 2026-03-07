@@ -15,22 +15,30 @@ class LedgerService:
         )
 
     def total_balance(self, user_id: int, asset: str) -> Decimal:
-        row = self.conn.execute(
-            "SELECT COALESCE(SUM(CAST(amount AS REAL)),0) v FROM ledger_entries WHERE account_type='USER' AND account_owner_id=? AND asset=?",
+        rows = self.conn.execute(
+            "SELECT amount FROM ledger_entries WHERE account_type='USER' AND account_owner_id=? AND asset=?",
             (user_id, asset.upper()),
-        ).fetchone()
-        return Decimal(str(row["v"]))
+        ).fetchall()
+        total = Decimal("0")
+        for row in rows:
+            total += Decimal(row["amount"])
+        return total
 
     def locked_balance(self, user_id: int, asset: str) -> Decimal:
-        l = self.conn.execute(
-            "SELECT COALESCE(SUM(CAST(amount AS REAL)),0) v FROM escrow_locks WHERE user_id=? AND asset=? AND status='locked'",
+        locks = self.conn.execute(
+            "SELECT amount FROM escrow_locks WHERE user_id=? AND asset=? AND status='locked'",
             (user_id, asset.upper()),
-        ).fetchone()["v"]
-        w = self.conn.execute(
-            "SELECT COALESCE(SUM(CAST(amount AS REAL)),0) v FROM withdrawals WHERE user_id=? AND asset=? AND status='pending'",
+        ).fetchall()
+        pending_withdrawals = self.conn.execute(
+            "SELECT amount FROM withdrawals WHERE user_id=? AND asset=? AND status='pending'",
             (user_id, asset.upper()),
-        ).fetchone()["v"]
-        return Decimal(str(l)) + Decimal(str(w))
+        ).fetchall()
+        locked = Decimal("0")
+        for row in locks:
+            locked += Decimal(row["amount"])
+        for row in pending_withdrawals:
+            locked += Decimal(row["amount"])
+        return locked
 
     def available_balance(self, user_id: int, asset: str) -> Decimal:
-        return self.total_balance(user_id, asset) - self.locked_balance(user_id, asset)
+        return self.total_balance(user_id, asset)
