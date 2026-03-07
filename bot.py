@@ -38,7 +38,8 @@ ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.str
     DEAL_RELEASE_CONFIRM,
     DEAL_RATE_SELLER,
     DEAL_RATE_BUYER,
-) = range(8)
+    DEAL_SEARCH_INPUT,
+) = range(9)
 
 
 def _services():
@@ -157,6 +158,78 @@ def _clear_draft_flow(context: ContextTypes.DEFAULT_TYPE) -> bool:
     return removed
 
 
+def _parse_callback_int(data: str, prefix: str) -> int | None:
+    if not data.startswith(prefix):
+        return None
+    try:
+        return int(data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        return None
+
+
+def _parse_callback_parts(data: str, expected_prefix: str, expected_len: int) -> list[str] | None:
+    parts = data.split(":")
+    if len(parts) != expected_len or not data.startswith(expected_prefix):
+        return None
+    return parts
+
+
+async def _show_frozen_callback(query) -> None:
+    await query.edit_message_text("Your account is frozen. Please contact support.")
+
+
+def _render_profile_text(conn, wallet: WalletService, tenant: TenantService, telegram_user) -> str:
+    user_id = tenant.ensure_user(telegram_user.id, telegram_user.username)
+    return _render_self_profile(conn, telegram_user, user_id, wallet)
+
+
+async def _show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_existing: bool = False) -> None:
+    conn, wallet, tenant, _ = _services()
+    try:
+        text = _render_profile_text(conn, wallet, tenant, update.effective_user)
+        conn.commit()
+    finally:
+        conn.close()
+
+    if edit_existing and update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=_profile_menu())
+    else:
+        await update.effective_message.reply_text(text, reply_markup=_profile_menu())
+
+
+async def _seller_lookup_and_render(update: Update, context: ContextTypes.DEFAULT_TYPE, lookup: str) -> int:
+    conn, _, tenant, _ = _services()
+    try:
+        tenant.ensure_user(update.effective_user.id, update.effective_user.username)
+        if not await _require_not_frozen(update, conn):
+            return ConversationHandler.END
+        if lookup.startswith("@"):
+            row = conn.execute("SELECT * FROM users WHERE username=?", (lookup[1:],)).fetchone()
+        else:
+            try:
+                tg = int(lookup)
+            except ValueError:
+                row = None
+            else:
+                row = conn.execute("SELECT * FROM users WHERE telegram_id=?", (tg,)).fetchone()
+        if not row:
+            await update.effective_message.reply_text("Seller not found")
+            return ConversationHandler.END
+
+        profile_data = _user_profile(conn, row)
+        context.user_data["seller_id"] = profile_data["user_id"]
+        context.user_data["seller_username"] = profile_data["username"]
+        context.user_data["seller_telegram_id"] = profile_data["telegram_id"]
+
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="deal_back_main"), InlineKeyboardButton("Create Deal", callback_data="deal_create")]])
+        profile_text = _render_user_profile(profile_data)
+        context.user_data["seller_profile_text"] = profile_text
+        await update.effective_message.reply_text(profile_text, reply_markup=keyboard)
+        conn.commit()
+        return DEAL_SEARCH_RESULT
+    finally:
+        conn.close()
+
 WITHDRAW_MINIMUMS = {
     "USDT": Decimal("100"),
     "USDC": Decimal("100"),
@@ -253,14 +326,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    conn, wallet, tenant, _ = _services()
-    try:
-        user_id = tenant.ensure_user(update.effective_user.id, update.effective_user.username)
-        text = _render_self_profile(conn, update.effective_user, user_id, wallet)
-        await update.effective_message.reply_text(text, reply_markup=_profile_menu())
-        conn.commit()
-    finally:
-        conn.close()
+    await _show_profile(update, context, edit_existing=False)
 
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -315,10 +381,25 @@ async def cancel_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     await update.effective_message.reply_text("There is no active draft deal to cancel.")
     return ConversationHandler.END
 
+async def profile_open_from_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    await _show_profile(update, context, edit_existing=True)
+
+
 async def profile_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     data = query.data
+
+    if data not in {"profile_back", "profile_open"}:
+        conn, _, _, _ = _services()
+        try:
+            if _is_user_frozen(conn, query.from_user.id):
+                await _show_frozen_callback(query)
+                return
+        finally:
+            conn.close()
 
     if data == "profile_back":
         await query.edit_message_text("Back to main menu", reply_markup=_start_menu())
@@ -385,6 +466,9 @@ async def withdraw_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     conn, wallet, tenant, _ = _services()
     try:
         user_id = tenant.ensure_user(query.from_user.id, query.from_user.username)
+        if _is_user_frozen(conn, query.from_user.id):
+            await _show_frozen_callback(query)
+            return ConversationHandler.END
         available_assets = [a for a, minimum in WITHDRAW_MINIMUMS.items() if wallet.available_balance(user_id, a) >= minimum]
     finally:
         conn.close()
@@ -474,6 +558,9 @@ async def withdraw_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     conn, wallet, tenant, _ = _services()
     try:
         user_id = tenant.ensure_user(query.from_user.id, query.from_user.username)
+        if _is_user_frozen(conn, query.from_user.id):
+            await _show_frozen_callback(query)
+            return ConversationHandler.END
         wallet.request_withdrawal(user_id, context.user_data["wd_asset"], Decimal(context.user_data["wd_amount"]), context.user_data["wd_address"])
         conn.commit()
     finally:
@@ -550,8 +637,8 @@ async def escrow_menu_actions(update: Update, context: ContextTypes.DEFAULT_TYPE
     conn, _, tenant, escrow = _services()
     try:
         user_id = tenant.ensure_user(query.from_user.id, query.from_user.username)
-        if action == "new":
-            await query.edit_message_text("Use /check_user <@username|telegram_id> to start a new deal.")
+        if _is_user_frozen(conn, query.from_user.id):
+            await _show_frozen_callback(query)
             return
         if action == "history":
             await _show_escrow_history_page(query, user_id, 1)
@@ -588,7 +675,11 @@ async def escrow_history_actions(update: Update, context: ContextTypes.DEFAULT_T
     try:
         user_id = tenant.ensure_user(query.from_user.id, query.from_user.username)
         if data.startswith("esc_hist_page:"):
-            await _show_escrow_history_page(query, user_id, int(data.split(":")[2]))
+            page = _parse_callback_int(data, "esc_hist_page:")
+            if page is None:
+                await query.edit_message_text("History view is stale. Please reopen Escrow Menu -> History.")
+                return
+            await _show_escrow_history_page(query, user_id, page)
             return
         if data == "esc_back_menu":
             await query.edit_message_text(
@@ -603,8 +694,16 @@ async def escrow_history_actions(update: Update, context: ContextTypes.DEFAULT_T
             )
             return
         if data.startswith("esc_hist_open:"):
-            _, _, escrow_id, page = data.split(":")
-            row = escrow.get_escrow(int(escrow_id))
+            parts = _parse_callback_parts(data, "esc_hist_open:", 4)
+            if not parts:
+                await query.edit_message_text("Deal history item is stale. Please reopen history.")
+                return
+            _, _, escrow_id, page = parts
+            try:
+                row = escrow.get_escrow(int(escrow_id))
+            except ValueError:
+                await query.edit_message_text("Deal is no longer available.")
+                return
             cp_id = escrow.counterparty_user_id(row, user_id)
             cp = conn.execute("SELECT username FROM users WHERE id=?", (cp_id,)).fetchone()
             cp_name = cp["username"] if cp and cp["username"] else "unknown"
@@ -628,59 +727,53 @@ async def escrow_history_actions(update: Update, context: ContextTypes.DEFAULT_T
                 f"Outcome: {outcome}\n"
                 f"Your rating: {your_rating}"
             )
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("View Counter-Party Profile", callback_data=f"esc_hist_profile:{cp_id}:{page}")], [InlineKeyboardButton("Back", callback_data=f"esc_hist_page:{page}")]]))
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("View Counter-Party Profile", callback_data=f"esc_hist_profile:{cp_id}:{page}:{escrow_id}")], [InlineKeyboardButton("Back", callback_data=f"esc_hist_page:{page}")]]))
             return
         if data.startswith("esc_hist_profile:"):
-            _, _, cp_id, page = data.split(":")
+            parts = _parse_callback_parts(data, "esc_hist_profile:", 5)
+            if not parts:
+                await query.edit_message_text("Counter-party view is stale. Please reopen history.")
+                return
+            _, _, cp_id, page, escrow_id = parts
             row = conn.execute("SELECT * FROM users WHERE id=?", (int(cp_id),)).fetchone()
             if not row:
                 await query.edit_message_text("Counter-party profile not found")
                 return
-            await query.edit_message_text(_render_user_profile(_user_profile(conn, row)), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"esc_hist_page:{page}")]]))
+            await query.edit_message_text(_render_user_profile(_user_profile(conn, row)), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"esc_hist_open:{escrow_id}:{page}")]]))
             return
     finally:
         conn.close()
+
+
+async def deal_search_input_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    lookup = update.effective_message.text.strip()
+    if not lookup:
+        await update.effective_message.reply_text("Enter seller @username or Telegram ID:")
+        return DEAL_SEARCH_INPUT
+    return await _seller_lookup_and_render(update, context, lookup)
+
+
+async def deal_new_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    conn, _, tenant, _ = _services()
+    try:
+        tenant.ensure_user(query.from_user.id, query.from_user.username)
+        if _is_user_frozen(conn, query.from_user.id):
+            await _show_frozen_callback(query)
+            return ConversationHandler.END
+    finally:
+        conn.close()
+
+    await query.edit_message_text("Enter seller @username or Telegram ID:")
+    return DEAL_SEARCH_INPUT
 
 
 async def deal_check_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not context.args:
         await update.effective_message.reply_text("Usage: /check_user <@username|telegram_id>")
         return ConversationHandler.END
-
-    lookup = context.args[0].strip()
-    conn, _, tenant, _ = _services()
-    try:
-        tenant.ensure_user(update.effective_user.id, update.effective_user.username)
-        if not await _require_not_frozen(update, conn):
-            return ConversationHandler.END
-        if lookup.startswith("@"):
-            row = conn.execute("SELECT * FROM users WHERE username=?", (lookup[1:],)).fetchone()
-        else:
-            try:
-                tg = int(lookup)
-            except ValueError:
-                row = None
-            else:
-                row = conn.execute("SELECT * FROM users WHERE telegram_id=?", (tg,)).fetchone()
-        if not row:
-            await update.effective_message.reply_text("Seller not found")
-            return ConversationHandler.END
-
-        profile_data = _user_profile(conn, row)
-        context.user_data["seller_id"] = profile_data["user_id"]
-        context.user_data["seller_username"] = profile_data["username"]
-        context.user_data["seller_telegram_id"] = profile_data["telegram_id"]
-
-        keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Back", callback_data="deal_back_main"), InlineKeyboardButton("Create Deal", callback_data="deal_create")]]
-        )
-        profile_text = _render_user_profile(profile_data)
-        context.user_data["seller_profile_text"] = profile_text
-        await update.effective_message.reply_text(profile_text, reply_markup=keyboard)
-        conn.commit()
-        return DEAL_SEARCH_RESULT
-    finally:
-        conn.close()
+    return await _seller_lookup_and_render(update, context, context.args[0].strip())
 
 
 async def deal_search_result_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1154,8 +1247,9 @@ def main() -> None:
     conn.close()
 
     conv = ConversationHandler(
-        entry_points=[CommandHandler("check_user", deal_check_user)],
+        entry_points=[CommandHandler("check_user", deal_check_user), CallbackQueryHandler(deal_new_entry, pattern=r"^esc_menu:new$")],
         states={
+            DEAL_SEARCH_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, deal_search_input_text)],
             DEAL_SEARCH_RESULT: [CallbackQueryHandler(deal_search_result_cb, pattern="^deal_(create|back_main)$")],
             DEAL_ENTER_AMOUNT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, deal_amount_input),
@@ -1206,8 +1300,9 @@ def main() -> None:
     app.add_handler(CommandHandler("support", support_team))
     app.add_handler(CallbackQueryHandler(seller_rate_buyer_callback, pattern=r"^deal_rate_buyer:\d+:\d+$"))
     app.add_handler(withdraw_conv)
+    app.add_handler(CallbackQueryHandler(profile_open_from_menu, pattern=r"^profile$"))
     app.add_handler(CallbackQueryHandler(profile_actions, pattern=r"^(profile_(?!withdraw$)|dep_asset:).*$"))
-    app.add_handler(CallbackQueryHandler(escrow_menu_actions, pattern=r"^esc_menu:"))
+    app.add_handler(CallbackQueryHandler(escrow_menu_actions, pattern=r"^esc_menu:(pending|active|disputes|history)$"))
     app.add_handler(CallbackQueryHandler(escrow_history_actions, pattern=r"^(esc_hist_|esc_back_menu).*$"))
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(on_menu_click))
