@@ -117,6 +117,25 @@ class EscrowService:
     def list_active_escrows(self, user_id: int):
         return self.conn.execute("SELECT * FROM escrows WHERE status='active' AND (buyer_id=? OR seller_id=?)", (user_id, user_id)).fetchall()
 
+    def list_disputed_escrows(self, user_id: int):
+        return self.conn.execute("SELECT * FROM escrows WHERE status='disputed' AND (buyer_id=? OR seller_id=?) ORDER BY id DESC", (user_id, user_id)).fetchall()
+
+    def list_completed_escrows_page(self, user_id: int, page: int = 1, per_page: int = 10):
+        page = max(1, int(page))
+        per_page = max(1, int(per_page))
+        total = self.conn.execute("SELECT COUNT(*) c FROM escrows WHERE status='completed' AND (buyer_id=? OR seller_id=?)", (user_id, user_id)).fetchone()["c"]
+        pages = max(1, (int(total) + per_page - 1) // per_page)
+        page = min(page, pages)
+        offset = (page - 1) * per_page
+        rows = self.conn.execute(
+            "SELECT * FROM escrows WHERE status='completed' AND (buyer_id=? OR seller_id=?) ORDER BY id DESC LIMIT ? OFFSET ?",
+            (user_id, user_id, per_page, offset),
+        ).fetchall()
+        return rows, page, pages
+
+    def counterparty_user_id(self, escrow_row, viewer_user_id: int) -> int:
+        return int(escrow_row["seller_id"]) if int(escrow_row["buyer_id"]) == int(viewer_user_id) else int(escrow_row["buyer_id"])
+
     def _event(self, escrow_id: int, event_type: str, data: dict) -> None:
         self.conn.execute("INSERT INTO escrow_events(escrow_id,event_type,data_json) VALUES(?,?,?)", (escrow_id, event_type, json.dumps(data)))
 

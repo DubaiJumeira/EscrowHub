@@ -104,7 +104,7 @@ def test_usdt_usdc_reuse_eth_address_and_no_private_keys_in_db(conn, monkeypatch
 
     assert eth.address == usdt.address == usdc.address
 
-    row = conn.execute("SELECT * FROM wallet_addresses WHERE user_id=? AND asset='ETH'", (10,)).fetchone()
+    row = conn.execute("SELECT * FROM wallet_addresses WHERE address=? AND asset='ETH'", (eth.address,)).fetchone()
     assert "private" not in " ".join(row.keys()).lower()
 
 
@@ -268,3 +268,12 @@ def test_deposit_notify_failure_is_swallowed(monkeypatch, conn):
     monkeypatch.setattr("watchers.notify.request.urlopen", Boom())
 
     notify_deposit_credited(conn, 42, "USDT", Decimal("5"), Decimal("10"))
+
+
+def test_wallet_resolves_telegram_id_to_internal_user_id(conn):
+    tenant = TenantService(conn)
+    internal_id = tenant.ensure_user(777, "alice")
+    wallet = WalletService(conn)
+    wallet.credit_deposit_if_confirmed(777, "USDT", Decimal("50"), "txz", "txz:0", "ETHEREUM", 12, True)
+
+    assert wallet.available_balance(internal_id, "USDT") == Decimal("50")

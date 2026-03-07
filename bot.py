@@ -126,6 +126,9 @@ DRAFT_FLOW_KEYS = {
     "escrow_id",
     "created_label",
     "previous_view",
+    "wd_asset",
+    "wd_amount",
+    "wd_address",
 }
 
 
@@ -154,27 +157,110 @@ def _clear_draft_flow(context: ContextTypes.DEFAULT_TYPE) -> bool:
     return removed
 
 
+WITHDRAW_MINIMUMS = {
+    "USDT": Decimal("100"),
+    "USDC": Decimal("100"),
+    "BTC": Decimal("0.001"),
+    "ETH": Decimal("1"),
+    "LTC": Decimal("1"),
+    "SOL": Decimal("1"),
+    "XRP": Decimal("10"),
+}
+
+(
+    WD_SELECT_ASSET,
+    WD_ENTER_AMOUNT,
+    WD_ENTER_ADDRESS,
+    WD_CONFIRM,
+) = range(100, 104)
+
+
+def _profile_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Deposit", callback_data="profile_deposit"), InlineKeyboardButton("Withdraw", callback_data="profile_withdraw")],
+            [InlineKeyboardButton("Withdrawal History", callback_data="profile_withdraw_history:1")],
+            [InlineKeyboardButton("Back", callback_data="profile_back")],
+        ]
+    )
+
+
+def _date_short(ts: str | None) -> str:
+    if not ts:
+        return "unknown"
+    try:
+        return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").strftime("%d %b %Y")
+    except ValueError:
+        return ts
+
+
+def _render_self_profile(conn, telegram_user, user_id: int, wallet: WalletService) -> str:
+    first_name = telegram_user.first_name or "unknown"
+    registered = conn.execute("SELECT created_at FROM users WHERE id=?", (user_id,)).fetchone()["created_at"]
+    rev = conn.execute("SELECT AVG(rating) avg_rating, COUNT(*) cnt FROM reviews WHERE reviewed_id=?", (user_id,)).fetchone()
+    successful = conn.execute("SELECT COUNT(*) c FROM escrows WHERE status='completed' AND (buyer_id=? OR seller_id=?)", (user_id, user_id)).fetchone()["c"]
+    cancelled = conn.execute("SELECT COUNT(*) c FROM escrows WHERE status='cancelled' AND (buyer_id=? OR seller_id=?)", (user_id, user_id)).fetchone()["c"]
+    disputes_lost = conn.execute(
+        "SELECT COUNT(*) c FROM disputes d JOIN escrows e ON e.id=d.escrow_id WHERE d.status='resolved' AND ((e.buyer_id=? AND json_extract(d.resolution_json,'$.resolution')='release_seller') OR (e.seller_id=? AND json_extract(d.resolution_json,'$.resolution')='refund_buyer'))",
+        (user_id, user_id),
+    ).fetchone()["c"]
+    lines = [
+        f"Your Telegram ID: {telegram_user.id}",
+        f"First Name: {first_name}",
+        "Balance:",
+    ]
+    for asset in ["USDT", "USDC", "BTC", "ETH", "LTC", "SOL", "XRP"]:
+        a = wallet.available_balance(user_id, asset)
+        l = wallet.locked_balance(user_id, asset)
+        lines.append(f"• {asset}: {a} (locked {l})")
+    trust = "High" if successful >= 20 else "Medium" if successful >= 5 else "Low"
+    lines.append(f"Registered: {_date_short(registered)}")
+    lines.append(f"Trust level: {trust}")
+    if int(rev["cnt"] or 0) < 3:
+        lines.append("Rating: Too few reviews")
+    else:
+        lines.append(f"Rating: {float(rev['avg_rating']):.1f}/5 from {int(rev['cnt'])} reviews")
+    lines.append("Deals:")
+    lines.append(f"Successful: {successful}")
+    lines.append(f"Cancelled: {cancelled}")
+    lines.append(f"Disputes lost: {disputes_lost}")
+
+    spent_rows = conn.execute("SELECT asset, COALESCE(SUM(CAST(amount AS REAL)),0) v FROM escrows WHERE buyer_id=? AND status='completed' GROUP BY asset", (user_id,)).fetchall()
+    earned_rows = conn.execute("SELECT asset, COALESCE(SUM(CAST(amount AS REAL)),0) v FROM escrows WHERE seller_id=? AND status='completed' GROUP BY asset", (user_id,)).fetchall()
+    lines.append("Total Spent/Earned:")
+    assets = sorted({r['asset'] for r in spent_rows} | {r['asset'] for r in earned_rows})
+    for asset in assets:
+        spent = next((Decimal(str(r['v'])) for r in spent_rows if r['asset'] == asset), Decimal('0'))
+        earned = next((Decimal(str(r['v'])) for r in earned_rows if r['asset'] == asset), Decimal('0'))
+        lines.append(f"• {asset}: spent {spent} / earned {earned}")
+
+    last_reviews = conn.execute(
+        "SELECT r.created_at, u.username reviewer_username FROM reviews r LEFT JOIN users u ON u.id=r.reviewer_id WHERE r.reviewed_id=? ORDER BY r.id DESC LIMIT 3",
+        (user_id,),
+    ).fetchall()
+    lines.append("Last 3 reviews:")
+    if not last_reviews:
+        lines.append("• No reviews yet")
+    else:
+        for r in last_reviews:
+            reviewer = r['reviewer_username'] or 'unknown'
+            lines.append(f"• by @{reviewer} ({_date_short(r['created_at'])})")
+    return "\n".join(lines)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text("Welcome to EscrowHub", reply_markup=_start_menu())
 
 
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    conn, wallet, tenant, escrow = _services()
+    conn, wallet, tenant, _ = _services()
     try:
         user_id = tenant.ensure_user(update.effective_user.id, update.effective_user.username)
-        lines = [f"User ID: {update.effective_user.id}", "Balances:"]
-        for asset in NETWORK_LABELS:
-            a = wallet.available_balance(user_id, asset)
-            l = wallet.locked_balance(user_id, asset)
-            if a or l:
-                lines.append(f"- {NETWORK_LABELS[asset]}: available={a} locked={l}")
-        lines.append(f"Pending escrows: {len(escrow.list_pending_escrows(user_id))}")
-        await update.effective_message.reply_text("\n".join(lines))
+        text = _render_self_profile(conn, update.effective_user, user_id, wallet)
+        await update.effective_message.reply_text(text, reply_markup=_profile_menu())
         conn.commit()
     finally:
         conn.close()
-
-
 
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -228,6 +314,333 @@ async def cancel_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return ConversationHandler.END
     await update.effective_message.reply_text("There is no active draft deal to cancel.")
     return ConversationHandler.END
+
+async def profile_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "profile_back":
+        await query.edit_message_text("Back to main menu", reply_markup=_start_menu())
+        return
+
+    if data == "profile_open":
+        conn, wallet, tenant, _ = _services()
+        try:
+            user_id = tenant.ensure_user(query.from_user.id, query.from_user.username)
+            text = _render_self_profile(conn, query.from_user, user_id, wallet)
+        finally:
+            conn.close()
+        await query.edit_message_text(text, reply_markup=_profile_menu())
+        return
+
+    if data == "profile_deposit":
+        keyboard = [[InlineKeyboardButton(asset, callback_data=f"dep_asset:{asset}")] for asset in ["USDT", "BTC", "ETH", "LTC", "USDC", "SOL", "XRP"]]
+        keyboard.append([InlineKeyboardButton("Cancel", callback_data="profile_open")])
+        await query.edit_message_text("Deposit currency:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if data.startswith("dep_asset:"):
+        asset = data.split(":", 1)[1]
+        conn, wallet, tenant, _ = _services()
+        try:
+            user_id = tenant.ensure_user(query.from_user.id, query.from_user.username)
+            route = wallet.get_or_create_deposit_address(user_id, asset)
+            lines = [f"Deposit {asset}", f"Address: {route.address}"]
+            if route.destination_tag:
+                lines.append(f"Destination tag: {route.destination_tag}")
+            conn.commit()
+        finally:
+            conn.close()
+        await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="profile_deposit")]]))
+        return
+
+    if data.startswith("profile_withdraw_history:"):
+        page = int(data.split(":")[1])
+        conn, wallet, tenant, _ = _services()
+        try:
+            user_id = tenant.ensure_user(query.from_user.id, query.from_user.username)
+            rows, page, pages = wallet.withdrawal_history(user_id, page=page, per_page=10)
+        finally:
+            conn.close()
+        lines = [f"Your Withdrawal History (Page {page}/{pages})"]
+        if not rows:
+            lines.append("You have no withdrawal history yet.")
+        else:
+            for r in rows:
+                lines.append(f"#{r['id']} | {r['asset']} | {r['amount']} | {r['status']} | {_date_short(r['created_at'])}")
+        nav = []
+        if page > 1:
+            nav.append(InlineKeyboardButton("Previous", callback_data=f"profile_withdraw_history:{page-1}"))
+        if page < pages:
+            nav.append(InlineKeyboardButton("Next", callback_data=f"profile_withdraw_history:{page+1}"))
+        buttons = [nav] if nav else []
+        buttons.append([InlineKeyboardButton("Back to Profile", callback_data="profile_open")])
+        await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def withdraw_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    conn, wallet, tenant, _ = _services()
+    try:
+        user_id = tenant.ensure_user(query.from_user.id, query.from_user.username)
+        available_assets = [a for a, minimum in WITHDRAW_MINIMUMS.items() if wallet.available_balance(user_id, a) >= minimum]
+    finally:
+        conn.close()
+
+    if not available_assets:
+        await query.edit_message_text(
+            "Insufficient Balance\nYou don't have sufficient balance in any currency for withdrawal.\nMinimum amounts:\n• 100 USDT\n• 0.001 BTC\n• 1 ETH",
+            reply_markup=_profile_menu(),
+        )
+        return ConversationHandler.END
+
+    keyboard = [[InlineKeyboardButton(a, callback_data=f"wd_asset:{a}")] for a in available_assets]
+    keyboard.append([InlineKeyboardButton("Back", callback_data="wd_back_profile")])
+    await query.edit_message_text("Select withdrawal currency:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return WD_SELECT_ASSET
+
+
+async def withdraw_select_asset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    if query.data == "wd_back_profile":
+        await profile_actions(update, context)
+        return ConversationHandler.END
+    context.user_data["wd_asset"] = query.data.split(":", 1)[1]
+    await query.edit_message_text(
+        f"Enter {context.user_data['wd_asset']} withdrawal amount:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="wd_back_assets")]]),
+    )
+    return WD_ENTER_AMOUNT
+
+
+async def withdraw_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    asset = context.user_data.get("wd_asset")
+    if not asset:
+        await update.effective_message.reply_text("Withdrawal session expired")
+        return ConversationHandler.END
+    try:
+        amount = Decimal(update.effective_message.text.strip())
+    except InvalidOperation:
+        await update.effective_message.reply_text("Enter a valid numeric amount")
+        return WD_ENTER_AMOUNT
+    if amount <= 0:
+        await update.effective_message.reply_text("Amount must be positive")
+        return WD_ENTER_AMOUNT
+    if amount < WITHDRAW_MINIMUMS[asset]:
+        await update.effective_message.reply_text(f"Minimum withdrawal for {asset} is {WITHDRAW_MINIMUMS[asset]}")
+        return WD_ENTER_AMOUNT
+    conn, wallet, tenant, _ = _services()
+    try:
+        user_id = tenant.ensure_user(update.effective_user.id, update.effective_user.username)
+        if wallet.available_balance(user_id, asset) < amount:
+            await update.effective_message.reply_text("Insufficient available balance")
+            return WD_ENTER_AMOUNT
+    finally:
+        conn.close()
+    context.user_data["wd_amount"] = amount
+    await update.effective_message.reply_text(
+        f"Enter your {asset} withdrawal address:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="wd_back_amount")]]),
+    )
+    return WD_ENTER_ADDRESS
+
+
+async def withdraw_address_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    address = update.effective_message.text.strip()
+    if not address:
+        await update.effective_message.reply_text("Address is required")
+        return WD_ENTER_ADDRESS
+    context.user_data["wd_address"] = address
+    await update.effective_message.reply_text(
+        f"Is this address correct? {address}",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Confirm", callback_data="wd_confirm"), InlineKeyboardButton("Cancel", callback_data="wd_cancel_addr")]]),
+    )
+    return WD_CONFIRM
+
+
+async def withdraw_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    if query.data == "wd_cancel_addr":
+        await query.edit_message_text(
+            f"Enter your {context.user_data.get('wd_asset','ASSET')} withdrawal address:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="wd_back_amount")]]),
+        )
+        return WD_ENTER_ADDRESS
+
+    conn, wallet, tenant, _ = _services()
+    try:
+        user_id = tenant.ensure_user(query.from_user.id, query.from_user.username)
+        wallet.request_withdrawal(user_id, context.user_data["wd_asset"], Decimal(context.user_data["wd_amount"]), context.user_data["wd_address"])
+        conn.commit()
+    finally:
+        conn.close()
+
+    for k in ["wd_asset", "wd_amount", "wd_address"]:
+        context.user_data.pop(k, None)
+    await query.edit_message_text(
+        "Withdrawal request submitted. Funds will arrive within a few minutes.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to Profile", callback_data="profile_open")]]),
+    )
+    return ConversationHandler.END
+
+
+async def withdraw_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    if query.data == "wd_back_assets":
+        return await withdraw_start(update, context)
+    if query.data == "wd_back_amount":
+        await query.edit_message_text(
+            f"Enter {context.user_data.get('wd_asset','ASSET')} withdrawal amount:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="wd_back_assets")]]),
+        )
+        return WD_ENTER_AMOUNT
+    if query.data == "wd_back_profile":
+        await profile_actions(update, context)
+        return ConversationHandler.END
+    return ConversationHandler.END
+
+
+async def escrow_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(
+        "Escrow Menu",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("New Deal", callback_data="esc_menu:new"), InlineKeyboardButton("Pending", callback_data="esc_menu:pending")],
+                [InlineKeyboardButton("Active", callback_data="esc_menu:active"), InlineKeyboardButton("Disputes", callback_data="esc_menu:disputes")],
+                [InlineKeyboardButton("History", callback_data="esc_menu:history")],
+            ]
+        ),
+    )
+
+
+async def _show_escrow_history_page(query, user_id: int, page: int) -> None:
+    conn, _, _, escrow = _services()
+    try:
+        rows, page, pages = escrow.list_completed_escrows_page(user_id, page=page, per_page=10)
+        buttons = []
+        for row in rows:
+            cp_id = escrow.counterparty_user_id(row, user_id)
+            cp = conn.execute("SELECT username FROM users WHERE id=?", (cp_id,)).fetchone()
+            cp_name = cp["username"] if cp and cp["username"] else "unknown"
+            desc = (row["description"] or "")[:24]
+            label = f"@{cp_name} {desc}"[:40]
+            buttons.append([InlineKeyboardButton(label, callback_data=f"esc_hist_open:{row['id']}:{page}")])
+        nav = []
+        if page > 1:
+            nav.append(InlineKeyboardButton("Previous", callback_data=f"esc_hist_page:{page-1}"))
+        if page < pages:
+            nav.append(InlineKeyboardButton("Next", callback_data=f"esc_hist_page:{page+1}"))
+        if nav:
+            buttons.append(nav)
+        buttons.append([InlineKeyboardButton("Back", callback_data="esc_back_menu")])
+    finally:
+        conn.close()
+    await query.edit_message_text(f"Completed Deals (Page {page}/{pages})", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def escrow_menu_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+    conn, _, tenant, escrow = _services()
+    try:
+        user_id = tenant.ensure_user(query.from_user.id, query.from_user.username)
+        if action == "new":
+            await query.edit_message_text("Use /check_user <@username|telegram_id> to start a new deal.")
+            return
+        if action == "history":
+            await _show_escrow_history_page(query, user_id, 1)
+            return
+        if action == "pending":
+            rows = escrow.list_pending_escrows(user_id)
+            title = "Pending escrows"
+        elif action == "active":
+            rows = escrow.list_active_escrows(user_id)
+            title = "Active escrows"
+        elif action == "disputes":
+            rows = escrow.list_disputed_escrows(user_id)
+            title = "Disputed escrows"
+        else:
+            rows = []
+            title = "Escrows"
+    finally:
+        conn.close()
+    lines = [title + ":"]
+    if not rows:
+        lines.append("None")
+    else:
+        for r in rows[:10]:
+            lines.append(f"#{r['id']} | {r['amount']} {r['asset']} | {r['status']} | {_format_db_timestamp(r['created_at'])}")
+    lines.append("\nUse Escrow Menu to navigate.")
+    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="esc_back_menu")]]))
+
+
+async def escrow_history_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    conn, _, tenant, escrow = _services()
+    try:
+        user_id = tenant.ensure_user(query.from_user.id, query.from_user.username)
+        if data.startswith("esc_hist_page:"):
+            await _show_escrow_history_page(query, user_id, int(data.split(":")[2]))
+            return
+        if data == "esc_back_menu":
+            await query.edit_message_text(
+                "Escrow Menu",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("New Deal", callback_data="esc_menu:new"), InlineKeyboardButton("Pending", callback_data="esc_menu:pending")],
+                        [InlineKeyboardButton("Active", callback_data="esc_menu:active"), InlineKeyboardButton("Disputes", callback_data="esc_menu:disputes")],
+                        [InlineKeyboardButton("History", callback_data="esc_menu:history")],
+                    ]
+                ),
+            )
+            return
+        if data.startswith("esc_hist_open:"):
+            _, _, escrow_id, page = data.split(":")
+            row = escrow.get_escrow(int(escrow_id))
+            cp_id = escrow.counterparty_user_id(row, user_id)
+            cp = conn.execute("SELECT username FROM users WHERE id=?", (cp_id,)).fetchone()
+            cp_name = cp["username"] if cp and cp["username"] else "unknown"
+            d = conn.execute("SELECT resolution_json FROM disputes WHERE escrow_id=? ORDER BY id DESC LIMIT 1", (int(escrow_id),)).fetchone()
+            outcome = "Completed successfully"
+            if d and d["resolution_json"]:
+                if "refund_buyer" in d["resolution_json"]:
+                    outcome = "Resolved in favor of Buyer"
+                elif "release_seller" in d["resolution_json"]:
+                    outcome = "Resolved in favor of Seller"
+                elif "split" in d["resolution_json"]:
+                    outcome = "Split resolution"
+            rating = conn.execute("SELECT rating FROM reviews WHERE reviewer_id=? AND escrow_id=?", (user_id, int(escrow_id))).fetchone()
+            your_rating = "⭐" * int(rating["rating"]) if rating else "Not rated yet"
+            text = (
+                "Deal history\n"
+                f"@{cp_name} {row['description'] or ''}\n"
+                f"{row['amount']} {row['asset']}\n"
+                f"Created: {_format_db_timestamp(row['created_at'])}\n"
+                f"Finished: {_format_db_timestamp(row['updated_at'])}\n"
+                f"Outcome: {outcome}\n"
+                f"Your rating: {your_rating}"
+            )
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("View Counter-Party Profile", callback_data=f"esc_hist_profile:{cp_id}:{page}")], [InlineKeyboardButton("Back", callback_data=f"esc_hist_page:{page}")]]))
+            return
+        if data.startswith("esc_hist_profile:"):
+            _, _, cp_id, page = data.split(":")
+            row = conn.execute("SELECT * FROM users WHERE id=?", (int(cp_id),)).fetchone()
+            if not row:
+                await query.edit_message_text("Counter-party profile not found")
+                return
+            await query.edit_message_text(_render_user_profile(_user_profile(conn, row)), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"esc_hist_page:{page}")]]))
+            return
+    finally:
+        conn.close()
+
 
 async def deal_check_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not context.args:
@@ -721,7 +1134,7 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await query.answer()
     mapping = {
         "profile": profile,
-        "escrow_menu": check_user_hint,
+        "escrow_menu": escrow_menu,
         "check_user": check_user_hint,
         "support_team": support_team,
     }
@@ -763,8 +1176,28 @@ def main() -> None:
         per_user=True,
     )
 
+    withdraw_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(withdraw_start, pattern=r"^profile_withdraw$")],
+        states={
+            WD_SELECT_ASSET: [CallbackQueryHandler(withdraw_select_asset, pattern=r"^wd_(asset:[A-Z]+|back_profile)$")],
+            WD_ENTER_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_amount_input),
+                CallbackQueryHandler(withdraw_back, pattern=r"^wd_(back_assets|back_profile)$"),
+            ],
+            WD_ENTER_ADDRESS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_address_input),
+                CallbackQueryHandler(withdraw_back, pattern=r"^wd_back_amount$"),
+            ],
+            WD_CONFIRM: [CallbackQueryHandler(withdraw_confirm, pattern=r"^wd_(confirm|cancel_addr)$")],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_flow)],
+        per_chat=True,
+        per_user=True,
+    )
+
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("profile", profile))
     app.add_handler(CommandHandler("balance", balance))
     app.add_handler(CommandHandler("history", history))
     app.add_handler(CommandHandler("cancel", cancel_flow))
@@ -772,6 +1205,10 @@ def main() -> None:
     app.add_handler(CommandHandler("run_signer", run_signer))
     app.add_handler(CommandHandler("support", support_team))
     app.add_handler(CallbackQueryHandler(seller_rate_buyer_callback, pattern=r"^deal_rate_buyer:\d+:\d+$"))
+    app.add_handler(withdraw_conv)
+    app.add_handler(CallbackQueryHandler(profile_actions, pattern=r"^(profile_(?!withdraw$)|dep_asset:).*$"))
+    app.add_handler(CallbackQueryHandler(escrow_menu_actions, pattern=r"^esc_menu:"))
+    app.add_handler(CallbackQueryHandler(escrow_history_actions, pattern=r"^(esc_hist_|esc_back_menu).*$"))
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(on_menu_click))
     app.run_polling()

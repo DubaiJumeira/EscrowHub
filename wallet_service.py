@@ -45,72 +45,82 @@ class WalletService:
     def _chain_family(self, asset: str) -> str:
         return "ETHEREUM" if self._asset(asset) in {"ETH", "USDT", "USDC"} else self._asset(asset)
 
-    def _ensure_user_row(self, user_id: int) -> None:
-        self.conn.execute("INSERT OR IGNORE INTO users(id, telegram_id, username, frozen) VALUES(?,?,?,0)", (user_id, user_id, None))
+    def _ensure_user_row(self, user_ref: int) -> int:
+        by_id = self.conn.execute("SELECT id FROM users WHERE id=?", (user_ref,)).fetchone()
+        if by_id:
+            return int(by_id["id"])
+        by_tg = self.conn.execute("SELECT id FROM users WHERE telegram_id=?", (user_ref,)).fetchone()
+        if by_tg:
+            return int(by_tg["id"])
+        cur = self.conn.execute("INSERT INTO users(telegram_id, username, frozen) VALUES(?,?,0)", (user_ref, None))
+        return int(cur.lastrowid)
 
     def get_or_create_deposit_address(self, user_id: int, asset: str) -> DepositRoute:
         symbol = self._asset(asset)
-        self._ensure_user_row(user_id)
-        row = self.conn.execute("SELECT * FROM wallet_addresses WHERE user_id=? AND asset=?", (user_id, symbol)).fetchone()
+        resolved_user_id = self._ensure_user_row(user_id)
+        row = self.conn.execute("SELECT * FROM wallet_addresses WHERE user_id=? AND asset=?", (resolved_user_id, symbol)).fetchone()
         if row:
             return DepositRoute(row["address"], row["asset"], row["chain_family"], row["destination_tag"], row["derivation_path"])
         derivation_path = None
-        derivation_index = user_id if symbol != "XRP" else None
+        derivation_index = resolved_user_id if symbol != "XRP" else None
         if symbol == "XRP":
             hot = os.getenv("XRP_HOT_WALLET_ADDRESS", "")
             if not hot and os.getenv("APP_ENV", "dev").lower() == "production":
                 raise RuntimeError("XRP_HOT_WALLET_ADDRESS missing")
-            address, tag = (hot or "xrp_dev_hot_wallet"), str(user_id)
+            address, tag = (hot or "xrp_dev_hot_wallet"), str(resolved_user_id)
         elif symbol == "BTC":
-            k = self.hd.derive_btc(user_id)
+            k = self.hd.derive_btc(resolved_user_id)
             address, tag, derivation_path = k.public_address, None, k.path
         elif symbol == "LTC":
-            k = self.hd.derive_ltc(user_id)
+            k = self.hd.derive_ltc(resolved_user_id)
             address, tag, derivation_path = k.public_address, None, k.path
         elif symbol in {"ETH", "USDT", "USDC"}:
-            k = self.hd.derive_eth(user_id)
+            k = self.hd.derive_eth(resolved_user_id)
             address, tag, derivation_path = k.public_address, None, k.path
         elif symbol == "SOL":
-            k = self.hd.derive_sol(user_id)
+            k = self.hd.derive_sol(resolved_user_id)
             address, tag, derivation_path = k.public_address, None, k.path
         else:
             if os.getenv("APP_ENV", "dev").lower() == "production":
                 raise RuntimeError(f"unsupported production derivation for {symbol}")
-            address, tag = f"{symbol.lower()}_addr_{user_id}", None
+            address, tag = f"{symbol.lower()}_addr_{resolved_user_id}", None
         self.conn.execute(
             "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,derivation_index,destination_tag,derivation_path) VALUES(?,?,?,?,?,?,?)",
-            (user_id, symbol, self._chain_family(symbol), address, derivation_index, tag, derivation_path),
+            (resolved_user_id, symbol, self._chain_family(symbol), address, derivation_index, tag, derivation_path),
         )
         return DepositRoute(address, symbol, self._chain_family(symbol), tag, derivation_path)
 
     def credit_deposit_if_confirmed(self, user_id: int, asset: str, amount: Decimal, txid: str, unique_key: str, chain_family: str, confirmations: int, finalized: bool) -> bool:
-        self._ensure_user_row(user_id)
+        resolved_user_id = self._ensure_user_row(user_id)
         try:
             cur = self.conn.execute(
                 "INSERT INTO deposits(user_id,asset,amount,txid,unique_key,chain_family,confirmations,status) VALUES(?,?,?,?,?,?,?,?)",
-                (user_id, self._asset(asset), str(Decimal(amount)), txid, unique_key, chain_family, confirmations, "credited" if finalized else "seen"),
+                (resolved_user_id, self._asset(asset), str(Decimal(amount)), txid, unique_key, chain_family, confirmations, "credited" if finalized else "seen"),
             )
         except Exception:
             return False
         if finalized:
-            self.ledger.add_entry("USER", user_id, user_id, asset, Decimal(amount), "DEPOSIT", "deposit", int(cur.lastrowid))
+            self.ledger.add_entry("USER", resolved_user_id, resolved_user_id, asset, Decimal(amount), "DEPOSIT", "deposit", int(cur.lastrowid))
         return finalized
 
     def total_balance(self, user_id: int, asset: str) -> Decimal:
-        return self.ledger.total_balance(user_id, self._asset(asset))
+        resolved_user_id = self._ensure_user_row(user_id)
+        return self.ledger.total_balance(resolved_user_id, self._asset(asset))
 
     def locked_balance(self, user_id: int, asset: str) -> Decimal:
-        return self.ledger.locked_balance(user_id, self._asset(asset))
+        resolved_user_id = self._ensure_user_row(user_id)
+        return self.ledger.locked_balance(resolved_user_id, self._asset(asset))
 
     def available_balance(self, user_id: int, asset: str) -> Decimal:
-        return self.ledger.available_balance(user_id, self._asset(asset))
+        resolved_user_id = self._ensure_user_row(user_id)
+        return self.ledger.available_balance(resolved_user_id, self._asset(asset))
 
     def lock_for_escrow(self, escrow_id: int, user_id: int, asset: str, amount: Decimal) -> None:
-        self._ensure_user_row(user_id)
-        if self.available_balance(user_id, asset) < Decimal(amount):
+        resolved_user_id = self._ensure_user_row(user_id)
+        if self.available_balance(resolved_user_id, asset) < Decimal(amount):
             raise ValueError("insufficient available balance")
-        self.conn.execute("INSERT INTO escrow_locks(escrow_id,user_id,asset,amount,status) VALUES(?,?,?,?,?)", (escrow_id, user_id, self._asset(asset), str(Decimal(amount)), "locked"))
-        self.ledger.add_entry("USER", user_id, user_id, asset, Decimal("0"), "ESCROW_LOCK", "escrow", escrow_id)
+        self.conn.execute("INSERT INTO escrow_locks(escrow_id,user_id,asset,amount,status) VALUES(?,?,?,?,?)", (escrow_id, resolved_user_id, self._asset(asset), str(Decimal(amount)), "locked"))
+        self.ledger.add_entry("USER", resolved_user_id, resolved_user_id, asset, Decimal("0"), "ESCROW_LOCK", "escrow", escrow_id)
 
     def release_escrow(self, escrow_id: int, seller_id: int, platform_fee: Decimal, bot_fee: Decimal, seller_payout: Decimal, bot_owner_id: int, asset: str) -> None:
         lock = self.conn.execute("SELECT * FROM escrow_locks WHERE escrow_id=?", (escrow_id,)).fetchone()
@@ -130,15 +140,15 @@ class WalletService:
         self.ledger.add_entry("USER", int(lock["user_id"]), int(lock["user_id"]), lock["asset"], Decimal("0"), "ADJUSTMENT", "escrow", escrow_id)
 
     def request_withdrawal(self, user_id: int, asset: str, amount: Decimal, destination_address: str):
-        self._ensure_user_row(user_id)
-        if self.available_balance(user_id, asset) < Decimal(amount):
+        resolved_user_id = self._ensure_user_row(user_id)
+        if self.available_balance(resolved_user_id, asset) < Decimal(amount):
             raise ValueError("insufficient available balance")
         cur = self.conn.execute(
             "INSERT INTO withdrawals(user_id,asset,amount,destination_address,status) VALUES(?,?,?,?,?)",
-            (user_id, self._asset(asset), str(Decimal(amount)), destination_address, "pending"),
+            (resolved_user_id, self._asset(asset), str(Decimal(amount)), destination_address, "pending"),
         )
         wid = int(cur.lastrowid)
-        self.ledger.add_entry("USER", user_id, user_id, asset, -Decimal(amount), "WITHDRAWAL_RESERVE", "withdrawal", wid)
+        self.ledger.add_entry("USER", resolved_user_id, resolved_user_id, asset, -Decimal(amount), "WITHDRAWAL_RESERVE", "withdrawal", wid)
         return {"id": wid, "asset": self._asset(asset), "amount": Decimal(amount), "destination_address": destination_address}
 
     def pending_withdrawals(self):
@@ -157,3 +167,18 @@ class WalletService:
                 continue
             total += Decimal(r["amount"])
         return total
+
+
+    def withdrawal_history(self, user_id: int, page: int = 1, per_page: int = 10):
+        resolved_user_id = self._ensure_user_row(user_id)
+        page = max(1, int(page))
+        per_page = max(1, int(per_page))
+        total = self.conn.execute("SELECT COUNT(*) c FROM withdrawals WHERE user_id=?", (resolved_user_id,)).fetchone()["c"]
+        pages = max(1, (int(total) + per_page - 1) // per_page)
+        page = min(page, pages)
+        offset = (page - 1) * per_page
+        rows = self.conn.execute(
+            "SELECT * FROM withdrawals WHERE user_id=? ORDER BY id DESC LIMIT ? OFFSET ?",
+            (resolved_user_id, per_page, offset),
+        ).fetchall()
+        return rows, page, pages
