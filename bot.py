@@ -139,9 +139,9 @@ def _services():
 def _start_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Profile", callback_data="profile"), InlineKeyboardButton("Escrow Menu", callback_data="escrow_menu")],
-            [InlineKeyboardButton("Check User", callback_data="check_user")],
-            [InlineKeyboardButton("Support Team", callback_data="support_team")],
+            [InlineKeyboardButton("👤 Profile", callback_data="profile"), InlineKeyboardButton("🤝 Escrow Menu", callback_data="escrow_menu")],
+            [InlineKeyboardButton("🔍Check User / 💡​Create Deal ", callback_data="check_user")],
+            [InlineKeyboardButton("​💬​Support Team", callback_data="support_team")],
         ]
     )
 
@@ -340,9 +340,9 @@ WITHDRAW_MINIMUMS = {
 def _profile_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Deposit", callback_data="profile_deposit"), InlineKeyboardButton("Withdraw", callback_data="profile_withdraw")],
-            [InlineKeyboardButton("Withdrawal History", callback_data="profile_withdraw_history:1")],
-            [InlineKeyboardButton("Back", callback_data="profile_back")],
+            [InlineKeyboardButton("💰 Deposit", callback_data="profile_deposit"), InlineKeyboardButton("Withdraw", callback_data="profile_withdraw")],
+            [InlineKeyboardButton("📂 Withdrawal History", callback_data="profile_withdraw_history:1")],
+            [InlineKeyboardButton("🔙 Back", callback_data="profile_back")],
         ]
     )
 
@@ -367,40 +367,40 @@ def _render_self_profile(conn, telegram_user, user_id: int, wallet: WalletServic
         (user_id, user_id),
     ).fetchone()["c"]
     lines = [
-        f"Your Telegram ID: {telegram_user.id}",
-        f"First Name: {first_name}",
-        "Balance:",
+        f"👤 Your Telegram ID: {telegram_user.id}",
+        f"👤 First Name: {first_name}\n",
+        "💰 Balance:",
     ]
     for asset in _enabled_assets():
         a = wallet.available_balance(user_id, asset)
         l = wallet.locked_balance(user_id, asset)
-        lines.append(f"• {asset}: available {a} | locked {l}")
+    lines.append(f"• {asset}: `{a}`\n")
     trust = "High" if successful >= 20 else "Medium" if successful >= 5 else "Low"
-    lines.append(f"Registered: {_date_short(registered)}")
-    lines.append(f"Trust level: {trust}")
+    lines.append(f"📅 Registered on : {_date_short(registered)} \n")
+    lines.append(f"🛡️ Trust level: {trust}")
     if int(rev["cnt"] or 0) < 3:
-        lines.append("Rating: Too few reviews")
+        lines.append("⭐ Rating: Too few reviews\n")
     else:
-        lines.append(f"Rating: {float(rev['avg_rating']):.1f}/5 from {int(rev['cnt'])} reviews")
-    lines.append("Deals:")
-    lines.append(f"Successful: {successful}")
-    lines.append(f"Cancelled: {cancelled}")
-    lines.append(f"Disputes lost: {disputes_lost}")
+        lines.append(f"⭐ Rating: {float(rev['avg_rating']):.1f}/5 from {int(rev['cnt'])} reviews\n")
+    lines.append("🤝  Deals:")
+    lines.append(f".✅ Successful: {successful}")
+    lines.append(f".🚫 Cancelled: {cancelled}")
+    lines.append(f".⚠️ Disputes lost: {disputes_lost}\n")
 
     spent_rows = conn.execute("SELECT asset, amount FROM escrows WHERE buyer_id=? AND status='completed'", (user_id,)).fetchall()
     earned_rows = conn.execute("SELECT asset, amount FROM escrows WHERE seller_id=? AND status='completed'", (user_id,)).fetchall()
-    lines.append("Total Spent/Earned:")
+    lines.append("📈  Total Spent/Earned:\n")
     assets = sorted({r['asset'] for r in spent_rows} | {r['asset'] for r in earned_rows})
     for asset in assets:
         spent = sum((Decimal(r['amount']) for r in spent_rows if r['asset'] == asset), Decimal('0'))
         earned = sum((Decimal(r['amount']) for r in earned_rows if r['asset'] == asset), Decimal('0'))
-        lines.append(f"• {asset}: spent {spent} / earned {earned}")
+        lines.append(f"• {asset}: spent {spent} / earned {earned}\n")
 
     last_reviews = conn.execute(
         "SELECT r.created_at, u.username reviewer_username FROM reviews r LEFT JOIN users u ON u.id=r.reviewer_id WHERE r.reviewed_id=? ORDER BY r.id DESC LIMIT 3",
         (user_id,),
     ).fetchall()
-    lines.append("Last 3 reviews:")
+    lines.append("📝 Last 3 reviews:")
     if not last_reviews:
         lines.append("• No reviews yet")
     else:
@@ -410,9 +410,9 @@ def _render_self_profile(conn, telegram_user, user_id: int, wallet: WalletServic
     return "\n".join(lines)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text("Welcome to EscrowHub", reply_markup=_start_menu())
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text("There is only 3% commission in bot. The lowest on market!", reply_markup=_start_menu())
 
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _show_profile(update, context, edit_existing=False)
@@ -491,7 +491,7 @@ async def profile_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             conn.close()
 
     if data == "profile_back":
-        await query.edit_message_text("Back to main menu", reply_markup=_start_menu())
+        await query.edit_message_text("There is only 3% commission in bot. The lowest on market!", reply_markup=_start_menu())
         return
 
     if data == "profile_open":
@@ -549,7 +549,7 @@ async def profile_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if page < pages:
             nav.append(InlineKeyboardButton("Next", callback_data=f"profile_withdraw_history:{page+1}"))
         buttons = [nav] if nav else []
-        buttons.append([InlineKeyboardButton("Back to Profile", callback_data="profile_open")])
+        buttons.append([InlineKeyboardButton("🔙 to Profile", callback_data="profile_open")])
         await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
 
 
@@ -672,7 +672,7 @@ async def withdraw_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             wallet.request_withdrawal(user_id, context.user_data["wd_asset"], Decimal(context.user_data["wd_amount"]), context.user_data["wd_address"])
         except ValueError as exc:
             conn.rollback()
-            await query.edit_message_text(str(exc), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to Profile", callback_data="profile_open")]]))
+            await query.edit_message_text(str(exc), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Profile", callback_data="profile_open")]]))
             return ConversationHandler.END
         conn.commit()
     finally:
@@ -682,7 +682,7 @@ async def withdraw_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         context.user_data.pop(k, None)
     await query.edit_message_text(
         "Withdrawal request submitted. Funds will arrive within a few minutes.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to Profile", callback_data="profile_open")]]),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Profile", callback_data="profile_open")]]),
     )
     return ConversationHandler.END
 
@@ -709,9 +709,10 @@ async def escrow_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "Escrow Menu",
         reply_markup=InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("New Deal", callback_data="esc_menu:new"), InlineKeyboardButton("Pending", callback_data="esc_menu:pending")],
-                [InlineKeyboardButton("Active", callback_data="esc_menu:active"), InlineKeyboardButton("Disputes", callback_data="esc_menu:disputes")],
-                [InlineKeyboardButton("History", callback_data="esc_menu:history")],
+                [InlineKeyboardButton("➕​ New Deal", callback_data="esc_menu:new")],
+                [InlineKeyboardButton("⌛ Pending", callback_data="esc_menu:pending"),InlineKeyboardButton("🤝 Active", callback_data="esc_menu:active"), ],
+                [InlineKeyboardButton("⚖️ Disputes", callback_data="esc_menu:disputes"), InlineKeyboardButton(" 📂 History", callback_data="esc_menu:history")],
+                [InlineKeyboardButton("🔙 Back", callback_data="profile_back")]
             ]
         ),
     )
@@ -757,13 +758,13 @@ async def escrow_menu_actions(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         if action == "pending":
             rows = escrow.list_pending_escrows(user_id)
-            title = "Pending escrows"
+            title = "⌛ Pending escrows"
         elif action == "active":
             rows = escrow.list_active_escrows(user_id)
-            title = "Active escrows"
+            title = "🤝 Active escrows"
         elif action == "disputes":
             rows = escrow.list_disputed_escrows(user_id)
-            title = "Disputed escrows"
+            title = "⚖️ Disputed escrows)"
         else:
             rows = []
             title = "Escrows"
@@ -771,13 +772,13 @@ async def escrow_menu_actions(update: Update, context: ContextTypes.DEFAULT_TYPE
         conn.close()
     lines = [title + ":"]
     if not rows:
-        lines.append("None")
-        if title == "Active escrows":
-            lines.append("No active state transitions are currently used in the default buyer flow.")
+        lines.append("")
+        if title == "🤝 Active deals ":
+            lines.append("")
     else:
         for r in rows[:10]:
             lines.append(f"#{r['id']} | {r['amount']} {r['asset']} | {r['status']} | {_format_db_timestamp(r['created_at'])}")
-    lines.append("\nUse Escrow Menu to navigate.")
+    lines.append("")
     await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="esc_back_menu")]]))
 
 
@@ -799,13 +800,12 @@ async def escrow_history_actions(update: Update, context: ContextTypes.DEFAULT_T
             return
         if data == "esc_back_menu":
             await query.edit_message_text(
-                "Escrow Menu",
+                "Escrow Menu:",
                 reply_markup=InlineKeyboardMarkup(
-                    [
-                        [InlineKeyboardButton("New Deal", callback_data="esc_menu:new"), InlineKeyboardButton("Pending", callback_data="esc_menu:pending")],
-                        [InlineKeyboardButton("Active", callback_data="esc_menu:active"), InlineKeyboardButton("Disputes", callback_data="esc_menu:disputes")],
-                        [InlineKeyboardButton("History", callback_data="esc_menu:history")],
-                    ]
+                [ [InlineKeyboardButton("➕​ New Deal", callback_data="esc_menu:new")], 
+                [InlineKeyboardButton("⌛ Pending", callback_data="esc_menu:pending"),InlineKeyboardButton("🤝 Active", callback_data="esc_menu:active"), ], 
+                [InlineKeyboardButton("⚖️ Disputes", callback_data="esc_menu:disputes"), InlineKeyboardButton(" 📂 History", callback_data="esc_menu:history")], 
+                [InlineKeyboardButton("🔙 Back", callback_data="profile_back")] ]
                 ),
             )
             return
@@ -938,7 +938,7 @@ async def deal_search_result_cb(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
 
     if query.data == "deal_back_main":
-        await query.edit_message_text("Back to main menu", reply_markup=_start_menu())
+        await query.edit_message_text("🔙 Back to main menu", reply_markup=_start_menu())
         return ConversationHandler.END
 
     conn, wallet, tenant, _ = _services()
@@ -1061,10 +1061,10 @@ async def deal_conditions_input(update: Update, context: ContextTypes.DEFAULT_TY
         )
         keyboard = InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("Cancel Request", callback_data="deal_cancel_request")],
-                [InlineKeyboardButton("Back to Pending List", callback_data="deal_back_pending")],
-                [InlineKeyboardButton("View Counter-Party Profile", callback_data="deal_view_counterparty")],
-                [InlineKeyboardButton("Release Funds", callback_data="deal_release_prompt")],
+                [InlineKeyboardButton("❌ Cancel Request", callback_data="deal_cancel_request")],
+                [InlineKeyboardButton("🔙 Back to Pending List", callback_data="deal_back_pending")],
+                [InlineKeyboardButton("👀 View Counter-Party Profile", callback_data="deal_view_counterparty")],
+                [InlineKeyboardButton("💰 Release Funds", callback_data="deal_release_prompt")],
             ]
         )
         await update.effective_message.reply_text(msg, reply_markup=keyboard)
@@ -1159,7 +1159,7 @@ async def _show_pending_list(query, context: ContextTypes.DEFAULT_TYPE) -> int:
     lines = ["Pending deals:"]
     for r in rows[:10]:
         lines.append(f"#{r['id']} | {r['amount']} {r['asset']} | status={r['status']} | {_format_db_timestamp(r['created_at'])}")
-    lines.append("Tap Back to return to current deal view.")
+    lines.append("🔙 Tap Back to return to current deal view.")
     await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="deal_back_to_pending")]]))
     return DEAL_PENDING_VIEW
 
@@ -1190,7 +1190,7 @@ async def _show_pending_view(query, context: ContextTypes.DEFAULT_TYPE) -> int:
     keyboard = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("Cancel Request", callback_data="deal_cancel_request")],
-            [InlineKeyboardButton("Back to Pending List", callback_data="deal_back_pending")],
+            [InlineKeyboardButton("🔙 Back to Pending List", callback_data="deal_back_pending")],
             [InlineKeyboardButton("View Counter-Party Profile", callback_data="deal_view_counterparty")],
             [InlineKeyboardButton("Release Funds", callback_data="deal_release_prompt")],
         ]
@@ -1232,7 +1232,7 @@ async def deal_release_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
             f"Payment of {view.amount} {view.asset} has been released to the seller."
         )
         stars = [InlineKeyboardButton("⭐", callback_data=f"deal_rate_seller:{i}") for i in range(1, 6)]
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Back to Main Menu", callback_data="deal_finish")], stars])
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="deal_finish")], stars])
         await query.edit_message_text(release_msg, reply_markup=keyboard)
 
         buyer_name = update.effective_user.username or str(update.effective_user.id)
@@ -1255,7 +1255,7 @@ async def deal_rate_seller(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     data = query.data
 
     if data == "deal_finish":
-        await query.edit_message_text("Done. Back to main menu.", reply_markup=_start_menu())
+        await query.edit_message_text("🔙 Done.  Back to main menu.", reply_markup=_start_menu())
         return ConversationHandler.END
 
     parts = _parse_callback_parts(data or "", "deal_rate_seller:", 2)
@@ -1280,7 +1280,7 @@ async def deal_rate_seller(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         escrow_id = int(context.user_data["escrow_id"])
         existing = conn.execute("SELECT 1 FROM reviews WHERE reviewer_id=? AND escrow_id=?", (buyer_id, escrow_id)).fetchone()
         if existing:
-            await query.edit_message_text("You already rated this deal.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to Main Menu", callback_data="deal_finish")]]))
+            await query.edit_message_text("You already rated this deal.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="deal_finish")]]))
             return DEAL_RATE_BUYER
         conn.execute(
             "INSERT INTO reviews(reviewer_id,reviewed_id,escrow_id,rating) VALUES(?,?,?,?)",
@@ -1298,7 +1298,7 @@ async def deal_rate_seller(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
         except Exception:
             LOGGER.exception("seller rating notification failed")
-        await query.edit_message_text("Your rating has been saved. Waiting for the seller's rating.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to Main Menu", callback_data="deal_finish")]]))
+        await query.edit_message_text("Your rating has been saved. Waiting for the seller's rating.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="deal_finish")]]))
         return DEAL_RATE_BUYER
     finally:
         conn.close()
@@ -1312,7 +1312,7 @@ async def deal_rate_buyer_wait(update: Update, context: ContextTypes.DEFAULT_TYP
     if query.data == "deal_finish":
         await query.edit_message_text("Done. Back to main menu.", reply_markup=_start_menu())
         return ConversationHandler.END
-    await query.edit_message_text("Waiting for seller rating. You can return to main menu.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to Main Menu", callback_data="deal_finish")]]))
+    await query.edit_message_text("Waiting for seller rating. You can return to main menu.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="deal_finish")]]))
     return DEAL_RATE_BUYER
 
 async def seller_rate_buyer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
