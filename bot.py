@@ -796,9 +796,9 @@ async def profile_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data == "profile_deposit":
-        keyboard = [[InlineKeyboardButton(asset, callback_data=f"dep_asset:{asset}")] for asset in _enabled_assets()]
+        keyboard = [[InlineKeyboardButton(_asset_with_icon(asset), callback_data=f"dep_asset:{asset}")] for asset in _enabled_assets()]
         keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="profile_open")])
-        await query.edit_message_text("💰 Deposit currency:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(_profile_block_html("<b>💰 Deposit currency:</b>"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
         return
 
     if data.startswith("profile_withdraw_history:"):
@@ -868,6 +868,7 @@ async def deposit_select_asset(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("Unsupported deposit currency.", reply_markup=_profile_menu())
         return ConversationHandler.END
     context.user_data["dep_asset"] = asset
+    asset_label_html = f"{_asset_profile_icon(asset)} {html.escape(asset)}"
 
     conn, _, _, escrow_service = _services()
     try:
@@ -877,7 +878,7 @@ async def deposit_select_asset(update: Update, context: ContextTypes.DEFAULT_TYP
 
     example = _deposit_quote_amounts(asset, Decimal("100"), price_usd)
     text = "\n".join([
-        _profile_block_html(f"<b>{_asset_profile_icon(asset)} {html.escape(asset)} Deposit</b>"),
+        _profile_block_html(f"<b>{asset_label_html} Deposit</b>"),
         _profile_block_html(
             "<b>💰 Enter the amount in USD to deposit</b>\n"
             "Min: $45.00\n"
@@ -885,7 +886,7 @@ async def deposit_select_asset(update: Update, context: ContextTypes.DEFAULT_TYP
             "Provider fee: 3%\n"
             "Platform fee: 2%\n\n"
             f"Example request: $100.00 USD\n"
-            f"Estimated to send: {html.escape(_crypto_quote_text(asset, example['crypto_amount']))}"
+            f"Estimated to send: {_asset_profile_icon(asset)} {html.escape(_crypto_quote_text(asset, example['crypto_amount']))}"
         ),
         "Send /cancel to abort.",
     ])
@@ -923,6 +924,8 @@ async def deposit_amount_input(update: Update, context: ContextTypes.DEFAULT_TYP
         conn.close()
 
     quote = _deposit_quote_amounts(asset, usd_amount, price_usd)
+    asset_label_html = f"{_asset_profile_icon(asset)} {html.escape(asset)}"
+    estimated_crypto_html = f"{_asset_profile_icon(asset)} {html.escape(_crypto_quote_text(asset, quote['crypto_amount']))}"
     provider_fee_text = _usd_text(quote["provider_fee_usd"])
     platform_fee_text = _usd_text(quote["platform_fee_usd"])
     explorer_template = DEPOSIT_EXPLORERS.get(asset, "https://etherscan.io/address/{address}")
@@ -931,17 +934,18 @@ async def deposit_amount_input(update: Update, context: ContextTypes.DEFAULT_TYP
         [InlineKeyboardButton("🔗 View Address", url=explorer_template.format(address=route.address))],
     ]
     details = [
-        _profile_block_html("<b>📥 Deposit details</b>"),
+        _profile_block_html(f"<b>📥 Deposit details • {asset_label_html}</b>"),
+        f"Selected asset: {_profile_block_html(asset_label_html)}",
         f"Requested amount: {_profile_block(f'${_usd_text(usd_amount)} USD')}",
-        f"Estimated crypto to send: {_profile_block(_crypto_quote_text(asset, quote['crypto_amount']))}",
+        f"Estimated crypto to send: {_profile_block_html(estimated_crypto_html)}",
         f"Provider fee: {_profile_block(f'${provider_fee_text} USD')}",
         f"Platform fee: {_profile_block(f'${platform_fee_text} USD')}",
         f"Address: {_profile_block(route.address)}",
-        f"Rate: {_profile_block(f'1 {asset} ≈ ${_usd_text(price_usd)}')}",
+        f"Rate: {_profile_block_html(f'1 {asset_label_html} ≈ ${html.escape(_usd_text(price_usd))}')}",
     ]
     if route.destination_tag:
         details.append(f"Destination tag: {_profile_block(route.destination_tag)}")
-    details.append("Send only the selected asset to this address.")
+    details.append(f"Send only {asset_label_html} to this address.")
     await update.effective_message.reply_text(
         "\n".join(details),
         reply_markup=InlineKeyboardMarkup(buttons),
