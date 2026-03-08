@@ -1599,6 +1599,20 @@ async def deal_enter_amount_callbacks(update: Update, context: ContextTypes.DEFA
     return DEAL_ENTER_AMOUNT
 
 
+def _deal_conditions_prompt(validation_line: str | None = None) -> str:
+    lines: list[str] = []
+    if validation_line:
+        lines.extend([validation_line, ""])
+    lines.extend([
+        "Describe the deal in detail, including ALL terms.",
+        "",
+        "‼️ THIS WILL AFFECT HOW DISPUTES ARE RESOLVED LATER",
+        "",
+        "Describe ALL deal conditions ✍️",
+    ])
+    return "\n".join(lines)
+
+
 async def deal_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if await _enforce_text_rate_limit(update, "deal_amount_input", limit=6, window_s=20):
         return DEAL_ENTER_AMOUNT
@@ -1655,10 +1669,7 @@ async def deal_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data["asset"] = asset
 
         await update.effective_message.reply_text(
-            "\n".join([
-                _profile_block_html("<b>Describe the deal in detail</b>"),
-                "Include all terms. This will affect how disputes are resolved later.",
-            ]),
+            _deal_conditions_prompt(),
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="deal_back_to_amount")]]),
             parse_mode=ParseMode.HTML,
         )
@@ -1673,7 +1684,11 @@ async def deal_conditions_input(update: Update, context: ContextTypes.DEFAULT_TY
         return DEAL_ENTER_CONDITIONS
     conditions = update.effective_message.text.strip()
     if not conditions:
-        await update.effective_message.reply_text("Conditions are required")
+        await update.effective_message.reply_text(
+            _deal_conditions_prompt("Please describe all deal conditions."),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="deal_back_to_amount")]]),
+            parse_mode=ParseMode.HTML,
+        )
         return DEAL_ENTER_CONDITIONS
 
     conn, _, tenant, escrow = _services()
