@@ -113,7 +113,13 @@ async def _enforce_text_rate_limit(update: Update, action: str, limit: int = 4, 
 def _runtime_bot_id(conn, tenant: TenantService) -> int:
     bot_id = int(Settings.bot_id)
     if not tenant.get_tenant(bot_id):
-        raise ValueError(f"Tenant bot {bot_id} is not configured")
+        owner_row = conn.execute("SELECT id FROM users ORDER BY id LIMIT 1").fetchone()
+        owner_id = int(owner_row["id"]) if owner_row else 1
+        conn.execute(
+            "INSERT OR IGNORE INTO bots(id, owner_user_id, bot_extra_fee_percent, display_name) VALUES(?,?,'0','EscrowHub')",
+            (bot_id, owner_id)
+        )
+        conn.commit()
     return bot_id
 
 (
@@ -152,7 +158,7 @@ async def _notify_safe(context: ContextTypes.DEFAULT_TYPE, telegram_user_id: int
     if not telegram_user_id:
         return
     try:
-        await context.bot.send_message(chat_id=telegram_user_id, text=text, reply_markup=reply_markup)
+        await context.bot.send_message(chat_id=telegram_user_id, text=text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
     except Exception:
         LOGGER.exception("notification failed for telegram_user_id=%s", telegram_user_id)
 
@@ -217,10 +223,10 @@ def _profile_custom_emoji(env_key: str, fallback: str) -> str:
 def _asset_profile_icon(asset: str) -> str:
     asset_code = (asset or "").upper()
     fallbacks = {
-        "USDT": "🟢",
-        "BTC": "🟠",
-        "ETH": "🟣",
-        "LTC": "🔵",
+        "USDT": "$",
+        "BTC": "₿",
+        "ETH": "⟠",
+        "LTC": "Ł",
     }
     return _profile_custom_emoji(f"TG_EMOJI_{asset_code}_ID", fallbacks.get(asset_code, "•"))
 
@@ -796,9 +802,9 @@ async def profile_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data == "profile_deposit":
-        keyboard = [[InlineKeyboardButton(asset, callback_data=f"dep_asset:{asset}")] for asset in _enabled_assets()]
+        keyboard = [[InlineKeyboardButton(_asset_with_icon(asset), callback_data=f"dep_asset:{asset}")] for asset in _enabled_assets()]
         keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="profile_open")])
-        await query.edit_message_text("💰 Deposit currency:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(_profile_block_html("<b>💰 Deposit currency:</b>"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
         return
 
     if data.startswith("profile_withdraw_history:"):
@@ -868,6 +874,7 @@ async def deposit_select_asset(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("Unsupported deposit currency.", reply_markup=_profile_menu())
         return ConversationHandler.END
     context.user_data["dep_asset"] = asset
+    asset_label_html = f"{_asset_profile_icon(asset)} {html.escape(asset)}"
 
     conn, _, _, escrow_service = _services()
     try:
@@ -877,7 +884,7 @@ async def deposit_select_asset(update: Update, context: ContextTypes.DEFAULT_TYP
 
     example = _deposit_quote_amounts(asset, Decimal("100"), price_usd)
     text = "\n".join([
-        _profile_block_html(f"<b>{_asset_profile_icon(asset)} {html.escape(asset)} Deposit</b>"),
+        _profile_block_html(f"<b>{asset_label_html} Deposit</b>"),
         _profile_block_html(
             "<b>💰 Enter the amount in USD to deposit</b>\n"
             "Min: $45.00\n"
@@ -885,7 +892,7 @@ async def deposit_select_asset(update: Update, context: ContextTypes.DEFAULT_TYP
             "Provider fee: 3%\n"
             "Platform fee: 2%\n\n"
             f"Example request: $100.00 USD\n"
-            f"Estimated to send: {html.escape(_crypto_quote_text(asset, example['crypto_amount']))}"
+            f"Estimated to send: {_asset_profile_icon(asset)} {html.escape(_crypto_quote_text(asset, example['crypto_amount']))}"
         ),
         "Send /cancel to abort.",
     ])
@@ -923,6 +930,8 @@ async def deposit_amount_input(update: Update, context: ContextTypes.DEFAULT_TYP
         conn.close()
 
     quote = _deposit_quote_amounts(asset, usd_amount, price_usd)
+    asset_label_html = f"{_asset_profile_icon(asset)} {html.escape(asset)}"
+    estimated_crypto_html = f"{_asset_profile_icon(asset)} {html.escape(_crypto_quote_text(asset, quote['crypto_amount']))}"
     provider_fee_text = _usd_text(quote["provider_fee_usd"])
     platform_fee_text = _usd_text(quote["platform_fee_usd"])
     explorer_template = DEPOSIT_EXPLORERS.get(asset, "https://etherscan.io/address/{address}")
@@ -931,17 +940,18 @@ async def deposit_amount_input(update: Update, context: ContextTypes.DEFAULT_TYP
         [InlineKeyboardButton("🔗 View Address", url=explorer_template.format(address=route.address))],
     ]
     details = [
-        _profile_block_html("<b>📥 Deposit details</b>"),
+        _profile_block_html(f"<b>📥 Deposit details • {asset_label_html}</b>"),
+        f"Selected asset: {_profile_block_html(asset_label_html)}",
         f"Requested amount: {_profile_block(f'${_usd_text(usd_amount)} USD')}",
-        f"Estimated crypto to send: {_profile_block(_crypto_quote_text(asset, quote['crypto_amount']))}",
+        f"Estimated crypto to send: {_profile_block_html(estimated_crypto_html)}",
         f"Provider fee: {_profile_block(f'${provider_fee_text} USD')}",
         f"Platform fee: {_profile_block(f'${platform_fee_text} USD')}",
         f"Address: {_profile_block(route.address)}",
-        f"Rate: {_profile_block(f'1 {asset} ≈ ${_usd_text(price_usd)}')}",
+        f"Rate: {_profile_block_html(f'1 {asset_label_html} ≈ ${html.escape(_usd_text(price_usd))}')}",
     ]
     if route.destination_tag:
         details.append(f"Destination tag: {_profile_block(route.destination_tag)}")
-    details.append("Send only the selected asset to this address.")
+    details.append(f"Send only {asset_label_html} to this address.")
     await update.effective_message.reply_text(
         "\n".join(details),
         reply_markup=InlineKeyboardMarkup(buttons),
@@ -1342,20 +1352,37 @@ async def escrow_history_actions(update: Update, context: ContextTypes.DEFAULT_T
                 await query.edit_message_text("Escrow item is stale. Please reopen Escrow Menu.")
                 return
             row = escrow.get_escrow(escrow_id)
+            icon = _asset_icon(row["asset"])
+            status_emoji = {
+                "pending": "⏳ Pending",
+                "active": "✅ Active",
+                "disputed": "⚖️ Disputed",
+                "completed": "✅ Completed",
+                "cancelled": "❌ Cancelled",
+            }.get(row["status"], row["status"].capitalize())
+            # Fetch counterparty username
+            cp_id = escrow.counterparty_user_id(row, user_id)
+            cp = conn.execute("SELECT username FROM users WHERE id=?", (cp_id,)).fetchone()
+            cp_name = cp["username"] if cp and cp["username"] else "unknown"
+            role = "Seller" if int(row["buyer_id"]) == user_id else "Buyer"
             text = (
-                f"Escrow #{row['id']}\n\n"
-                f"Status: {row['status']}\n"
-                f"Amount: {row['amount']} {row['asset']}\n"
-                f"Created: {_format_db_timestamp(row['created_at'])}\n"
-                f"Updated: {_format_db_timestamp(row['updated_at'])}\n"
-                f"Description: {row['description'] or '-'}"
+                f"<b>📋 Deal #{row['id']}</b>\n\n"
+                f"<b>Status:</b> {status_emoji}\n"
+                f"<b>{role}:</b> @{html.escape(str(cp_name))}\n"
+                f"<b>Amount:</b> <code>{html.escape(str(row['amount']))} {html.escape(str(row['asset']))}</code> {icon}\n"
+                f"<b>Created:</b> {_format_db_timestamp(row['created_at'])}\n\n"
+                f"<b>Conditions</b>\n{html.escape(str(row['description'] or '-'))}"
             )
             back_cb = {
                 "pending": f"esc_pending_page:{page}",
                 "active": f"esc_active_page:{page}",
                 "disputes": f"esc_disputes_page:{page}",
             }.get(section, "esc_back_menu")
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data=back_cb)]]))
+            kb_rows = [[InlineKeyboardButton("⬅️ Back", callback_data=back_cb)]]
+            if row["status"] == "pending" and int(row["buyer_id"]) == user_id:
+                esc_id_val = row["id"]
+                kb_rows.insert(0, [InlineKeyboardButton("📋 View Pending Request", callback_data=f"esc_view_pending:{esc_id_val}:{back_cb}")])
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb_rows), parse_mode=ParseMode.HTML)
             return
         if data.startswith("esc_hist_open:"):
             parts = _parse_callback_parts(data, "esc_hist_open:", 4)
@@ -1595,6 +1622,20 @@ async def deal_enter_amount_callbacks(update: Update, context: ContextTypes.DEFA
     return DEAL_ENTER_AMOUNT
 
 
+def _deal_conditions_prompt(validation_line: str | None = None) -> str:
+    lines: list[str] = []
+    if validation_line:
+        lines.extend([validation_line, ""])
+    lines.extend([
+        "Describe the deal in detail, including ALL terms.",
+        "",
+        "‼️ THIS WILL AFFECT HOW DISPUTES ARE RESOLVED LATER",
+        "",
+        "Describe ALL deal conditions ✍️",
+    ])
+    return "\n".join(lines)
+
+
 async def deal_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if await _enforce_text_rate_limit(update, "deal_amount_input", limit=6, window_s=20):
         return DEAL_ENTER_AMOUNT
@@ -1651,10 +1692,7 @@ async def deal_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data["asset"] = asset
 
         await update.effective_message.reply_text(
-            "\n".join([
-                _profile_block_html("<b>Describe the deal in detail</b>"),
-                "Include all terms. This will affect how disputes are resolved later.",
-            ]),
+            _deal_conditions_prompt(),
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="deal_back_to_amount")]]),
             parse_mode=ParseMode.HTML,
         )
@@ -1669,7 +1707,11 @@ async def deal_conditions_input(update: Update, context: ContextTypes.DEFAULT_TY
         return DEAL_ENTER_CONDITIONS
     conditions = update.effective_message.text.strip()
     if not conditions:
-        await update.effective_message.reply_text("Conditions are required")
+        await update.effective_message.reply_text(
+            _deal_conditions_prompt("Please describe all deal conditions."),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="deal_back_to_amount")]]),
+            parse_mode=ParseMode.HTML,
+        )
         return DEAL_ENTER_CONDITIONS
 
     conn, _, tenant, escrow = _services()
@@ -1700,27 +1742,41 @@ async def deal_conditions_input(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data["created_label"] = created_label
         context.user_data["previous_view"] = "pending"
         msg = (
-            "Pending Deal Request:\n"
-            f"@{seller_username}\n"
-            f"{conditions}\n"
-            f"{amount} {asset}\n"
-            f"Created: {created_label}"
+            f"✅ Deal sent to @{seller_username}\n\n"
+            f"⏳ Waiting for @{seller_username} to accept...\n\n"
+            f"💰 {amount} {asset}\n"
+            f"📋 {conditions}\n\n"
+            f"🕒 Created: {created_label}"
         )
         keyboard = InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("❌ Cancel Request", callback_data="deal_cancel_request")],
-                [InlineKeyboardButton("⬅️ Back", callback_data="deal_back_pending")],
-                [InlineKeyboardButton("👀 View Counter-Party Profile", callback_data="deal_view_counterparty")],
-                [InlineKeyboardButton("💰 Release Funds", callback_data="deal_release_prompt")],
+                [InlineKeyboardButton("📋 View Deal", callback_data="deal_back_pending")],
+                [InlineKeyboardButton("🏠 Main Menu", callback_data="deal_finish_main")],
             ]
         )
         await update.effective_message.reply_text(msg, reply_markup=keyboard)
 
         buyer_name = update.effective_user.username or str(update.effective_user.id)
+        icon = _asset_icon(asset)
+        seller_msg = (
+            "<b>📨 New Deal Request</b>\n\n"
+            f"<b>From:</b> @{html.escape(str(buyer_name))}\n"
+            f"<b>Amount:</b> <code>{html.escape(str(amount))} {html.escape(str(asset))}</code> {icon}\n"
+            f"<b>Deal #{view.escrow_id}</b> · {html.escape(str(created_label))}\n\n"
+            f"<b>Conditions</b>\n{html.escape(str(conditions))}\n\n"
+            "❓ <i>Do you accept this deal?</i>"
+        )
+        seller_keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Accept", callback_data=f"escrow_accept:{view.escrow_id}"),
+                InlineKeyboardButton("❌ Decline", callback_data=f"escrow_decline:{view.escrow_id}"),
+            ]
+        ])
         await _notify_safe(
             context,
             context.user_data.get("seller_telegram_id"),
-            f"New Deal Request from @{buyer_name} | {amount} {asset} | {conditions} | Created: {created_label}",
+            seller_msg,
+            reply_markup=seller_keyboard,
         )
         conn.commit()
         return DEAL_PENDING_VIEW
@@ -1738,14 +1794,43 @@ async def deal_pending_actions(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("Deal context expired. Run /check_user again.", reply_markup=_start_menu())
         return ConversationHandler.END
 
+    if action == "deal_finish_main":
+        _clear_draft_flow(context)
+        await query.edit_message_text("🏠 Main Menu", reply_markup=_start_menu())
+        return ConversationHandler.END
+
     if action == "deal_cancel_request":
-        moderator = Settings.moderator_username or "moderator"
-        context.user_data["previous_view"] = "cancel_info"
+        escrow_id = context.user_data.get("escrow_id")
+        if not escrow_id:
+            await query.edit_message_text("Deal context expired.", reply_markup=_start_menu())
+            return ConversationHandler.END
+        conn2, _, _, _ = _services()
+        try:
+            row = conn2.execute("SELECT status FROM escrows WHERE id=?", (int(escrow_id),)).fetchone()
+            if not row:
+                await query.answer("Deal not found.", show_alert=True)
+                return DEAL_PENDING_VIEW
+            if row["status"] != "pending":
+                await query.answer("Cannot cancel — seller already accepted this deal.", show_alert=True)
+                return DEAL_PENDING_VIEW
+            # Unlock buyer funds and cancel
+            conn2.execute("UPDATE escrows SET status='cancelled', updated_at=CURRENT_TIMESTAMP WHERE id=?", (int(escrow_id),))
+            conn2.execute(
+                "INSERT INTO ledger_entries(account_type,account_owner_id,user_id,asset,amount,entry_type,ref_type,ref_id) "
+                "SELECT account_type,account_owner_id,user_id,asset,-amount,'ESCROW_UNLOCK','escrow',ref_id "
+                "FROM ledger_entries WHERE ref_type='escrow' AND ref_id=? AND entry_type='ESCROW_LOCK'",
+                (int(escrow_id),)
+            )
+            conn2.commit()
+        finally:
+            conn2.close()
+        _clear_draft_flow(context)
         await query.edit_message_text(
-            f"To cancel this deal, please contact the moderators: @{moderator}",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="deal_back_to_pending")]]),
+            "✅ <b>Deal request cancelled.</b>\n\nYour funds have been unlocked.",
+            reply_markup=_start_menu(),
+            parse_mode=ParseMode.HTML,
         )
-        return DEAL_CANCEL_INFO
+        return ConversationHandler.END
 
     if action == "deal_back_pending":
         return await _show_pending_list(query, context)
@@ -1820,30 +1905,31 @@ async def deal_cancel_info_actions(update: Update, context: ContextTypes.DEFAULT
 
 async def _show_pending_view(query, context: ContextTypes.DEFAULT_TYPE) -> int:
     amount = context.user_data.get("amount")
-    asset = context.user_data.get("asset")
+    asset = context.user_data.get("asset", "USDT")
     seller_username = context.user_data.get("seller_username", "unknown")
     conditions = context.user_data.get("conditions", "")
     escrow_id = context.user_data.get("escrow_id")
     created_label = context.user_data.get("created_label", "unknown")
     if not escrow_id:
-        await query.edit_message_text("Deal context expired. Run /check_user again.", reply_markup=_start_menu())
+        await query.edit_message_text("Deal context expired.", reply_markup=_start_menu())
         return ConversationHandler.END
+    icon = _asset_icon(asset)
     text = (
-        "Pending Deal Request:\n"
-        f"@{seller_username}\n"
-        f"{conditions}\n"
-        f"{amount} {asset}\n"
-        f"Created: {created_label}"
+        "<b>⏳ Pending Deal Request</b>\n\n"
+        f"<b>Seller:</b> @{html.escape(str(seller_username))}\n"
+        f"<b>Amount:</b> <code>{html.escape(str(amount))} {html.escape(str(asset))}</code> {icon}\n"
+        f"<b>Deal #{escrow_id}</b> · Created: {html.escape(str(created_label))}\n\n"
+        f"<b>Conditions</b>\n{html.escape(str(conditions))}\n\n"
+        "⏳ <i>Waiting for seller to accept…</i>"
     )
     keyboard = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Cancel Request", callback_data="deal_cancel_request")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="deal_back_pending")],
-            [InlineKeyboardButton("View Counter-Party Profile", callback_data="deal_view_counterparty")],
-            [InlineKeyboardButton("Release Funds", callback_data="deal_release_prompt")],
+            [InlineKeyboardButton("❌ Cancel Request", callback_data="deal_cancel_request")],
+            [InlineKeyboardButton("👤 View Seller Profile", callback_data="deal_view_counterparty")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="deal_finish_main")],
         ]
     )
-    await query.edit_message_text(text, reply_markup=keyboard)
+    await query.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
     return DEAL_PENDING_VIEW
 
 
@@ -2104,6 +2190,157 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await fn(update, context)
 
 
+
+async def escrow_accept_decline(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global handler for seller Accept/Decline buttons sent via notification."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data  # escrow_accept:ID or escrow_decline:ID
+    action, escrow_id_str = data.split(":", 1)
+    try:
+        escrow_id = int(escrow_id_str)
+    except ValueError:
+        await query.edit_message_text("Invalid deal reference.")
+        return
+
+    conn, _, tenant, escrow_svc = _services()
+    try:
+        row = conn.execute("SELECT * FROM escrows WHERE id=?", (escrow_id,)).fetchone()
+        if not row:
+            await query.edit_message_text("❌ Deal not found.")
+            return
+        seller_user = conn.execute("SELECT telegram_id, username FROM users WHERE id=?", (int(row["seller_id"]),)).fetchone()
+        if not seller_user or int(seller_user["telegram_id"]) != update.effective_user.id:
+            await query.answer("This deal is not addressed to you.", show_alert=True)
+            return
+        if row["status"] != "pending":
+            await query.answer(f"This deal is already {row['status']}.", show_alert=True)
+            return
+
+        buyer_user = conn.execute("SELECT telegram_id, username FROM users WHERE id=?", (int(row["buyer_id"]),)).fetchone()
+        buyer_tg_id = int(buyer_user["telegram_id"]) if buyer_user else None
+        buyer_name = buyer_user["username"] if buyer_user else "buyer"
+        icon = _asset_icon(row["asset"])
+
+        if action == "escrow_accept":
+            conn.execute("UPDATE escrows SET status='active', updated_at=CURRENT_TIMESTAMP WHERE id=?", (escrow_id,))
+            conn.commit()
+            # Notify seller
+            await query.edit_message_text(
+                f"✅ <b>Deal #{escrow_id} accepted!</b>\n\n"
+                f"<b>From:</b> @{html.escape(str(buyer_name))}\n"
+                f"<b>Amount:</b> <code>{html.escape(str(row['amount']))} {html.escape(str(row['asset']))}</code> {icon}\n\n"
+                f"<blockquote>{html.escape(str(row['description'] or ''))}</blockquote>\n\n"
+                "💰 <i>Funds are locked. Deliver as agreed.</i>",
+                parse_mode=ParseMode.HTML,
+            )
+            # Notify buyer
+            if buyer_tg_id:
+                await context.bot.send_message(
+                    chat_id=buyer_tg_id,
+                    text=(
+                        f"✅ <b>@{html.escape(str(seller_user['username'] or 'Seller'))} accepted your deal!</b>\n\n"
+                        f"<b>Deal #{escrow_id}</b> is now <b>Active</b>\n"
+                        f"<code>{html.escape(str(row['amount']))} {html.escape(str(row['asset']))}</code> {icon}\n\n"
+                        f"<blockquote>{html.escape(str(row['description'] or ''))}</blockquote>\n\n"
+                        "🔒 <i>Funds locked. Release when you receive the goods/service.</i>"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+        else:  # escrow_decline
+            conn.execute("UPDATE escrows SET status='cancelled', updated_at=CURRENT_TIMESTAMP WHERE id=?", (escrow_id,))
+            # Unlock buyer funds
+            conn.execute(
+                "INSERT INTO ledger_entries(account_type,account_owner_id,user_id,asset,amount,entry_type,ref_type,ref_id) "
+                "SELECT account_type,account_owner_id,user_id,asset,-amount,'ESCROW_UNLOCK','escrow',ref_id "
+                "FROM ledger_entries WHERE ref_type='escrow' AND ref_id=? AND entry_type='ESCROW_LOCK'",
+                (escrow_id,)
+            )
+            conn.commit()
+            await query.edit_message_text(
+                f"❌ <b>Deal #{escrow_id} declined.</b>",
+                parse_mode=ParseMode.HTML,
+            )
+            if buyer_tg_id:
+                await context.bot.send_message(
+                    chat_id=buyer_tg_id,
+                    text=(
+                        f"❌ <b>Your deal request was declined.</b>\n\n"
+                        f"<b>Deal #{escrow_id}</b> · {html.escape(str(row['asset']))} {icon}\n\n"
+                        "<i>Your funds have been unlocked.</i>"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+    finally:
+        conn.close()
+
+
+async def esc_cancel_pending_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancel a pending escrow directly from the Escrow Menu deal view."""
+    query = update.callback_query
+    await query.answer()
+    escrow_id = int(query.data.split(":")[1])
+    conn, _, _, _ = _services()
+    try:
+        row = conn.execute("SELECT * FROM escrows WHERE id=?", (escrow_id,)).fetchone()
+        if not row or int(row["buyer_id"]) != update.effective_user.id:
+            await query.answer("Not authorised.", show_alert=True)
+            return
+        if row["status"] != "pending":
+            await query.answer(f"Cannot cancel — deal is already {row['status']}.", show_alert=True)
+            return
+        conn.execute("UPDATE escrows SET status='cancelled', updated_at=CURRENT_TIMESTAMP WHERE id=?", (escrow_id,))
+        conn.execute(
+            "INSERT INTO ledger_entries(account_type,account_owner_id,user_id,asset,amount,entry_type,ref_type,ref_id) "
+            "SELECT account_type,account_owner_id,user_id,asset,-amount,'ESCROW_UNLOCK','escrow',ref_id "
+            "FROM ledger_entries WHERE ref_type='escrow' AND ref_id=? AND entry_type='ESCROW_LOCK'",
+            (escrow_id,)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    await query.edit_message_text(
+        "✅ <b>Deal request cancelled.</b>\n\nYour funds have been unlocked.",
+        reply_markup=_start_menu(),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def esc_view_pending_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the full Pending Deal Request from Escrow Menu (loads from DB, no conv state needed)."""
+    query = update.callback_query
+    await query.answer()
+    # callback: esc_view_pending:{escrow_id}:{back_cb}
+    parts = query.data.split(":", 2)
+    escrow_id = int(parts[1])
+    back_cb = parts[2] if len(parts) > 2 else "esc_back_menu"
+
+    conn, _, _, escrow_svc = _services()
+    try:
+        row = conn.execute("SELECT * FROM escrows WHERE id=?", (escrow_id,)).fetchone()
+        if not row or row["status"] != "pending":
+            await query.edit_message_text("This deal is no longer pending.", reply_markup=_start_menu())
+            return
+        seller = conn.execute("SELECT username FROM users WHERE id=?", (int(row["seller_id"]),)).fetchone()
+        seller_name = seller["username"] if seller and seller["username"] else "unknown"
+        icon = _asset_icon(row["asset"])
+        created_label = _format_db_timestamp(row["created_at"])
+        text = (
+            "<b>⏳ Pending Deal Request</b>\n\n"
+            f"<b>Seller:</b> @{html.escape(str(seller_name))}\n"
+            f"<b>Amount:</b> <code>{html.escape(str(row['amount']))} {html.escape(str(row['asset']))}</code> {icon}\n"
+            f"<b>Deal #{escrow_id}</b> · Created: {html.escape(str(created_label))}\n\n"
+            f"<b>Conditions</b>\n{html.escape(str(row['description'] or '-'))}\n\n"
+            "⏳ <i>Waiting for seller to accept…</i>"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel Request", callback_data=f"esc_cancel_pending:{escrow_id}")],
+            [InlineKeyboardButton("⬅️ Back", callback_data=back_cb)],
+        ])
+        await query.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+    finally:
+        conn.close()
+
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -2130,7 +2367,7 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, deal_conditions_input),
                 CallbackQueryHandler(deal_back_from_conditions, pattern="^deal_back_to_amount$"),
             ],
-            DEAL_PENDING_VIEW: [CallbackQueryHandler(deal_pending_actions, pattern="^deal_(cancel_request|back_pending|view_counterparty|release_prompt|back_to_pending)$")],
+            DEAL_PENDING_VIEW: [CallbackQueryHandler(deal_pending_actions, pattern="^deal_(cancel_request|back_pending|view_counterparty|release_prompt|back_to_pending|finish_main)$")],
             DEAL_CANCEL_INFO: [CallbackQueryHandler(deal_cancel_info_actions, pattern="^deal_back_to_pending$")],
             DEAL_RELEASE_CONFIRM: [CallbackQueryHandler(deal_release_confirm, pattern="^deal_(release_confirm|back_to_pending)$")],
             DEAL_RATE_SELLER: [CallbackQueryHandler(deal_rate_seller, pattern=r"^deal_(rate_seller:\d+|finish)$")],
@@ -2195,6 +2432,9 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(profile_actions, pattern=r"^(profile_(?!withdraw$)|esc_wd_open:).*$"))
     app.add_handler(CallbackQueryHandler(escrow_menu_actions, pattern=r"^esc_menu:(pending|active|disputes|history)$"))
     app.add_handler(CallbackQueryHandler(escrow_history_actions, pattern=r"^(esc_hist_|esc_back_menu|esc_pending_page:|esc_active_page:|esc_disputes_page:|esc_open:).*$"))
+    app.add_handler(CallbackQueryHandler(esc_view_pending_handler, pattern=r"^esc_view_pending:\d+:.+$"))
+    app.add_handler(CallbackQueryHandler(esc_cancel_pending_handler, pattern=r"^esc_cancel_pending:\d+$"))
+    app.add_handler(CallbackQueryHandler(escrow_accept_decline, pattern=r"^escrow_(accept|decline):\d+$"))
     app.add_handler(CallbackQueryHandler(on_menu_click))
     app.run_polling()
 
