@@ -235,7 +235,7 @@ def _profile_asset_line(asset: str, amount: Decimal | int | str) -> str:
 def _profile_review_line(review: dict) -> str:
     reviewer = html.escape(str(review.get("reviewer_username") or "unknown"))
     stars = "⭐" * max(1, min(5, int(review.get("rating") or 0)))
-    return f"• {stars} by {_profile_chip(f'@{reviewer}')} ({_date_short(review.get('created_at'))})"
+    return f"• {stars} by @{reviewer} ({_date_short(review.get('created_at'))})"
 
 
 def _user_profile(conn, user_row) -> dict:
@@ -334,12 +334,12 @@ def _render_user_profile(profile: dict) -> str:
     return "\n".join(
         [
             _profile_blockquote(
-                f"👤 Profile: {_profile_chip(f'@{username}')}",
+                f"👤 Profile: @{html.escape(username)}",
                 f"👤 Telegram Id: {_profile_chip(profile.get('telegram_id', 'unknown'))}",
                 f"👤 First Name: {_profile_chip(first_name)}",
             ),
             "",
-            _profile_blockquote(f"📅 Registered: {_profile_chip(registered_label)}"),
+            _profile_blockquote(f"📅 Registered: {html.escape(registered_label)}"),
             "",
             _profile_blockquote(
                 f"🛡️ Trust level: {trust_level}",
@@ -678,7 +678,7 @@ def _render_self_profile(conn, telegram_user, user_id: int, wallet: WalletServic
             "💰 Balance:",
             _profile_blockquote(*balance_lines),
             "",
-            _profile_blockquote(f"📅 Registered: {_profile_chip(_date_short(profile.get('registered_date')))}"),
+            _profile_blockquote(f"📅 Registered: {html.escape(_date_short(profile.get('registered_date')))}"),
             "",
             _profile_blockquote(
                 f"🛡️ Trust level: {html.escape(str(profile.get('trust_level') or '🔴 Low'))}",
