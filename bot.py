@@ -132,7 +132,10 @@ def _runtime_bot_id(conn, tenant: TenantService) -> int:
     DEAL_RATE_SELLER,
     DEAL_RATE_BUYER,
     DEAL_SEARCH_INPUT,
-) = range(9)
+    DEAL_ACTIVE_VIEW,
+    DEAL_DISPUTE_REASON,
+    DEAL_CANCEL_ACTIVE,
+) = range(12)
 
 
 def _services():
@@ -1379,17 +1382,20 @@ async def escrow_history_actions(update: Update, context: ContextTypes.DEFAULT_T
                 "disputes": f"esc_disputes_page:{page}",
             }.get(section, "esc_back_menu")
             kb_rows = [[InlineKeyboardButton("⬅️ Back", callback_data=back_cb)]]
-            if row["status"] == "pending" and int(row["buyer_id"]) == user_id:
-                esc_id_val = row["id"]
+            esc_id_val = row["id"]
+            is_buyer = int(row["buyer_id"]) == user_id
+            if row["status"] == "pending" and is_buyer:
                 kb_rows.insert(0, [InlineKeyboardButton("📋 View Pending Request", callback_data=f"esc_view_pending:{esc_id_val}:{back_cb}")])
+            elif row["status"] == "active":
+                kb_rows.insert(0, [InlineKeyboardButton("📋 View Active Deal", callback_data=f"esc_view_active:{esc_id_val}:{back_cb}")])
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb_rows), parse_mode=ParseMode.HTML)
             return
         if data.startswith("esc_hist_open:"):
-            parts = _parse_callback_parts(data, "esc_hist_open:", 4)
+            parts = _parse_callback_parts(data, "esc_hist_open:", 3)
             if not parts:
                 await query.edit_message_text("Deal history item is stale. Please reopen history.")
                 return
-            _, _, escrow_id, page = parts
+            _, escrow_id, page = parts
             try:
                 row = escrow.get_escrow(int(escrow_id))
             except ValueError:
@@ -1426,11 +1432,11 @@ async def escrow_history_actions(update: Update, context: ContextTypes.DEFAULT_T
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
             return
         if data.startswith("esc_hist_rate:"):
-            parts = _parse_callback_parts(data, "esc_hist_rate:", 5)
+            parts = _parse_callback_parts(data, "esc_hist_rate:", 4)
             if not parts:
                 await query.edit_message_text("Rating action is stale. Please reopen history.")
                 return
-            _, _, escrow_id_str, rating_str, page = parts
+            _, escrow_id_str, rating_str, page = parts
             try:
                 escrow_id = int(escrow_id_str)
                 rating_value = int(rating_str)
@@ -1460,11 +1466,11 @@ async def escrow_history_actions(update: Update, context: ContextTypes.DEFAULT_T
             )
             return
         if data.startswith("esc_hist_profile:"):
-            parts = _parse_callback_parts(data, "esc_hist_profile:", 5)
+            parts = _parse_callback_parts(data, "esc_hist_profile:", 4)
             if not parts:
                 await query.edit_message_text("Counter-party view is stale. Please reopen history.")
                 return
-            _, _, cp_id, page, escrow_id = parts
+            _, cp_id, page, escrow_id = parts
             row = conn.execute("SELECT * FROM users WHERE id=?", (int(cp_id),)).fetchone()
             if not row:
                 await query.edit_message_text("Counter-party profile not found")
@@ -1750,7 +1756,7 @@ async def deal_conditions_input(update: Update, context: ContextTypes.DEFAULT_TY
         )
         keyboard = InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("📋 View Deal", callback_data="deal_back_pending")],
+                [InlineKeyboardButton("📋 View Deal", callback_data="deal_back_to_pending")],
                 [InlineKeyboardButton("🏠 Main Menu", callback_data="deal_finish_main")],
             ]
         )
@@ -2230,8 +2236,13 @@ async def escrow_accept_decline(update: Update, context: ContextTypes.DEFAULT_TY
                 f"✅ <b>Deal #{escrow_id} accepted!</b>\n\n"
                 f"<b>From:</b> @{html.escape(str(buyer_name))}\n"
                 f"<b>Amount:</b> <code>{html.escape(str(row['amount']))} {html.escape(str(row['asset']))}</code> {icon}\n\n"
-                f"<blockquote>{html.escape(str(row['description'] or ''))}</blockquote>\n\n"
+                f"<b>Conditions</b>\n{html.escape(str(row['description'] or ''))}\n\n"
                 "💰 <i>Funds are locked. Deliver as agreed.</i>",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⚖️ Open Dispute", callback_data=f"esc_active_dispute:{escrow_id}")],
+                    [InlineKeyboardButton("👤 View Buyer Profile", callback_data=f"esc_active_profile:{escrow_id}:esc_back_menu")],
+                    [InlineKeyboardButton("📋 View Deal", callback_data=f"esc_view_active:{escrow_id}:esc_back_menu")],
+                ]),
                 parse_mode=ParseMode.HTML,
             )
             # Notify buyer
@@ -2242,9 +2253,16 @@ async def escrow_accept_decline(update: Update, context: ContextTypes.DEFAULT_TY
                         f"✅ <b>@{html.escape(str(seller_user['username'] or 'Seller'))} accepted your deal!</b>\n\n"
                         f"<b>Deal #{escrow_id}</b> is now <b>Active</b>\n"
                         f"<code>{html.escape(str(row['amount']))} {html.escape(str(row['asset']))}</code> {icon}\n\n"
-                        f"<blockquote>{html.escape(str(row['description'] or ''))}</blockquote>\n\n"
+                        f"<b>Conditions</b>\n{html.escape(str(row['description'] or ''))}\n\n"
                         "🔒 <i>Funds locked. Release when you receive the goods/service.</i>"
                     ),
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("💰 Release Funds", callback_data=f"esc_active_release:{escrow_id}")],
+                        [InlineKeyboardButton("❌ Request Cancellation", callback_data=f"esc_active_cancel:{escrow_id}")],
+                        [InlineKeyboardButton("⚖️ Open Dispute", callback_data=f"esc_active_dispute:{escrow_id}")],
+                        [InlineKeyboardButton("👤 View Seller Profile", callback_data=f"esc_active_profile:{escrow_id}:esc_back_menu")],
+                        [InlineKeyboardButton("📋 View Deal", callback_data=f"esc_view_active:{escrow_id}:esc_back_menu")],
+                    ]),
                     parse_mode=ParseMode.HTML,
                 )
         else:  # escrow_decline
@@ -2282,8 +2300,16 @@ async def esc_cancel_pending_handler(update: Update, context: ContextTypes.DEFAU
     escrow_id = int(query.data.split(":")[1])
     conn, _, _, _ = _services()
     try:
+        # Resolve internal user_id from Telegram ID
+        tg_id = update.effective_user.id
+        user_row = conn.execute("SELECT id FROM users WHERE telegram_id=?", (tg_id,)).fetchone()
+        if not user_row:
+            await query.answer("User not found.", show_alert=True)
+            return
+        internal_user_id = int(user_row["id"])
+
         row = conn.execute("SELECT * FROM escrows WHERE id=?", (escrow_id,)).fetchone()
-        if not row or int(row["buyer_id"]) != update.effective_user.id:
+        if not row or int(row["buyer_id"]) != internal_user_id:
             await query.answer("Not authorised.", show_alert=True)
             return
         if row["status"] != "pending":
@@ -2341,6 +2367,417 @@ async def esc_view_pending_handler(update: Update, context: ContextTypes.DEFAULT
     finally:
         conn.close()
 
+
+# ──────────────────────────────────────────────
+# ACTIVE DEAL HANDLERS (global, outside conv)
+# ──────────────────────────────────────────────
+
+def _resolve_user_id(conn, telegram_id: int) -> int | None:
+    row = conn.execute("SELECT id FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
+    return int(row["id"]) if row else None
+
+
+async def esc_active_profile_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """View counterparty profile from active deal."""
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split(":", 2)
+    escrow_id = int(parts[1])
+    back_cb = parts[2] if len(parts) > 2 else "esc_back_menu"
+    conn, _, _, escrow_svc = _services()
+    try:
+        user_id = _resolve_user_id(conn, update.effective_user.id)
+        row = conn.execute("SELECT * FROM escrows WHERE id=?", (escrow_id,)).fetchone()
+        if not row:
+            await query.edit_message_text("Deal not found.")
+            return
+        cp_id = escrow_svc.counterparty_user_id(row, user_id)
+        cp_row = conn.execute("SELECT * FROM users WHERE id=?", (cp_id,)).fetchone()
+        profile_txt = _render_user_profile(_user_profile(conn, cp_row))
+    finally:
+        conn.close()
+    await query.edit_message_text(
+        profile_txt,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=back_cb)]]),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def esc_active_release_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Release funds confirmation screen."""
+    query = update.callback_query
+    await query.answer()
+    escrow_id = int(query.data.split(":")[1])
+    conn, _, _, _ = _services()
+    try:
+        row = conn.execute("SELECT * FROM escrows WHERE id=?", (escrow_id,)).fetchone()
+        if not row or row["status"] != "active":
+            await query.answer("Deal is no longer active.", show_alert=True)
+            return
+        user_id = _resolve_user_id(conn, update.effective_user.id)
+        if int(row["buyer_id"]) != user_id:
+            await query.answer("Only the buyer can release funds.", show_alert=True)
+            return
+        icon = _asset_icon(row["asset"])
+    finally:
+        conn.close()
+    conn2, _, _, esc2 = _services()
+    try:
+        usd_val = esc2.price_service.get_usd_value(row["asset"], Decimal(str(row["amount"])))
+        usd_str = f"≈ ${_usd_text(usd_val)} USD"
+    except Exception:
+        usd_str = ""
+    finally:
+        conn2.close()
+    await query.edit_message_text(
+        f"<b>💰 Release Funds — Deal #{escrow_id}</b>\n\n"
+        f"<code>{html.escape(str(row['amount']))} {html.escape(str(row['asset']))}</code> {icon}\n"
+        f"{html.escape(usd_str)}\n\n"
+        "⚠️ <b>Are you sure?</b> This confirms delivery and releases funds to the seller.\n"
+        "<i>This action cannot be undone.</i>",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Confirm Release", callback_data=f"esc_release_confirm:{escrow_id}"),
+                InlineKeyboardButton("❌ Cancel", callback_data=f"esc_view_active:{escrow_id}:esc_back_menu"),
+            ]
+        ]),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def esc_release_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Actually release the funds."""
+    query = update.callback_query
+    await query.answer()
+    escrow_id = int(query.data.split(":")[1])
+    conn, _, tenant, escrow_svc = _services()
+    try:
+        user_id = _resolve_user_id(conn, update.effective_user.id)
+        row = conn.execute("SELECT * FROM escrows WHERE id=?", (escrow_id,)).fetchone()
+        if not row or row["status"] != "active":
+            await query.edit_message_text("Deal is no longer active.", reply_markup=_start_menu())
+            return
+        if int(row["buyer_id"]) != user_id:
+            await query.answer("Only the buyer can release funds.", show_alert=True)
+            return
+        view = escrow_svc.release(escrow_id, actor_user_id=user_id)
+        seller = conn.execute("SELECT username, telegram_id FROM users WHERE id=?", (int(row["seller_id"]),)).fetchone()
+        seller_name = seller["username"] if seller else "seller"
+        seller_tg = int(seller["telegram_id"]) if seller else None
+        icon = _asset_icon(view.asset)
+        conn.commit()
+    finally:
+        conn.close()
+
+    stars_kb = [
+        InlineKeyboardButton("⭐ 1", callback_data=f"esc_hist_rate:{escrow_id}:1:1"),
+        InlineKeyboardButton("⭐ 2", callback_data=f"esc_hist_rate:{escrow_id}:2:1"),
+        InlineKeyboardButton("⭐ 3", callback_data=f"esc_hist_rate:{escrow_id}:3:1"),
+        InlineKeyboardButton("⭐ 4", callback_data=f"esc_hist_rate:{escrow_id}:4:1"),
+        InlineKeyboardButton("⭐ 5", callback_data=f"esc_hist_rate:{escrow_id}:5:1"),
+    ]
+    await query.edit_message_text(
+        f"✅ <b>Funds Released!</b>\n\n"
+        f"<code>{html.escape(str(view.amount))} {html.escape(str(view.asset))}</code> {icon} sent to @{html.escape(str(seller_name))}\n\n"
+        "⭐ <b>Rate this deal:</b>",
+        reply_markup=InlineKeyboardMarkup([stars_kb, [InlineKeyboardButton("🏠 Skip", callback_data="esc_back_menu")]]),
+        parse_mode=ParseMode.HTML,
+    )
+    if seller_tg:
+        await context.bot.send_message(
+            chat_id=seller_tg,
+            text=f"✅ <b>Payment received!</b>\n\n"
+                 f"<code>{html.escape(str(view.amount))} {html.escape(str(view.asset))}</code> {icon} released to your account.\n"
+                 f"<b>Deal #{escrow_id}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def esc_active_cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Buyer or seller requests cancellation of active deal — notifies counterparty."""
+    query = update.callback_query
+    await query.answer()
+    escrow_id = int(query.data.split(":")[1])
+    conn, _, _, _ = _services()
+    try:
+        row = conn.execute("SELECT * FROM escrows WHERE id=?", (escrow_id,)).fetchone()
+        if not row or row["status"] != "active":
+            await query.answer("Deal is no longer active.", show_alert=True)
+            return
+        user_id = _resolve_user_id(conn, update.effective_user.id)
+        is_buyer = int(row["buyer_id"]) == user_id
+        is_seller = int(row["seller_id"]) == user_id
+        if not is_buyer and not is_seller:
+            await query.answer("Not authorised.", show_alert=True)
+            return
+        requester_name = update.effective_user.username or str(update.effective_user.id)
+        icon = _asset_icon(row["asset"])
+        if is_buyer:
+            cp = conn.execute("SELECT username, telegram_id FROM users WHERE id=?", (int(row["seller_id"]),)).fetchone()
+        else:
+            cp = conn.execute("SELECT username, telegram_id FROM users WHERE id=?", (int(row["buyer_id"]),)).fetchone()
+        cp_name = cp["username"] if cp else "counterparty"
+        cp_tg = int(cp["telegram_id"]) if cp else None
+    finally:
+        conn.close()
+
+    await query.edit_message_text(
+        f"<b>⏳ Cancellation Request Sent</b>\n\n"
+        f"Your request to cancel Deal #{escrow_id} has been sent to @{html.escape(str(cp_name))}.\n\n"
+        "<i>Waiting for their response…</i>",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="esc_back_menu")]]),
+        parse_mode=ParseMode.HTML,
+    )
+    if cp_tg:
+        await context.bot.send_message(
+            chat_id=cp_tg,
+            text=(
+                f"<b>⚠️ Cancellation Request — Deal #{escrow_id}</b>\n\n"
+                f"@{html.escape(str(requester_name))} wants to cancel this deal.\n"
+                f"<b>Amount:</b> <code>{html.escape(str(row['amount']))} {html.escape(str(row['asset']))}</code> {icon}\n\n"
+                f"<b>Conditions</b>\n{html.escape(str(row['description'] or '-'))}\n\n"
+                "Do you accept the cancellation?"
+            ),
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Accept", callback_data=f"esc_cancel_accept:{escrow_id}:{user_id}"),
+                    InlineKeyboardButton("❌ Decline", callback_data=f"esc_cancel_decline:{escrow_id}:{user_id}"),
+                ]
+            ]),
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def esc_cancel_response_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Seller accepts or declines buyer's cancellation request."""
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split(":")
+    action = parts[0]  # esc_cancel_accept or esc_cancel_decline
+    escrow_id = int(parts[1])
+    buyer_internal_id = int(parts[2])
+
+    conn, _, _, _ = _services()
+    try:
+        row = conn.execute("SELECT * FROM escrows WHERE id=?", (escrow_id,)).fetchone()
+        if not row or row["status"] != "active":
+            await query.edit_message_text("This deal is no longer active.")
+            return
+        responder_id = _resolve_user_id(conn, update.effective_user.id)
+        # Responder must be a participant but NOT the requester
+        requester_internal_id = int(parts[2])
+        if responder_id == requester_internal_id:
+            await query.answer("You cannot respond to your own request.", show_alert=True)
+            return
+        if responder_id not in (int(row["buyer_id"]), int(row["seller_id"])):
+            await query.answer("Not authorised.", show_alert=True)
+            return
+        requester = conn.execute("SELECT username, telegram_id FROM users WHERE id=?", (requester_internal_id,)).fetchone()
+        buyer_tg = int(requester["telegram_id"]) if requester else None
+        buyer_name = requester["username"] if requester else "requester"
+        icon = _asset_icon(row["asset"])
+
+        if action == "esc_cancel_accept":
+            # Cancel the escrow and unlock buyer funds
+            conn.execute("UPDATE escrows SET status='cancelled', updated_at=CURRENT_TIMESTAMP WHERE id=?", (escrow_id,))
+            conn.execute(
+                "INSERT INTO ledger_entries(account_type,account_owner_id,user_id,asset,amount,entry_type,ref_type,ref_id) "
+                "SELECT account_type,account_owner_id,user_id,asset,-amount,'ESCROW_UNLOCK','escrow',ref_id "
+                "FROM ledger_entries WHERE ref_type='escrow' AND ref_id=? AND entry_type='ESCROW_LOCK'",
+                (escrow_id,)
+            )
+            conn.commit()
+            await query.edit_message_text(
+                f"✅ <b>Cancellation accepted.</b>\nDeal #{escrow_id} has been cancelled.",
+                reply_markup=_start_menu(),
+                parse_mode=ParseMode.HTML,
+            )
+            if buyer_tg:
+                await context.bot.send_message(
+                    chat_id=buyer_tg,
+                    text=f"✅ <b>Cancellation accepted!</b>\n\n"
+                         f"Deal #{escrow_id} has been cancelled by @{html.escape(str(update.effective_user.username or 'seller'))}.\n"
+                         f"Your <code>{html.escape(str(row['amount']))} {html.escape(str(row['asset']))}</code> {icon} have been unlocked.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_start_menu(),
+                )
+        else:  # esc_cancel_decline
+            await query.edit_message_text(
+                f"❌ <b>Cancellation declined.</b>\nDeal #{escrow_id} remains active.",
+                parse_mode=ParseMode.HTML,
+            )
+            if buyer_tg:
+                await context.bot.send_message(
+                    chat_id=buyer_tg,
+                    text=f"❌ <b>Cancellation declined.</b>\n\n"
+                         f"@{html.escape(str(update.effective_user.username or 'Seller'))} declined your cancellation request for Deal #{escrow_id}.\n\n"
+                         "You can send another request or open a dispute.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⚖️ Open Dispute", callback_data=f"esc_active_dispute:{escrow_id}")],
+                        [InlineKeyboardButton("🏠 Main Menu", callback_data="esc_back_menu")],
+                    ]),
+                )
+    finally:
+        conn.close()
+
+
+async def esc_active_dispute_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ask user for dispute reason."""
+    query = update.callback_query
+    await query.answer()
+    escrow_id = int(query.data.split(":")[1])
+    context.user_data["dispute_escrow_id"] = escrow_id
+    await query.edit_message_text(
+        f"<b>⚖️ Open Dispute — Deal #{escrow_id}</b>\n\n"
+        "Please describe the reason for your dispute in detail.\n"
+        "<i>This will be reviewed by our moderation team.</i>\n\n"
+        "Type your reason below:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"esc_active_page:1")]]),
+        parse_mode=ParseMode.HTML,
+    )
+    context.user_data["awaiting_dispute_reason"] = True
+
+
+async def esc_dispute_reason_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Receive dispute reason text and show confirm/cancel."""
+    if not context.user_data.get("awaiting_dispute_reason"):
+        return
+    reason = update.effective_message.text.strip()
+    if not reason:
+        await update.effective_message.reply_text("Please enter a valid reason.")
+        return
+    escrow_id = context.user_data.get("dispute_escrow_id")
+    context.user_data["dispute_reason"] = reason
+    context.user_data["awaiting_dispute_reason"] = False
+    await update.effective_message.reply_text(
+        f"<b>⚖️ Confirm Dispute — Deal #{escrow_id}</b>\n\n"
+        f"<b>Reason:</b>\n{html.escape(str(reason))}\n\n"
+        "Submit this dispute to the moderation team?",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Confirm", callback_data=f"esc_dispute_submit:{escrow_id}"),
+                InlineKeyboardButton("❌ Cancel", callback_data=f"esc_active_page:1"),
+            ]
+        ]),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def esc_dispute_submit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Submit the dispute and notify moderator."""
+    query = update.callback_query
+    await query.answer()
+    escrow_id = int(query.data.split(":")[1])
+    reason = context.user_data.get("dispute_reason", "No reason provided")
+    context.user_data.pop("dispute_reason", None)
+
+    conn, _, tenant, escrow_svc = _services()
+    try:
+        user_id = _resolve_user_id(conn, update.effective_user.id)
+        row = conn.execute("SELECT * FROM escrows WHERE id=?", (escrow_id,)).fetchone()
+        if not row or row["status"] not in ("pending", "active"):
+            await query.edit_message_text("Deal is not eligible for dispute.", reply_markup=_start_menu())
+            return
+        escrow_svc.dispute(escrow_id, opened_by_user_id=user_id, reason=reason)
+        conn.commit()
+        # Notify moderator
+        moderator = (Settings.moderator_username or "").strip()
+        if moderator:
+            buyer = conn.execute("SELECT username FROM users WHERE id=?", (int(row["buyer_id"]),)).fetchone()
+            seller = conn.execute("SELECT username FROM users WHERE id=?", (int(row["seller_id"]),)).fetchone()
+            buyer_name = buyer["username"] if buyer else "unknown"
+            seller_name = seller["username"] if seller else "unknown"
+            icon = _asset_icon(row["asset"])
+            mod_text = (
+                f"<b>🚨 New Dispute — Deal #{escrow_id}</b>\n\n"
+                f"<b>Buyer:</b> @{html.escape(str(buyer_name))}\n"
+                f"<b>Seller:</b> @{html.escape(str(seller_name))}\n"
+                f"<b>Amount:</b> <code>{html.escape(str(row['amount']))} {html.escape(str(row['asset']))}</code> {icon}\n\n"
+                f"<b>Reason:</b>\n{html.escape(str(reason))}"
+            )
+            try:
+                # Try to find moderator telegram_id
+                mod_row = conn.execute("SELECT telegram_id FROM users WHERE username=?", (moderator.lstrip('@'),)).fetchone()
+                if mod_row:
+                    await context.bot.send_message(chat_id=int(mod_row["telegram_id"]), text=mod_text, parse_mode=ParseMode.HTML)
+            except Exception:
+                LOGGER.exception("Failed to notify moderator")
+    finally:
+        conn.close()
+
+    await query.edit_message_text(
+        f"✅ <b>Dispute submitted for Deal #{escrow_id}</b>\n\n"
+        "Our moderation team will review your case and contact you shortly.\n\n"
+        f"<b>Your reason:</b>\n{html.escape(str(reason))}",
+        reply_markup=_start_menu(),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def esc_view_active_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Full active deal view with all action buttons — accessible from Escrow Menu or buyer notification."""
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split(":", 2)
+    escrow_id = int(parts[1])
+    back_cb = parts[2] if len(parts) > 2 else "esc_back_menu"
+
+    conn, _, _, escrow_svc = _services()
+    try:
+        tg_id = update.effective_user.id
+        user_id = _resolve_user_id(conn, tg_id)
+        row = conn.execute("SELECT * FROM escrows WHERE id=?", (escrow_id,)).fetchone()
+        if not row or row["status"] != "active":
+            await query.edit_message_text("This deal is no longer active.", reply_markup=_start_menu())
+            return
+        buyer_id_db = int(row["buyer_id"])
+        seller_id_db = int(row["seller_id"])
+        # Determine role by checking both buyer and seller telegram IDs
+        buyer_user = conn.execute("SELECT id, username, telegram_id FROM users WHERE id=?", (buyer_id_db,)).fetchone()
+        seller_user = conn.execute("SELECT id, username, telegram_id FROM users WHERE id=?", (seller_id_db,)).fetchone()
+        is_buyer = buyer_user and int(buyer_user["telegram_id"]) == tg_id
+        is_seller = seller_user and int(seller_user["telegram_id"]) == tg_id
+        if is_buyer:
+            cp_name = seller_user["username"] if seller_user and seller_user["username"] else "unknown"
+            role = "Buyer"
+            counterparty_role = "Seller"
+        else:
+            cp_name = buyer_user["username"] if buyer_user and buyer_user["username"] else "unknown"
+            role = "Seller"
+            counterparty_role = "Buyer"
+        icon = _asset_icon(row["asset"])
+        created_label = _format_db_timestamp(row["created_at"])
+        amount = row["amount"]
+        asset = row["asset"]
+        description = row["description"] or "-"
+    finally:
+        conn.close()
+
+    try:
+        conn3, _, _, esc3 = _services()
+        usd_val = esc3.price_service.get_usd_value(asset, Decimal(str(amount)))
+        usd_str = f" (≈ ${_usd_text(usd_val)} USD)"
+        conn3.close()
+    except Exception:
+        usd_str = ""
+    text = (
+        "<b>✅ Active Deal</b>\n\n"
+        f"<b>Your role:</b> {role}\n"
+        f"<b>{counterparty_role}:</b> @{html.escape(str(cp_name))}\n"
+        f"<b>Amount:</b> <code>{html.escape(str(amount))} {html.escape(str(asset))}</code> {icon}{html.escape(usd_str)}\n"
+        f"<b>Deal #{escrow_id}</b> · Created: {html.escape(str(created_label))}\n\n"
+        f"<b>Conditions</b>\n{html.escape(str(description))}"
+    )
+    kb = []
+    if is_buyer:
+        kb.append([InlineKeyboardButton("💰 Release Funds", callback_data=f"esc_active_release:{escrow_id}")])
+    kb.append([InlineKeyboardButton("❌ Request Cancellation", callback_data=f"esc_active_cancel:{escrow_id}")])
+    kb.append([InlineKeyboardButton("⚖️ Open Dispute", callback_data=f"esc_active_dispute:{escrow_id}")])
+    kb.append([InlineKeyboardButton("👤 View Counterparty Profile", callback_data=f"esc_active_profile:{escrow_id}:{back_cb}")])
+    kb.append([InlineKeyboardButton("🔙 Back", callback_data=back_cb)])
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -2393,9 +2830,9 @@ def main() -> None:
             ],
             WD_ENTER_ADDRESS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_address_input),
-                CallbackQueryHandler(withdraw_back, pattern=r"^wd_back_amount$"),
+                CallbackQueryHandler(withdraw_back, pattern=r"^wd_(back_amount|back_assets|back_profile)$"),
             ],
-            WD_CONFIRM: [CallbackQueryHandler(withdraw_confirm, pattern=r"^wd_(confirm|cancel_addr)$")],
+            WD_CONFIRM: [CallbackQueryHandler(withdraw_confirm, pattern=r"^wd_(confirm|cancel_addr|back_amount)$")],
         },
         fallbacks=[CommandHandler("cancel", cancel_flow)],
         per_chat=True,
@@ -2433,6 +2870,15 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(escrow_menu_actions, pattern=r"^esc_menu:(pending|active|disputes|history)$"))
     app.add_handler(CallbackQueryHandler(escrow_history_actions, pattern=r"^(esc_hist_|esc_back_menu|esc_pending_page:|esc_active_page:|esc_disputes_page:|esc_open:).*$"))
     app.add_handler(CallbackQueryHandler(esc_view_pending_handler, pattern=r"^esc_view_pending:\d+:.+$"))
+    app.add_handler(CallbackQueryHandler(esc_view_active_handler, pattern=r"^esc_view_active:\d+(:.+)?$"))
+    app.add_handler(CallbackQueryHandler(esc_active_profile_handler, pattern=r"^esc_active_profile:\d+:.+$"))
+    app.add_handler(CallbackQueryHandler(esc_active_release_handler, pattern=r"^esc_active_release:\d+$"))
+    app.add_handler(CallbackQueryHandler(esc_release_confirm_handler, pattern=r"^esc_release_confirm:\d+$"))
+    app.add_handler(CallbackQueryHandler(esc_active_cancel_handler, pattern=r"^esc_active_cancel:\d+$"))
+    app.add_handler(CallbackQueryHandler(esc_cancel_response_handler, pattern=r"^esc_cancel_(accept|decline):\d+:\d+$"))
+    app.add_handler(CallbackQueryHandler(esc_active_dispute_handler, pattern=r"^esc_active_dispute:\d+$"))
+    app.add_handler(CallbackQueryHandler(esc_dispute_submit_handler, pattern=r"^esc_dispute_submit:\d+$"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, esc_dispute_reason_message))
     app.add_handler(CallbackQueryHandler(esc_cancel_pending_handler, pattern=r"^esc_cancel_pending:\d+$"))
     app.add_handler(CallbackQueryHandler(escrow_accept_decline, pattern=r"^escrow_(accept|decline):\d+$"))
     app.add_handler(CallbackQueryHandler(on_menu_click))
