@@ -27,8 +27,6 @@ class Settings:
     # Backward compatibility alias; prefer `moderator_username`.
     MODERATOR_USERNAME = moderator_username
 
-    sol_enabled = _as_bool("SOL_ENABLED", "true" if environment != "production" else "false")
-
 
 if os.getenv("BOT_ID") and not os.getenv("ESCROWHUB_BOT_ID"):
     LOGGER.warning("BOT_ID is deprecated; use ESCROWHUB_BOT_ID")
@@ -36,5 +34,3 @@ if os.getenv("ESCROWHUB_MODERATOR_USERNAME") and not os.getenv("MODERATOR_USERNA
     LOGGER.warning("ESCROWHUB_MODERATOR_USERNAME is deprecated; use MODERATOR_USERNAME")
 if not Settings.moderator_username:
     LOGGER.warning("MODERATOR_USERNAME is not set; cancellation guidance will use fallback text")
-if Settings.environment.lower() == "production" and Settings.sol_enabled:
-    LOGGER.warning("SOL is enabled in production. Ensure SOL watcher/signing pipeline is fully validated before use")

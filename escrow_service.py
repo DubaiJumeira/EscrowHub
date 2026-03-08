@@ -30,7 +30,7 @@ class EscrowService:
         self.tenant_service = TenantService(conn)
         self.fee_service = FeeService()
         self.price_service = price_service or StaticPriceService(
-            {"BTC": Decimal("65000"), "ETH": Decimal("3500"), "LTC": Decimal("80"), "USDT": Decimal("1"), "USDC": Decimal("1"), "SOL": Decimal("150"), "XRP": Decimal("0.55")}
+            {"BTC": Decimal("65000"), "ETH": Decimal("3500"), "LTC": Decimal("80"), "USDT": Decimal("1")}
         )
 
     def create_escrow(self, bot_id: int, buyer_id: int, seller_id: int, asset: str, amount: Decimal, description: str) -> EscrowView:

@@ -3,22 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 
-import os
 import re
 
-from config.settings import Settings
 from hd_wallet import HDWalletDeriver
 from ledger_service import LedgerService
 
-SUPPORTED_ASSETS = {"BTC", "ETH", "LTC", "USDT", "USDC", "SOL", "XRP"}
+SUPPORTED_ASSETS = {"BTC", "ETH", "LTC", "USDT"}
 NETWORK_LABELS = {
     "BTC": "BTC",
     "ETH": "ETH",
     "LTC": "LTC",
     "USDT": "USDT (ERC-20)",
-    "USDC": "USDC (ERC-20)",
-    "SOL": "SOL",
-    "XRP": "XRP",
 }
 
 
@@ -37,22 +32,15 @@ class WalletService:
         self.ledger = LedgerService(conn)
         self.hd = HDWalletDeriver()
 
-
-    @staticmethod
-    def _ensure_asset_enabled(symbol: str) -> None:
-        if symbol == "SOL" and not Settings.sol_enabled:
-            raise ValueError("SOL is temporarily unavailable")
-
     @staticmethod
     def _asset(asset: str) -> str:
         symbol = asset.upper()
         if symbol not in SUPPORTED_ASSETS:
             raise ValueError(f"unsupported asset: {symbol}")
-        WalletService._ensure_asset_enabled(symbol)
         return symbol
 
     def _chain_family(self, asset: str) -> str:
-        return "ETHEREUM" if self._asset(asset) in {"ETH", "USDT", "USDC"} else self._asset(asset)
+        return "ETHEREUM" if self._asset(asset) in {"ETH", "USDT"} else self._asset(asset)
 
     def _ensure_user_row(self, user_ref: int) -> int:
         by_id = self.conn.execute("SELECT id FROM users WHERE id=?", (user_ref,)).fetchone()
@@ -71,28 +59,16 @@ class WalletService:
         if row:
             return DepositRoute(row["address"], row["asset"], row["chain_family"], row["destination_tag"], row["derivation_path"])
         derivation_path = None
-        derivation_index = resolved_user_id if symbol != "XRP" else None
-        if symbol == "XRP":
-            hot = os.getenv("XRP_HOT_WALLET_ADDRESS", "")
-            if not hot and os.getenv("APP_ENV", "dev").lower() == "production":
-                raise RuntimeError("XRP_HOT_WALLET_ADDRESS missing")
-            address, tag = (hot or "xrp_dev_hot_wallet"), str(resolved_user_id)
-        elif symbol == "BTC":
+        derivation_index = resolved_user_id
+        if symbol == "BTC":
             k = self.hd.derive_btc(resolved_user_id)
             address, tag, derivation_path = k.public_address, None, k.path
         elif symbol == "LTC":
             k = self.hd.derive_ltc(resolved_user_id)
             address, tag, derivation_path = k.public_address, None, k.path
-        elif symbol in {"ETH", "USDT", "USDC"}:
+        else:
             k = self.hd.derive_eth(resolved_user_id)
             address, tag, derivation_path = k.public_address, None, k.path
-        elif symbol == "SOL":
-            k = self.hd.derive_sol(resolved_user_id)
-            address, tag, derivation_path = k.public_address, None, k.path
-        else:
-            if os.getenv("APP_ENV", "dev").lower() == "production":
-                raise RuntimeError(f"unsupported production derivation for {symbol}")
-            address, tag = f"{symbol.lower()}_addr_{resolved_user_id}", None
         self.conn.execute(
             "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,derivation_index,destination_tag,derivation_path) VALUES(?,?,?,?,?,?,?)",
             (resolved_user_id, symbol, self._chain_family(symbol), address, derivation_index, tag, derivation_path),
@@ -157,11 +133,8 @@ class WalletService:
         patterns = {
             "ETH": r"^0x[a-fA-F0-9]{40}$",
             "USDT": r"^0x[a-fA-F0-9]{40}$",
-            "USDC": r"^0x[a-fA-F0-9]{40}$",
             "BTC": r"^(bc1[ac-hj-np-z02-9]{11,71}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})$",
             "LTC": r"^(ltc1[ac-hj-np-z02-9]{11,71}|[LM3][a-km-zA-HJ-NP-Z1-9]{26,34})$",
-            "SOL": r"^[1-9A-HJ-NP-Za-km-z]{32,44}$",
-            "XRP": r"^r[1-9A-HJ-NP-Za-km-z]{24,34}$",
         }
         if not re.match(patterns[symbol], address):
             network = NETWORK_LABELS.get(symbol, symbol)

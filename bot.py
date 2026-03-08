@@ -52,11 +52,11 @@ def _parse_admin_ids() -> set[int]:
 
 ADMIN_IDS = _parse_admin_ids()
 
-BASE_ASSETS = ["USDT", "USDC", "BTC", "ETH", "LTC", "SOL", "XRP"]
+BASE_ASSETS = ["USDT", "BTC", "ETH", "LTC"]
 
 
 def _enabled_assets() -> list[str]:
-    return [a for a in BASE_ASSETS if a != "SOL" or Settings.sol_enabled]
+    return list(BASE_ASSETS)
 
 
 _RATE_BUCKETS: dict[tuple[int, str], deque[float]] = defaultdict(deque)
@@ -189,10 +189,7 @@ def _crypto_quote_text(asset: str, amount: Decimal | int | str) -> str:
         'BTC': 8,
         'ETH': 8,
         'LTC': 8,
-        'SOL': 6,
-        'XRP': 6,
         'USDT': 6,
-        'USDC': 6,
     }.get((asset or '').upper(), 8)
     return f"{_decimal_text(amount, precision)} {(asset or '').upper()}".strip()
 
@@ -221,12 +218,9 @@ def _asset_profile_icon(asset: str) -> str:
     asset_code = (asset or "").upper()
     fallbacks = {
         "USDT": "🟢",
-        "USDC": "🔵",
         "BTC": "🟠",
         "ETH": "🟣",
         "LTC": "🔵",
-        "SOL": "🟣",
-        "XRP": "⚫️",
     }
     return _profile_custom_emoji(f"TG_EMOJI_{asset_code}_ID", fallbacks.get(asset_code, "•"))
 
@@ -415,12 +409,9 @@ DRAFT_FLOW_KEYS = {
 
 ASSET_ICONS = {
     "USDT": "💲",
-    "USDC": "💵",
     "BTC": "₿",
     "ETH": "⟠",
     "LTC": "Ł",
-    "SOL": "◎",
-    "XRP": "✕",
 }
 
 
@@ -445,10 +436,7 @@ DEPOSIT_EXPLORERS = {
     "BTC": "https://blockstream.info/address/{address}",
     "ETH": "https://etherscan.io/address/{address}",
     "USDT": "https://etherscan.io/address/{address}",
-    "USDC": "https://etherscan.io/address/{address}",
     "LTC": "https://litecoinspace.org/address/{address}",
-    "XRP": "https://xrpscan.com/account/{address}",
-    "SOL": "https://solscan.io/account/{address}",
 }
 
 
@@ -605,12 +593,9 @@ async def _seller_lookup_and_render(update: Update, context: ContextTypes.DEFAUL
 
 WITHDRAW_MINIMUMS = {
     "USDT": Decimal("100"),
-    "USDC": Decimal("100"),
     "BTC": Decimal("0.001"),
     "ETH": Decimal("1"),
     "LTC": Decimal("1"),
-    "SOL": Decimal("1"),
-    "XRP": Decimal("10"),
 }
 
 (
@@ -879,6 +864,9 @@ async def deposit_select_asset(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     asset = query.data.split(":", 1)[1]
+    if asset not in _enabled_assets():
+        await query.edit_message_text("Unsupported deposit currency.", reply_markup=_profile_menu())
+        return ConversationHandler.END
     context.user_data["dep_asset"] = asset
 
     conn, _, _, escrow_service = _services()
@@ -985,8 +973,6 @@ async def withdraw_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         btc_icon = _asset_icon("BTC")
         eth_icon = _asset_icon("ETH")
         ltc_icon = _asset_icon("LTC")
-        sol_icon = _asset_icon("SOL")
-        xrp_icon = _asset_icon("XRP")
         await query.edit_message_text(
             _profile_section(
                 "<b>❌ Insufficient Balance</b>",
@@ -998,8 +984,6 @@ async def withdraw_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     f"{btc_icon} 0.001 BTC",
                     f"{eth_icon} 1 ETH",
                     f"{ltc_icon} 1 LTC",
-                    f"{sol_icon} 1 SOL",
-                    f"{xrp_icon} 10 XRP",
                     "",
                     "Please deposit funds to your account before attempting a withdrawal.",
                 ],
@@ -1021,7 +1005,11 @@ async def withdraw_select_asset(update: Update, context: ContextTypes.DEFAULT_TY
     if query.data == "wd_back_profile":
         await profile_actions(update, context)
         return ConversationHandler.END
-    context.user_data["wd_asset"] = query.data.split(":", 1)[1]
+    asset = query.data.split(":", 1)[1]
+    if asset not in _enabled_assets():
+        await query.edit_message_text(_profile_section("<b>🏦 Withdraw</b>", ["Unsupported withdrawal currency."]), reply_markup=_profile_menu(), parse_mode=ParseMode.HTML)
+        return ConversationHandler.END
+    context.user_data["wd_asset"] = asset
     await query.edit_message_text(
         _profile_section("<b>🏦 Withdraw</b>", [f"Enter {html.escape(str(context.user_data['wd_asset']))} withdrawal amount:"]),
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="wd_back_assets")]]),
@@ -1585,6 +1573,9 @@ async def deal_enter_amount_callbacks(update: Update, context: ContextTypes.DEFA
     if not parts:
         return DEAL_ENTER_AMOUNT
     asset = parts[1]
+    if asset not in _enabled_assets():
+        await query.edit_message_text("Unsupported escrow currency.", reply_markup=_start_menu())
+        return ConversationHandler.END
     conn, _, tenant, _ = _services()
     try:
         buyer_id = tenant.ensure_user(update.effective_user.id, update.effective_user.username)
