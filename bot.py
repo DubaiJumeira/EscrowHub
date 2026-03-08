@@ -233,6 +233,24 @@ ASSET_ICONS = {
     "XRP": "✕",
 }
 
+
+def _asset_icon(asset: str) -> str:
+    return ASSET_ICONS.get(asset, "•")
+
+
+def _asset_with_icon(asset: str) -> str:
+    return f"{_asset_icon(asset)} {asset}"
+
+
+def _asset_display(asset: str) -> str:
+    # Use plain asset code in deal flow instead of generic emoji glyphs.
+    return (asset or "").upper()
+
+
+def _format_asset_value(asset: str, amount: Decimal | int | str, *, code: bool = True) -> str:
+    amount_text = f"`{amount}`" if code else str(amount)
+    return f"{_asset_with_icon(asset)}: {amount_text}"
+
 DEPOSIT_EXPLORERS = {
     "BTC": "https://blockstream.info/address/{address}",
     "ETH": "https://etherscan.io/address/{address}",
@@ -307,38 +325,85 @@ async def _show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE, edit
         await update.effective_message.reply_text(text, reply_markup=_profile_menu())
 
 
+def _deal_search_prompt_text() -> str:
+    return (
+        "🔍 Check User\n\n"
+        "Please send me one of the following:\n"
+        "• @username - Telegram username\n"
+        "• https://t.me/username - Telegram profile link\n"
+        "• username - Just the username without @"
+    )
+
+
+def _deal_search_prompt_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="deal_back_main")]])
+
+
+def _normalize_deal_lookup(raw: str) -> str:
+    lookup = (raw or "").strip()
+    if not lookup:
+        return ""
+
+    lower_lookup = lookup.lower()
+    for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
+        if lower_lookup.startswith(prefix):
+            lookup = lookup[len(prefix):].strip()
+            break
+
+    lookup = lookup.removeprefix("@").strip()
+    lookup = lookup.split("/", 1)[0].split("?", 1)[0].strip()
+    return lookup
+
+
 async def _seller_lookup_and_render(update: Update, context: ContextTypes.DEFAULT_TYPE, lookup: str) -> int:
+    normalized_lookup = _normalize_deal_lookup(lookup)
     conn, _, tenant, _ = _services()
     try:
         tenant.ensure_user(update.effective_user.id, update.effective_user.username)
         if not await _require_not_frozen(update, conn):
             return ConversationHandler.END
-        if lookup.startswith("@"):
-            row = conn.execute("SELECT * FROM users WHERE username=?", (lookup[1:],)).fetchone()
-        else:
-            try:
-                tg = int(lookup)
-            except ValueError:
-                row = None
-            else:
-                row = conn.execute("SELECT * FROM users WHERE telegram_id=?", (tg,)).fetchone()
+
+        row = None
+        if normalized_lookup.isdigit():
+            row = conn.execute("SELECT * FROM users WHERE telegram_id=?", (int(normalized_lookup),)).fetchone()
+        elif normalized_lookup:
+            row = conn.execute("SELECT * FROM users WHERE LOWER(username)=LOWER(?)", (normalized_lookup,)).fetchone()
+
         if not row:
-            await update.effective_message.reply_text("Seller not found")
-            return ConversationHandler.END
+            reply_markup = InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("🔄 Restart", callback_data="deal_search_again")],
+                    [InlineKeyboardButton("🔙 Back", callback_data="deal_back_main")],
+                ]
+            )
+            if update.callback_query:
+                await update.callback_query.edit_message_text("❌ User not found", reply_markup=reply_markup)
+            else:
+                await update.effective_message.reply_text("❌ User not found", reply_markup=reply_markup)
+            return DEAL_SEARCH_RESULT
 
         profile_data = _user_profile(conn, row)
         context.user_data["seller_id"] = profile_data["user_id"]
         context.user_data["seller_username"] = profile_data["username"]
         context.user_data["seller_telegram_id"] = profile_data["telegram_id"]
 
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="deal_back_main"), InlineKeyboardButton("Create Deal", callback_data="deal_create")]])
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🤝 Create Deal", callback_data="deal_create")],
+                [InlineKeyboardButton("🔙 Back", callback_data="deal_back_main")],
+            ]
+        )
         profile_text = _render_user_profile(profile_data)
         context.user_data["seller_profile_text"] = profile_text
-        await update.effective_message.reply_text(profile_text, reply_markup=keyboard)
+        if update.callback_query:
+            await update.callback_query.edit_message_text(profile_text, reply_markup=keyboard)
+        else:
+            await update.effective_message.reply_text(profile_text, reply_markup=keyboard)
         conn.commit()
         return DEAL_SEARCH_RESULT
     finally:
         conn.close()
+
 
 WITHDRAW_MINIMUMS = {
     "USDT": Decimal("100"),
@@ -395,11 +460,10 @@ def _render_self_profile(conn, telegram_user, user_id: int, wallet: WalletServic
     ]
     for asset in _enabled_assets():
         a = wallet.available_balance(user_id, asset)
-        icon = ASSET_ICONS.get(asset, "•")
         if a > 0:
-            lines.append(f"{icon} {asset}: `{a}`")
+            lines.append(_format_asset_value(asset, a))
         else:
-            lines.append(f"{icon} {asset}: 0")
+            lines.append(_format_asset_value(asset, 0, code=False))
     trust = "High" if successful >= 20 else "Medium" if successful >= 5 else "Low"
     lines.append(f"📅 Registered on : {_date_short(registered)} \n")
     lines.append(f"🛡️ Trust level: {trust}")
@@ -419,7 +483,7 @@ def _render_self_profile(conn, telegram_user, user_id: int, wallet: WalletServic
     for asset in assets:
         spent = sum((Decimal(r['amount']) for r in spent_rows if r['asset'] == asset), Decimal('0'))
         earned = sum((Decimal(r['amount']) for r in earned_rows if r['asset'] == asset), Decimal('0'))
-        lines.append(f"• {asset}: spent {spent} / earned {earned}\n")
+        lines.append(f"{_asset_with_icon(asset)}: spent `{spent}` / earned `{earned}`\n")
 
     last_reviews = conn.execute(
         "SELECT r.created_at, u.username reviewer_username FROM reviews r LEFT JOIN users u ON u.id=r.reviewer_id WHERE r.reviewed_id=? ORDER BY r.id DESC LIMIT 3",
@@ -437,6 +501,7 @@ def _render_self_profile(conn, telegram_user, user_id: int, wallet: WalletServic
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _clear_draft_flow(context)
     await update.effective_message.reply_text("There is only 3% commission in bot. The lowest on market!", reply_markup=_start_menu())
 
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -531,7 +596,7 @@ async def profile_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data == "profile_deposit":
         keyboard = [[InlineKeyboardButton(asset, callback_data=f"dep_asset:{asset}")] for asset in _enabled_assets()]
-        keyboard.append([InlineKeyboardButton("Cancel", callback_data="profile_open")])
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="profile_open")])
         await query.edit_message_text("Deposit currency:", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
@@ -558,7 +623,7 @@ async def profile_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             nav.append(InlineKeyboardButton("Next", callback_data=f"profile_withdraw_history:{page+1}"))
         if nav:
             buttons.append(nav)
-        buttons.append([InlineKeyboardButton("🔙 to Profile", callback_data="profile_open")])
+        buttons.append([InlineKeyboardButton("🔙 Back", callback_data="profile_open")])
         await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
         return
 
@@ -599,7 +664,7 @@ async def deposit_select_asset(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     asset = query.data.split(":", 1)[1]
     context.user_data["dep_asset"] = asset
-    icon = ASSET_ICONS.get(asset, "💰")
+    icon = _asset_icon(asset)
     await query.edit_message_text(
         f"{icon} {asset} Deposit\n\n"
         f"Enter the amount in {asset} to deposit (min 45, max 10000).\n\n"
@@ -669,12 +734,12 @@ async def withdraw_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         conn.close()
 
     if not available_assets:
-        usdt_icon = ASSET_ICONS.get("USDT", "•")
-        btc_icon = ASSET_ICONS.get("BTC", "•")
-        eth_icon = ASSET_ICONS.get("ETH", "•")
-        ltc_icon = ASSET_ICONS.get("LTC", "•")
-        sol_icon = ASSET_ICONS.get("SOL", "•")
-        xrp_icon = ASSET_ICONS.get("XRP", "•")
+        usdt_icon = _asset_icon("USDT")
+        btc_icon = _asset_icon("BTC")
+        eth_icon = _asset_icon("ETH")
+        ltc_icon = _asset_icon("LTC")
+        sol_icon = _asset_icon("SOL")
+        xrp_icon = _asset_icon("XRP")
         await query.edit_message_text(
             "❌ Insufficient Balance\n\n"
             "You don't have sufficient balance in any currency for withdrawal.\n\n"
@@ -691,7 +756,7 @@ async def withdraw_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return ConversationHandler.END
 
     keyboard = [[InlineKeyboardButton(a, callback_data=f"wd_asset:{a}")] for a in available_assets]
-    keyboard.append([InlineKeyboardButton("Back", callback_data="wd_back_profile")])
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="wd_back_profile")])
     await query.edit_message_text("Select withdrawal currency:", reply_markup=InlineKeyboardMarkup(keyboard))
     return WD_SELECT_ASSET
 
@@ -705,7 +770,7 @@ async def withdraw_select_asset(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data["wd_asset"] = query.data.split(":", 1)[1]
     await query.edit_message_text(
         f"Enter {context.user_data['wd_asset']} withdrawal amount:",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="wd_back_assets")]]),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="wd_back_assets")]]),
     )
     return WD_ENTER_AMOUNT
 
@@ -739,7 +804,7 @@ async def withdraw_amount_input(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data["wd_amount"] = amount
     await update.effective_message.reply_text(
         f"Enter your {asset} withdrawal address:",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="wd_back_amount")]]),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="wd_back_amount")]]),
     )
     return WD_ENTER_ADDRESS
 
@@ -773,7 +838,7 @@ async def withdraw_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if query.data == "wd_cancel_addr":
         await query.edit_message_text(
             f"Enter your {context.user_data.get('wd_asset','ASSET')} withdrawal address:",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="wd_back_amount")]]),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="wd_back_amount")]]),
         )
         return WD_ENTER_ADDRESS
     if await _enforce_rate_limit(query, query.from_user.id, "withdraw_confirm", limit=3, window_s=20):
@@ -789,7 +854,7 @@ async def withdraw_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             wallet.request_withdrawal(user_id, context.user_data["wd_asset"], Decimal(context.user_data["wd_amount"]), context.user_data["wd_address"])
         except ValueError as exc:
             conn.rollback()
-            await query.edit_message_text(str(exc), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Profile", callback_data="profile_open")]]))
+            await query.edit_message_text(str(exc), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="profile_open")]]))
             return ConversationHandler.END
         conn.commit()
     finally:
@@ -799,7 +864,7 @@ async def withdraw_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         context.user_data.pop(k, None)
     await query.edit_message_text(
         "Withdrawal request submitted. Funds will arrive within a few minutes.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Profile", callback_data="profile_open")]]),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="profile_open")]]),
     )
     return ConversationHandler.END
 
@@ -812,7 +877,7 @@ async def withdraw_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     if query.data == "wd_back_amount":
         await query.edit_message_text(
             f"Enter {context.user_data.get('wd_asset','ASSET')} withdrawal amount:",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="wd_back_assets")]]),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="wd_back_assets")]]),
         )
         return WD_ENTER_AMOUNT
     if query.data == "wd_back_profile":
@@ -881,7 +946,7 @@ async def _show_pending_page(query, user_id: int, page: int) -> None:
         nav.append(InlineKeyboardButton("Next", callback_data=f"esc_pending_page:{page+1}"))
     if nav:
         buttons.append(nav)
-    buttons.append([InlineKeyboardButton("Back", callback_data="esc_back_menu")])
+    buttons.append([InlineKeyboardButton("🔙 Back", callback_data="esc_back_menu")])
     await query.edit_message_text(f"⌛ Pending escrows (Page {page}/{pages})", reply_markup=InlineKeyboardMarkup(buttons))
 
 
@@ -900,7 +965,7 @@ async def _show_active_page(query, user_id: int, page: int) -> None:
         nav.append(InlineKeyboardButton("Next", callback_data=f"esc_active_page:{page+1}"))
     if nav:
         buttons.append(nav)
-    buttons.append([InlineKeyboardButton("Back", callback_data="esc_back_menu")])
+    buttons.append([InlineKeyboardButton("🔙 Back", callback_data="esc_back_menu")])
     await query.edit_message_text(f"🤝 Active escrows (Page {page}/{pages})", reply_markup=InlineKeyboardMarkup(buttons))
 
 
@@ -919,7 +984,7 @@ async def _show_disputes_page(query, user_id: int, page: int) -> None:
         nav.append(InlineKeyboardButton("Next", callback_data=f"esc_disputes_page:{page+1}"))
     if nav:
         buttons.append(nav)
-    buttons.append([InlineKeyboardButton("Back", callback_data="esc_back_menu")])
+    buttons.append([InlineKeyboardButton("🔙 Back", callback_data="esc_back_menu")])
     await query.edit_message_text(f"⚖️ Disputed escrows (Page {page}/{pages})", reply_markup=InlineKeyboardMarkup(buttons))
 
 
@@ -942,7 +1007,7 @@ async def _show_escrow_history_page(query, user_id: int, page: int) -> None:
             nav.append(InlineKeyboardButton("Next", callback_data=f"esc_hist_page:{page+1}"))
         if nav:
             buttons.append(nav)
-        buttons.append([InlineKeyboardButton("Back", callback_data="esc_back_menu")])
+        buttons.append([InlineKeyboardButton("🔙 Back", callback_data="esc_back_menu")])
     finally:
         conn.close()
     await query.edit_message_text(f"Completed Deals (Page {page}/{pages})", reply_markup=InlineKeyboardMarkup(buttons))
@@ -1042,7 +1107,7 @@ async def escrow_history_actions(update: Update, context: ContextTypes.DEFAULT_T
                 "active": f"esc_active_page:{page}",
                 "disputes": f"esc_disputes_page:{page}",
             }.get(section, "esc_back_menu")
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=back_cb)]]))
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=back_cb)]]))
             return
         if data.startswith("esc_hist_open:"):
             parts = _parse_callback_parts(data, "esc_hist_open:", 4)
@@ -1082,7 +1147,7 @@ async def escrow_history_actions(update: Update, context: ContextTypes.DEFAULT_T
             if not rating:
                 stars = [InlineKeyboardButton(f"⭐{i}", callback_data=f"esc_hist_rate:{escrow_id}:{i}:{page}") for i in range(1, 6)]
                 buttons.append(stars)
-            buttons.append([InlineKeyboardButton("Back", callback_data=f"esc_hist_page:{page}")])
+            buttons.append([InlineKeyboardButton("🔙 Back", callback_data=f"esc_hist_page:{page}")])
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
             return
         if data.startswith("esc_hist_rate:"):
@@ -1107,7 +1172,7 @@ async def escrow_history_actions(update: Update, context: ContextTypes.DEFAULT_T
             reviewed_id = int(esc["seller_id"]) if int(esc["buyer_id"]) == user_id else int(esc["buyer_id"])
             existing = conn.execute("SELECT 1 FROM reviews WHERE reviewer_id=? AND escrow_id=?", (user_id, escrow_id)).fetchone()
             if existing:
-                await query.edit_message_text("You already rated this deal.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"esc_hist_open:{escrow_id}:{page}")]]))
+                await query.edit_message_text("You already rated this deal.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"esc_hist_open:{escrow_id}:{page}")]]))
                 return
             conn.execute(
                 "INSERT INTO reviews(reviewer_id,reviewed_id,escrow_id,rating) VALUES(?,?,?,?)",
@@ -1116,7 +1181,7 @@ async def escrow_history_actions(update: Update, context: ContextTypes.DEFAULT_T
             conn.commit()
             await query.edit_message_text(
                 "Your rating has been saved. Waiting for the seller's rating.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"esc_hist_open:{escrow_id}:{page}")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"esc_hist_open:{escrow_id}:{page}")]]),
             )
             return
         if data.startswith("esc_hist_profile:"):
@@ -1129,7 +1194,7 @@ async def escrow_history_actions(update: Update, context: ContextTypes.DEFAULT_T
             if not row:
                 await query.edit_message_text("Counter-party profile not found")
                 return
-            await query.edit_message_text(_render_user_profile(_user_profile(conn, row)), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data=f"esc_hist_open:{escrow_id}:{page}")]]))
+            await query.edit_message_text(_render_user_profile(_user_profile(conn, row)), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"esc_hist_open:{escrow_id}:{page}")]]))
             return
     finally:
         conn.close()
@@ -1138,33 +1203,11 @@ async def escrow_history_actions(update: Update, context: ContextTypes.DEFAULT_T
 async def deal_search_input_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if await _enforce_text_rate_limit(update, "deal_search_input", limit=6, window_s=15):
         return DEAL_SEARCH_INPUT
-    lookup = update.effective_message.text.strip()
-    lookup = lookup.removeprefix("@").strip()
-    lookup = lookup.removeprefix("https://t.me/").strip()
-    lookup = lookup.split("/", 1)[0].split("?", 1)[0].strip()
+    lookup = _normalize_deal_lookup(update.effective_message.text)
     if not lookup:
         await update.effective_message.reply_text("Please send a username.")
         return DEAL_SEARCH_INPUT
-    conn, _, tenant, _ = _services()
-    try:
-        tenant.ensure_user(update.effective_user.id, update.effective_user.username)
-        if not await _require_not_frozen(update, conn):
-            return ConversationHandler.END
-        row = conn.execute("SELECT * FROM users WHERE username=?", (lookup,)).fetchone()
-        if not row:
-            await update.effective_message.reply_text(
-                f"❌ User not found\n\nUser with username @{lookup} not found in the database.",
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [InlineKeyboardButton("🔍 Search Again", callback_data="deal_search_again")],
-                        [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="deal_back_main")],
-                    ]
-                ),
-            )
-            return DEAL_SEARCH_RESULT
-    finally:
-        conn.close()
-    return await _seller_lookup_and_render(update, context, f"@{lookup}")
+    return await _seller_lookup_and_render(update, context, lookup)
 
 
 async def deal_new_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1179,21 +1222,17 @@ async def deal_new_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     finally:
         conn.close()
 
-    await query.edit_message_text(
-        "🔍 Check User\n\n"
-        "Please send me one of the following:\n"
-        "• @username - Telegram username\n"
-        "• https://t.me/username - Telegram profile link\n"
-        "• username - Just the username without @",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="deal_back_main")]]),
-    )
+    _clear_draft_flow(context)
+
+    await query.edit_message_text(_deal_search_prompt_text(), reply_markup=_deal_search_prompt_markup())
     return DEAL_SEARCH_INPUT
 
 
 async def deal_check_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    _clear_draft_flow(context)
     if not context.args:
-        await update.effective_message.reply_text("Usage: /check_user <@username|telegram_id>")
-        return ConversationHandler.END
+        await update.effective_message.reply_text(_deal_search_prompt_text(), reply_markup=_deal_search_prompt_markup())
+        return DEAL_SEARCH_INPUT
     return await _seller_lookup_and_render(update, context, context.args[0].strip())
 
 
@@ -1202,45 +1241,103 @@ async def deal_search_result_cb(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
 
     if query.data == "deal_back_main":
+        _clear_draft_flow(context)
         await query.edit_message_text("🔙 Back to main menu", reply_markup=_start_menu())
         return ConversationHandler.END
     if query.data == "deal_search_again":
-        await query.edit_message_text(
-            "🔍 Check User\n\n"
-            "Please send me one of the following:\n"
-            "• @username - Telegram username\n"
-            "• https://t.me/username - Telegram profile link\n"
-            "• username - Just the username without @",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="deal_back_main")]]),
-        )
+        _clear_draft_flow(context)
+        await query.edit_message_text(_deal_search_prompt_text(), reply_markup=_deal_search_prompt_markup())
         return DEAL_SEARCH_INPUT
 
-    conn, wallet, tenant, _ = _services()
+    if query.data == "deal_create":
+        keyboard: list[list[InlineKeyboardButton]] = []
+        assets = _enabled_assets()
+        if assets:
+            keyboard.append([InlineKeyboardButton(_asset_display(assets[0]), callback_data=f"deal_asset:{assets[0]}")])
+            row: list[InlineKeyboardButton] = []
+            for asset in assets[1:]:
+                row.append(InlineKeyboardButton(_asset_display(asset), callback_data=f"deal_asset:{asset}"))
+                if len(row) == 2:
+                    keyboard.append(row)
+                    row = []
+            if row:
+                keyboard.append(row)
+        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="deal_back_main")])
+        await query.edit_message_text("Select the currency for this deal:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return DEAL_ENTER_AMOUNT
+
+    return DEAL_SEARCH_RESULT
+
+
+async def _show_deal_amount_prompt(query, buyer_id: int, asset: str) -> None:
+    conn, wallet, _, _ = _services()
+    try:
+        balance = wallet.available_balance(buyer_id, asset)
+    finally:
+        conn.close()
+    await query.edit_message_text(
+        "💰 Your balances:\n"
+        f"• {_asset_display(asset)}: {balance}    ⚠️ min: 40\n\n"
+        "Enter the deal amount ✍️:",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("Deposit", callback_data="profile_deposit")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="deal_back_main")],
+            ]
+        ),
+    )
+
+
+async def deal_enter_amount_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+
+    if data == "deal_back_to_search":
+        profile_txt = context.user_data.get("seller_profile_text") or (
+            f"@{context.user_data.get('seller_username','unknown')}\n"
+            "Seller found\n"
+            "Use Create Deal to continue."
+        )
+        await query.edit_message_text(
+            profile_txt,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("🤝 Create Deal", callback_data="deal_create")],
+                    [InlineKeyboardButton("🔙 Back", callback_data="deal_back_main")],
+                ]
+            ),
+        )
+        return DEAL_SEARCH_RESULT
+
+    if data == "profile_deposit":
+        await profile_actions(update, context)
+        return DEAL_ENTER_AMOUNT
+
+    if data == "deal_back_main":
+        return await deal_search_result_cb(update, context)
+
+    parts = _parse_callback_parts(data, "deal_asset:", 2)
+    if not parts:
+        return DEAL_ENTER_AMOUNT
+    asset = parts[1]
+    conn, _, tenant, _ = _services()
     try:
         buyer_id = tenant.ensure_user(update.effective_user.id, update.effective_user.username)
         if _is_user_frozen(conn, update.effective_user.id):
             await query.edit_message_text("Your account is frozen. Please contact support.")
             return ConversationHandler.END
-        context.user_data["buyer_id"] = buyer_id
         seller_id = context.user_data.get("seller_id")
         if seller_id and int(seller_id) == int(buyer_id):
             await query.edit_message_text("You cannot create a deal with yourself", reply_markup=_start_menu())
             return ConversationHandler.END
-        balances = []
-        for asset in _enabled_assets():
-            bal = wallet.available_balance(buyer_id, asset)
-            if bal > 0:
-                balances.append(f"{asset}: {bal}")
-        context.user_data["asset"] = "USDT"
-        balance_txt = " | ".join(balances) if balances else "No available balances"
-        await query.edit_message_text(
-            f"Your balances: {balance_txt} | min: 40 | Enter the deal amount:",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="deal_back_to_search")]]),
-        )
+        context.user_data["buyer_id"] = buyer_id
+        context.user_data["asset"] = asset
         conn.commit()
-        return DEAL_ENTER_AMOUNT
     finally:
         conn.close()
+    await _show_deal_amount_prompt(query, int(context.user_data["buyer_id"]), asset)
+    return DEAL_ENTER_AMOUNT
 
 
 async def deal_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1274,8 +1371,20 @@ async def deal_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if escrow_service.price_service.get_usd_value(asset, amount) < Decimal("40"):
             await update.effective_message.reply_text("Amount must be at least $40 equivalent")
             return DEAL_ENTER_AMOUNT
-        if wallet.available_balance(buyer_id, asset) < amount:
-            await update.effective_message.reply_text("Insufficient available balance")
+        balance = wallet.available_balance(buyer_id, asset)
+        if balance < amount:
+            difference = amount - balance
+            await update.effective_message.reply_text(
+                f"Insufficient balance. You need {amount} {_asset_display(asset)}, but you have {balance} {_asset_display(asset)}.\n\n"
+                f"You need {difference} {_asset_display(asset)} more.\n\n"
+                "Top up your balance or enter a different amount.",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("Deposit", callback_data="profile_deposit")],
+                        [InlineKeyboardButton("❌ Cancel", callback_data="deal_back_main")],
+                    ]
+                ),
+            )
             return DEAL_ENTER_AMOUNT
 
         context.user_data["amount"] = amount
@@ -1283,7 +1392,7 @@ async def deal_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         await update.effective_message.reply_text(
             "Describe the deal in detail, including ALL terms. THIS WILL AFFECT HOW DISPUTES ARE RESOLVED LATER. Describe ALL deal conditions",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="deal_back_to_amount")]]),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="deal_back_to_amount")]]),
         )
         conn.commit()
         return DEAL_ENTER_CONDITIONS
@@ -1336,7 +1445,7 @@ async def deal_conditions_input(update: Update, context: ContextTypes.DEFAULT_TY
         keyboard = InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("❌ Cancel Request", callback_data="deal_cancel_request")],
-                [InlineKeyboardButton("🔙 Back to Pending List", callback_data="deal_back_pending")],
+                [InlineKeyboardButton("🔙 Back", callback_data="deal_back_pending")],
                 [InlineKeyboardButton("👀 View Counter-Party Profile", callback_data="deal_view_counterparty")],
                 [InlineKeyboardButton("💰 Release Funds", callback_data="deal_release_prompt")],
             ]
@@ -1370,7 +1479,7 @@ async def deal_pending_actions(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data["previous_view"] = "cancel_info"
         await query.edit_message_text(
             f"To cancel this deal, please contact the moderators: @{moderator}",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="deal_back_to_pending")]]),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="deal_back_to_pending")]]),
         )
         return DEAL_CANCEL_INFO
 
@@ -1390,14 +1499,14 @@ async def deal_pending_actions(update: Update, context: ContextTypes.DEFAULT_TYP
         try:
             row = conn.execute("SELECT * FROM users WHERE id=?", (int(seller_id),)).fetchone()
             if not row:
-                await query.edit_message_text("Counter-party not found", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="deal_back_to_pending")]]))
+                await query.edit_message_text("Counter-party not found", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="deal_back_to_pending")]]))
                 return DEAL_PENDING_VIEW
             profile_txt = _render_user_profile(_user_profile(conn, row))
         finally:
             conn.close()
         await query.edit_message_text(
             profile_txt,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="deal_back_to_pending")]]),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="deal_back_to_pending")]]),
         )
         return DEAL_PENDING_VIEW
 
@@ -1406,7 +1515,7 @@ async def deal_pending_actions(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text(
             "Are you sure you want to release funds? This means the product/service has been delivered with no problems.",
             reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("Back", callback_data="deal_back_to_pending"), InlineKeyboardButton("Release", callback_data="deal_release_confirm")]]
+                [[InlineKeyboardButton("🔙 Back", callback_data="deal_back_to_pending"), InlineKeyboardButton("Release", callback_data="deal_release_confirm")]]
             ),
         )
         return DEAL_RELEASE_CONFIRM
@@ -1427,14 +1536,14 @@ async def _show_pending_list(query, context: ContextTypes.DEFAULT_TYPE) -> int:
         conn.close()
 
     if not rows:
-        await query.edit_message_text("No pending deals.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="deal_back_to_pending")]]))
+        await query.edit_message_text("No pending deals.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="deal_back_to_pending")]]))
         return DEAL_PENDING_VIEW
 
     lines = ["Pending deals:"]
     for r in rows[:10]:
         lines.append(f"#{r['id']} | {r['amount']} {r['asset']} | status={r['status']} | {_format_db_timestamp(r['created_at'])}")
     lines.append("🔙 Tap Back to return to current deal view.")
-    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="deal_back_to_pending")]]))
+    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="deal_back_to_pending")]]))
     return DEAL_PENDING_VIEW
 
 async def deal_cancel_info_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1464,7 +1573,7 @@ async def _show_pending_view(query, context: ContextTypes.DEFAULT_TYPE) -> int:
     keyboard = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("Cancel Request", callback_data="deal_cancel_request")],
-            [InlineKeyboardButton("🔙 Back to Pending List", callback_data="deal_back_pending")],
+            [InlineKeyboardButton("🔙 Back", callback_data="deal_back_pending")],
             [InlineKeyboardButton("View Counter-Party Profile", callback_data="deal_view_counterparty")],
             [InlineKeyboardButton("Release Funds", callback_data="deal_release_prompt")],
         ]
@@ -1506,7 +1615,7 @@ async def deal_release_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
             f"Payment of {view.amount} {view.asset} has been released to the seller."
         )
         stars = [InlineKeyboardButton("⭐", callback_data=f"deal_rate_seller:{i}") for i in range(1, 6)]
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="deal_finish")], stars])
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="deal_finish")], stars])
         await query.edit_message_text(release_msg, reply_markup=keyboard)
 
         buyer_name = update.effective_user.username or str(update.effective_user.id)
@@ -1554,7 +1663,7 @@ async def deal_rate_seller(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         escrow_id = int(context.user_data["escrow_id"])
         existing = conn.execute("SELECT 1 FROM reviews WHERE reviewer_id=? AND escrow_id=?", (buyer_id, escrow_id)).fetchone()
         if existing:
-            await query.edit_message_text("You already rated this deal.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="deal_finish")]]))
+            await query.edit_message_text("You already rated this deal.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="deal_finish")]]))
             return DEAL_RATE_BUYER
         conn.execute(
             "INSERT INTO reviews(reviewer_id,reviewed_id,escrow_id,rating) VALUES(?,?,?,?)",
@@ -1572,7 +1681,7 @@ async def deal_rate_seller(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
         except Exception:
             LOGGER.exception("seller rating notification failed")
-        await query.edit_message_text("Your rating has been saved. Waiting for the seller's rating.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="deal_finish")]]))
+        await query.edit_message_text("Your rating has been saved. Waiting for the seller's rating.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="deal_finish")]]))
         return DEAL_RATE_BUYER
     finally:
         conn.close()
@@ -1586,7 +1695,7 @@ async def deal_rate_buyer_wait(update: Update, context: ContextTypes.DEFAULT_TYP
     if query.data == "deal_finish":
         await query.edit_message_text("🔙 Done. Back to main menu.", reply_markup=_start_menu())
         return ConversationHandler.END
-    await query.edit_message_text("Waiting for seller rating. You can return to main menu.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="deal_finish")]]))
+    await query.edit_message_text("Waiting for seller rating. You can return to main menu.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="deal_finish")]]))
     return DEAL_RATE_BUYER
 
 async def seller_rate_buyer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1642,7 +1751,12 @@ async def deal_back_from_amount(update: Update, context: ContextTypes.DEFAULT_TY
     )
     await query.edit_message_text(
         profile_txt,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="deal_back_main"), InlineKeyboardButton("Create Deal", callback_data="deal_create")]]),
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🤝 Create Deal", callback_data="deal_create")],
+                [InlineKeyboardButton("🔙 Back", callback_data="deal_back_main")],
+            ]
+        ),
     )
     return DEAL_SEARCH_RESULT
 
@@ -1655,21 +1769,8 @@ async def deal_back_from_conditions(update: Update, context: ContextTypes.DEFAUL
         await query.edit_message_text("Deal context expired. Run /check_user again.", reply_markup=_start_menu())
         return ConversationHandler.END
 
-    conn, wallet, _, _ = _services()
-    try:
-        balances = []
-        for asset in _enabled_assets():
-            bal = wallet.available_balance(buyer_id, asset)
-            if bal > 0:
-                balances.append(f"{asset}: {bal}")
-        balance_txt = " | ".join(balances) if balances else "No available balances"
-    finally:
-        conn.close()
-
-    await query.edit_message_text(
-        f"Your balances: {balance_txt} | min: 40 | Enter the deal amount:",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="deal_back_to_search")]]),
-    )
+    asset = context.user_data.get("asset", "USDT")
+    await _show_deal_amount_prompt(query, int(buyer_id), asset)
     return DEAL_ENTER_AMOUNT
 
 
@@ -1711,10 +1812,17 @@ async def check_user_hint(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def support_team(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="profile_back")]])
     if update.callback_query:
-        await update.callback_query.edit_message_text("Support Team: @your_support_handle")
+        await update.callback_query.edit_message_text("Support Team: @your_support_handle", reply_markup=reply_markup)
     else:
-        await update.effective_message.reply_text("Support Team: @your_support_handle")
+        await update.effective_message.reply_text("Support Team: @your_support_handle", reply_markup=reply_markup)
+
+
+async def deal_start_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    _clear_draft_flow(context)
+    await start(update, context)
+    return ConversationHandler.END
 
 
 async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1751,7 +1859,7 @@ def main() -> None:
             DEAL_SEARCH_RESULT: [CallbackQueryHandler(deal_search_result_cb, pattern="^deal_(create|back_main|search_again)$")],
             DEAL_ENTER_AMOUNT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, deal_amount_input),
-                CallbackQueryHandler(deal_back_from_amount, pattern="^deal_back_to_search$"),
+                CallbackQueryHandler(deal_enter_amount_callbacks, pattern=r"^(deal_asset:[A-Z]+|deal_back_to_search|profile_deposit|deal_back_main)$"),
             ],
             DEAL_ENTER_CONDITIONS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, deal_conditions_input),
@@ -1763,7 +1871,12 @@ def main() -> None:
             DEAL_RATE_SELLER: [CallbackQueryHandler(deal_rate_seller, pattern=r"^deal_(rate_seller:\d+|finish)$")],
             DEAL_RATE_BUYER: [CallbackQueryHandler(deal_rate_buyer_wait, pattern="^deal_finish$")],
         },
-        fallbacks=[CommandHandler("start", start), CommandHandler("cancel", cancel_flow)],
+        fallbacks=[
+            CallbackQueryHandler(deal_search_result_cb, pattern=r"^deal_back_main$"),
+            CommandHandler("start", deal_start_fallback),
+            CommandHandler("cancel", cancel_flow),
+        ],
+        allow_reentry=True,
         per_chat=True,
         per_user=True,
     )
@@ -1801,6 +1914,7 @@ def main() -> None:
     )
 
     app = Application.builder().token(token).build()
+    app.add_handler(conv)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("profile", profile))
     app.add_handler(CommandHandler("balance", balance))
@@ -1816,7 +1930,6 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(profile_actions, pattern=r"^(profile_(?!withdraw$)|esc_wd_open:).*$"))
     app.add_handler(CallbackQueryHandler(escrow_menu_actions, pattern=r"^esc_menu:(pending|active|disputes|history)$"))
     app.add_handler(CallbackQueryHandler(escrow_history_actions, pattern=r"^(esc_hist_|esc_back_menu|esc_pending_page:|esc_active_page:|esc_disputes_page:|esc_open:).*$"))
-    app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(on_menu_click))
     app.run_polling()
 
