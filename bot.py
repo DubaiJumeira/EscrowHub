@@ -161,29 +161,53 @@ def _profile_chip(value: object) -> str:
     return f"<code>{html.escape(str(value))}</code>"
 
 
-def _profile_blockquote(*lines: str) -> str:
-    filtered = [line for line in lines if line is not None]
-    return '<blockquote>' + '\n'.join(filtered) + '</blockquote>'
+def _profile_block(value: object) -> str:
+    return f"<blockquote>{html.escape(str(value))}</blockquote>"
 
 
-def _format_decimal_value(value: Decimal | int | str, *, places: int = 8, trim: bool = True) -> str:
-    try:
-        decimal_value = Decimal(str(value))
-    except Exception:
-        return str(value)
-    quant = Decimal('1').scaleb(-places)
-    rendered = f"{decimal_value.quantize(quant, rounding=ROUND_HALF_UP):f}"
-    if trim and '.' in rendered:
-        rendered = rendered.rstrip('0').rstrip('.')
-    return rendered or '0'
+def _profile_block_html(value_html: str) -> str:
+    return f"<blockquote>{value_html}</blockquote>"
 
 
-def _format_usd_value(value: Decimal | int | str) -> str:
-    try:
-        decimal_value = Decimal(str(value))
-    except Exception:
-        return str(value)
-    return f"${decimal_value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):f}"
+def _usd_text(value: Decimal | int | str) -> str:
+    amount = Decimal(str(value))
+    return f"{amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):f}"
+
+
+def _decimal_text(value: Decimal | int | str, places: int | None = None) -> str:
+    amount = Decimal(str(value))
+    if places is not None:
+        amount = amount.quantize(Decimal('1').scaleb(-places), rounding=ROUND_HALF_UP)
+    text = format(amount, 'f')
+    if '.' in text:
+        text = text.rstrip('0').rstrip('.')
+    return text or '0'
+
+
+def _crypto_quote_text(asset: str, amount: Decimal | int | str) -> str:
+    precision = {
+        'BTC': 8,
+        'ETH': 8,
+        'LTC': 8,
+        'SOL': 6,
+        'XRP': 6,
+        'USDT': 6,
+        'USDC': 6,
+    }.get((asset or '').upper(), 8)
+    return f"{_decimal_text(amount, precision)} {(asset or '').upper()}".strip()
+
+
+def _deposit_quote_amounts(asset: str, usd_amount: Decimal, price_usd: Decimal) -> dict[str, Decimal]:
+    provider_fee_usd = (usd_amount * Decimal('0.03')).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    platform_fee_usd = (usd_amount * Decimal('0.02')).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    total_invoice_usd = usd_amount + provider_fee_usd + platform_fee_usd
+    crypto_amount = total_invoice_usd / price_usd
+    return {
+        'provider_fee_usd': provider_fee_usd,
+        'platform_fee_usd': platform_fee_usd,
+        'total_invoice_usd': total_invoice_usd,
+        'crypto_amount': crypto_amount,
+    }
 
 
 def _profile_custom_emoji(env_key: str, fallback: str) -> str:
@@ -224,18 +248,32 @@ def _profile_rating_stars(rating: float) -> str:
 
 
 def _profile_stats_line(icon: str, label: str, value: object) -> str:
-    stat_text = f"{label:<15} {value}"
-    return f"• {icon} {_profile_chip(stat_text)}"
+    spacing = {
+        "Successful:": 6,
+        "Cancelled:": 7,
+        "Disputes lost:": 3,
+    }.get(label, 1)
+    nbsp = " " * spacing
+    return f"• {icon} {html.escape(label)}{nbsp}{html.escape(str(value))}"
 
 
 def _profile_asset_line(asset: str, amount: Decimal | int | str) -> str:
-    return f"• {_asset_profile_icon(asset)} {_profile_chip(amount)}"
+    return f"• {_asset_profile_icon(asset)} {html.escape(_decimal_text(amount))}"
+
+
+def _profile_section(title_html: str, rows: list[str] | None = None) -> str:
+    parts: list[str] = []
+    if title_html:
+        parts.append(title_html)
+    if rows:
+        parts.extend(rows)
+    return _profile_block_html("\n".join(parts))
 
 
 def _profile_review_line(review: dict) -> str:
     reviewer = html.escape(str(review.get("reviewer_username") or "unknown"))
     stars = "⭐" * max(1, min(5, int(review.get("rating") or 0)))
-    return f"• {stars} by {_profile_chip(f'@{reviewer}')} ({_date_short(review.get('created_at'))})"
+    return f"• {stars} by @{reviewer} ({_date_short(review.get('created_at'))})"
 
 
 def _user_profile(conn, user_row) -> dict:
@@ -297,65 +335,54 @@ def _user_profile(conn, user_row) -> dict:
 
 
 def _render_user_profile(profile: dict) -> str:
-    username = str(profile.get("username") or "unknown")
-    first_name = str(profile.get("first_name") or "unknown")
-    registered_label = _date_short(profile.get("registered_date"))
-    trust_level = html.escape(str(profile.get("trust_level") or "🔴 Low"))
+    username = html.escape(str(profile.get("username") or "unknown"))
+    first_name = html.escape(str(profile.get("first_name") or "unknown"))
 
     review_count = int(profile.get("review_count", 0) or 0)
     rating = float(profile.get("rating", 0.0) or 0.0)
-    if review_count < 3:
-        rating_line = "⭐ Rating: Too few reviews"
-    else:
+    rating_line = "⭐ Rating: Too few reviews"
+    if review_count >= 3:
         rating_line = f"⭐ Rating: {_profile_rating_stars(rating)} ({rating:.1f}/5 from {review_count} reviews)"
 
-    deal_lines = [
+    deals_rows = [
         _profile_stats_line("✅", "Successful:", profile.get("successful_deals", 0)),
         _profile_stats_line("🚫", "Cancelled:", profile.get("cancelled_deals", 0)),
         _profile_stats_line("⚠️", "Disputes lost:", profile.get("disputes_lost", 0)),
     ]
 
-    asset_lines: list[str] = []
     asset_totals = profile.get("asset_totals") or {}
+    totals_rows: list[str] = []
     if asset_totals:
         for asset in sorted(asset_totals.keys(), key=lambda a: BASE_ASSETS.index(a) if a in BASE_ASSETS else 999):
-            asset_lines.append(_profile_asset_line(asset, _format_decimal_value(asset_totals[asset])))
+            totals_rows.append(_profile_asset_line(asset, asset_totals[asset]))
     else:
-        asset_lines.append(f"• {_profile_chip('No completed volume yet')}")
+        totals_rows.append("• No completed volume yet")
 
-    review_lines: list[str] = []
     reviews = profile.get("last_reviews") or []
-    if not reviews:
-        review_lines.append("• No reviews yet")
-    else:
-        for review in reviews:
-            review_lines.append(_profile_review_line(review))
+    review_rows = [_profile_review_line(review) for review in reviews] if reviews else ["• No reviews yet"]
 
-    return "\n".join(
-        [
-            _profile_blockquote(
-                f"👤 Profile: {_profile_chip(f'@{username}')}",
-                f"👤 Telegram Id: {_profile_chip(profile.get('telegram_id', 'unknown'))}",
-                f"👤 First Name: {_profile_chip(first_name)}",
-            ),
-            "",
-            _profile_blockquote(f"📅 Registered: {_profile_chip(registered_label)}"),
-            "",
-            _profile_blockquote(
-                f"🛡️ Trust level: {trust_level}",
+    sections = [
+        _profile_section(
+            "<b>👤 Seller Profile</b>",
+            [
+                f"👤 Profile: @{username}",
+                f"👤 Telegram Id: {html.escape(str(profile.get('telegram_id', 'unknown')))}",
+                f"👤 First Name: {first_name}",
+            ],
+        ),
+        _profile_section(
+            "<b>📋 Account Overview</b>",
+            [
+                f"📅 Registered: {_date_short(profile.get('registered_date'))}",
+                f"🛡️ Trust level: {html.escape(str(profile.get('trust_level') or '🔴 Low'))}",
                 rating_line,
-            ),
-            "",
-            "🤝 Deals:",
-            _profile_blockquote(*deal_lines),
-            "",
-            "📈 Total Spent/Earned:",
-            _profile_blockquote(*asset_lines),
-            "",
-            "📝 Last 3 reviews:",
-            _profile_blockquote(*review_lines),
-        ]
-    )
+            ],
+        ),
+        _profile_section("<b>🤝 Deals</b>", deals_rows),
+        _profile_section("<b>📈 Total Spent/Earned</b>", totals_rows),
+        _profile_section("<b>📝 Last 3 reviews</b>", review_rows),
+    ]
+    return "\n\n".join(sections)
 
 
 def _format_db_timestamp(ts: str | None) -> str:
@@ -490,11 +517,11 @@ async def _show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE, edit
 
 def _deal_search_prompt_text() -> str:
     return (
-        "🔍 Check User\n\n"
+        "<blockquote><b>🔍 Check User</b>\n\n"
         "Please send me one of the following:\n"
         "• @username - Telegram username\n"
         "• https://t.me/username - Telegram profile link\n"
-        "• username - Just the username without @"
+        "• username - Just the username without @</blockquote>"
     )
 
 
@@ -616,85 +643,77 @@ def _date_short(ts: str | None) -> str:
 
 def _render_self_profile(conn, telegram_user, user_id: int, wallet: WalletService) -> str:
     user_row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    first_name = html.escape(str(getattr(telegram_user, "first_name", "") or "unknown"))
+    telegram_id = html.escape(str(getattr(telegram_user, "id", "unknown")))
+
     if not user_row:
-        first_name = str(getattr(telegram_user, "first_name", "") or "unknown")
-        return "\n".join([
-            _profile_blockquote(
-                f"👤 Your Telegram Id: {_profile_chip(getattr(telegram_user, 'id', 'unknown'))}",
-                f"👤 First Name: {_profile_chip(first_name)}",
+        return "\n\n".join([
+            _profile_section(
+                "<b>👤 Your Profile</b>",
+                [
+                    f"👤 Your Telegram Id: {telegram_id}",
+                    f"👤 First Name: {first_name}",
+                ],
             ),
-            "",
-            "💰 Balance:",
-            _profile_blockquote(f"• {_profile_chip('No balance yet')}"),
+            _profile_section("<b>💰 Balance</b>", ["• No balance yet"]),
         ])
 
     profile = _user_profile(conn, user_row)
     profile["first_name"] = getattr(telegram_user, "first_name", None)
 
-    balance_lines: list[str] = []
+    balance_rows: list[str] = []
     for asset in _enabled_assets():
         available = wallet.available_balance(user_id, asset)
         if available > 0:
-            balance_lines.append(_profile_asset_line(asset, _format_decimal_value(available)))
-    if not balance_lines:
-        balance_lines.append(f"• {_profile_chip('No balance yet')}")
+            balance_rows.append(_profile_asset_line(asset, available))
+    if not balance_rows:
+        balance_rows.append("• No balance yet")
 
     review_count = int(profile.get("review_count", 0) or 0)
     rating = float(profile.get("rating", 0.0) or 0.0)
-    if review_count < 3:
-        rating_line = "⭐ Rating: Too few reviews"
-    else:
+    rating_line = "⭐ Rating: Too few reviews"
+    if review_count >= 3:
         rating_line = f"⭐ Rating: {_profile_rating_stars(rating)} ({rating:.1f}/5 from {review_count} reviews)"
 
-    deal_lines = [
+    deals_rows = [
         _profile_stats_line("✅", "Successful:", profile.get("successful_deals", 0)),
         _profile_stats_line("🚫", "Cancelled:", profile.get("cancelled_deals", 0)),
         _profile_stats_line("⚠️", "Disputes lost:", profile.get("disputes_lost", 0)),
     ]
 
-    volume_lines: list[str] = []
     asset_totals = profile.get("asset_totals") or {}
+    totals_rows: list[str] = []
     if asset_totals:
         for asset in sorted(asset_totals.keys(), key=lambda a: BASE_ASSETS.index(a) if a in BASE_ASSETS else 999):
-            volume_lines.append(_profile_asset_line(asset, _format_decimal_value(asset_totals[asset])))
+            totals_rows.append(_profile_asset_line(asset, asset_totals[asset]))
     else:
-        volume_lines.append(f"• {_profile_chip('No completed volume yet')}")
+        totals_rows.append("• No completed volume yet")
 
-    review_lines: list[str] = []
     reviews = profile.get("last_reviews") or []
-    if not reviews:
-        review_lines.append("• No reviews yet")
-    else:
-        for review in reviews:
-            review_lines.append(_profile_review_line(review))
+    review_rows = [_profile_review_line(review) for review in reviews] if reviews else ["• No reviews yet"]
 
-    return "\n".join(
-        [
-            _profile_blockquote(
-                f"👤 Your Telegram Id: {_profile_chip(profile.get('telegram_id', 'unknown'))}",
-                f"👤 First Name: {_profile_chip(profile.get('first_name') or 'unknown')}",
-            ),
-            "",
-            "💰 Balance:",
-            _profile_blockquote(*balance_lines),
-            "",
-            _profile_blockquote(f"📅 Registered: {_profile_chip(_date_short(profile.get('registered_date')))}"),
-            "",
-            _profile_blockquote(
+    sections = [
+        _profile_section(
+            "<b>👤 Your Profile</b>",
+            [
+                f"👤 Your Telegram Id: {html.escape(str(profile.get('telegram_id', 'unknown')))}",
+                f"👤 First Name: {html.escape(str(profile.get('first_name') or 'unknown'))}",
+            ],
+        ),
+        _profile_section("<b>💰 Balance</b>", balance_rows),
+        _profile_section(
+            "<b>📋 Account Overview</b>",
+            [
+                f"📅 Registered: {_date_short(profile.get('registered_date'))}",
                 f"🛡️ Trust level: {html.escape(str(profile.get('trust_level') or '🔴 Low'))}",
                 rating_line,
-            ),
-            "",
-            "🤝 Deals:",
-            _profile_blockquote(*deal_lines),
-            "",
-            "📈 Total Spent/Earned:",
-            _profile_blockquote(*volume_lines),
-            "",
-            "📝 Last 3 reviews:",
-            _profile_blockquote(*review_lines),
-        ]
-    )
+            ],
+        ),
+        _profile_section("<b>🤝 Deals</b>", deals_rows),
+        _profile_section("<b>📈 Total Spent/Earned</b>", totals_rows),
+        _profile_section("<b>📝 Last 3 reviews</b>", review_rows),
+    ]
+    return "\n\n".join(sections)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -805,7 +824,7 @@ async def profile_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             rows, page, pages = wallet.withdrawal_history(user_id, page=page, per_page=10)
         finally:
             conn.close()
-        lines = [f"Your Withdrawal History (Page {page}/{pages})"]
+        lines = [f"<b>Your Withdrawal History (Page {page}/{pages})</b>"]
         buttons = []
         if not rows:
             lines.append("You have no withdrawal history yet.")
@@ -821,13 +840,13 @@ async def profile_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if nav:
             buttons.append(nav)
         buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="profile_open")])
-        await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
+        await query.edit_message_text(_profile_block_html("\n".join(lines)), reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.HTML)
         return
 
     if data.startswith("esc_wd_open:"):
         parts = _parse_callback_parts(data, "esc_wd_open:", 3)
         if not parts:
-            await query.edit_message_text("Withdrawal entry is stale. Please reopen your history.")
+            await query.edit_message_text(_profile_section("<b>🏦 Withdrawal History</b>", ["Withdrawal entry is stale.", "Please reopen your history."]), parse_mode=ParseMode.HTML)
             return
         _, withdrawal_id, page = parts
         conn, wallet, tenant, _ = _services()
@@ -837,7 +856,7 @@ async def profile_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         finally:
             conn.close()
         if not row:
-            await query.edit_message_text("Withdrawal not found.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data=f"profile_withdraw_history:{page}")]]))
+            await query.edit_message_text(_profile_section("<b>🏦 Withdrawal History</b>", ["Withdrawal not found."]), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data=f"profile_withdraw_history:{page}")]]), parse_mode=ParseMode.HTML)
             return
         await query.edit_message_text(
             "\n".join(
@@ -861,29 +880,31 @@ async def deposit_select_asset(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     asset = query.data.split(":", 1)[1]
     context.user_data["dep_asset"] = asset
-    icon = _asset_icon(asset)
 
     conn, _, _, escrow_service = _services()
     try:
-        asset_usd_price = escrow_service.price_service.get_usd_price(asset)
+        price_usd = escrow_service.price_service.get_usd_price(asset)
     finally:
         conn.close()
 
-    example_usd = Decimal("100")
-    example_send_asset = (example_usd * Decimal("1.03")) / asset_usd_price
-    example_credit_asset = (example_usd * Decimal("0.98")) / asset_usd_price
-
+    example = _deposit_quote_amounts(asset, Decimal("100"), price_usd)
+    text = "\n".join([
+        _profile_block_html(f"<b>{_asset_profile_icon(asset)} {html.escape(asset)} Deposit</b>"),
+        _profile_block_html(
+            "<b>Enter the amount in USD to deposit</b>\n"
+            "Min: $45.00\n"
+            "Max: $10000.00\n\n"
+            "Provider fee: 3%\n"
+            "Platform fee: 2%\n\n"
+            f"Example request: $100.00 USD\n"
+            f"Estimated to send: {html.escape(_crypto_quote_text(asset, example['crypto_amount']))}"
+        ),
+        "Send /cancel to abort.",
+    ])
     await query.edit_message_text(
-        f"{icon} {asset} Deposit\n\n"
-        "Enter the amount in USD you want to deposit (min $45, max $10,000).\n\n"
-        "Provider fee: 3%.\n"
-        "Platform deposit fee: 2%.\n\n"
-        "Example:\n"
-        f"• You enter: {_format_usd_value(example_usd)}\n"
-        f"• You send: ~{_format_decimal_value(example_send_asset)} {asset}\n"
-        f"• You receive: ~{_format_decimal_value(example_credit_asset)} {asset}\n\n"
-        "The crypto amount is calculated from the USD value at the current rate.",
+        text,
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="profile_deposit")]]),
+        parse_mode=ParseMode.HTML,
     )
     return DEPOSIT_ENTER_AMOUNT
 
@@ -901,41 +922,43 @@ async def deposit_amount_input(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.effective_message.reply_text("Please enter a valid USD amount.")
         return DEPOSIT_ENTER_AMOUNT
     if usd_amount < Decimal("45") or usd_amount > Decimal("10000"):
-        await update.effective_message.reply_text("Enter an amount between $45 and $10,000.")
+        await update.effective_message.reply_text("Enter an amount between $45.00 and $10000.00 USD.")
         return DEPOSIT_ENTER_AMOUNT
 
     conn, wallet, tenant, escrow_service = _services()
     try:
         user_id = tenant.ensure_user(update.effective_user.id, update.effective_user.username)
         route = wallet.get_or_create_deposit_address(user_id, asset)
-        asset_usd_price = escrow_service.price_service.get_usd_price(asset)
+        price_usd = escrow_service.price_service.get_usd_price(asset)
         conn.commit()
     finally:
         conn.close()
 
-    send_usd = usd_amount * Decimal("1.03")
-    credit_usd = usd_amount * Decimal("0.98")
-    send_asset = send_usd / asset_usd_price
-    credit_asset = credit_usd / asset_usd_price
-
+    quote = _deposit_quote_amounts(asset, usd_amount, price_usd)
+    provider_fee_text = _usd_text(quote["provider_fee_usd"])
+    platform_fee_text = _usd_text(quote["platform_fee_usd"])
     explorer_template = DEPOSIT_EXPLORERS.get(asset, "https://etherscan.io/address/{address}")
     buttons = [
         [InlineKeyboardButton("⬅️ Back", callback_data="profile_deposit")],
         [InlineKeyboardButton("🔗 View Address", url=explorer_template.format(address=route.address))],
     ]
-    await update.effective_message.reply_text(
-        "📥 Deposit\n\n"
-        f"Selected amount: {_format_usd_value(usd_amount)}\n"
-        f"You need to send approximately: {_format_decimal_value(send_asset)} {asset}\n"
-        f"Estimated credited balance: {_format_decimal_value(credit_asset)} {asset}\n\n"
-        f"Deposit address:\n{route.address}\n\n"
-        f"This quote is based on ~{_format_usd_value(asset_usd_price)} per {asset}.\n"
-        "Provider fee 3% is included in the send amount.\n"
-        "Platform deposit fee 2% is reflected in the credited amount.",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
+    details = [
+        _profile_block_html("<b>📥 Deposit details</b>"),
+        f"Requested amount: {_profile_block(f'${_usd_text(usd_amount)} USD')}",
+        f"Estimated crypto to send: {_profile_block(_crypto_quote_text(asset, quote['crypto_amount']))}",
+        f"Provider fee: {_profile_block(f'${provider_fee_text} USD')}",
+        f"Platform fee: {_profile_block(f'${platform_fee_text} USD')}",
+        f"Address: {_profile_block(route.address)}",
+        f"Rate: {_profile_block(f'1 {asset} ≈ ${_usd_text(price_usd)}')}",
+    ]
     if route.destination_tag:
-        await update.effective_message.reply_text(f"Destination tag: {route.destination_tag}")
+        details.append(f"Destination tag: {_profile_block(route.destination_tag)}")
+    details.append("Send only the selected asset to this address.")
+    await update.effective_message.reply_text(
+        "\n".join(details),
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode=ParseMode.HTML,
+    )
     return ConversationHandler.END
 
 
@@ -965,23 +988,30 @@ async def withdraw_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         sol_icon = _asset_icon("SOL")
         xrp_icon = _asset_icon("XRP")
         await query.edit_message_text(
-            "❌ Insufficient Balance\n\n"
-            "You don't have sufficient balance in any currency for withdrawal.\n\n"
-            "Minimum amounts:\n"
-            f"{usdt_icon} 100 USDT\n"
-            f"{btc_icon} 0.001 BTC\n"
-            f"{eth_icon} 1 ETH\n"
-            f"{ltc_icon} 1 LTC\n"
-            f"{sol_icon} 1 SOL\n"
-            f"{xrp_icon} 10 XRP\n\n"
-            "Please deposit funds to your account before attempting a withdrawal.",
+            _profile_section(
+                "<b>❌ Insufficient Balance</b>",
+                [
+                    "You don't have sufficient balance in any currency for withdrawal.",
+                    "",
+                    "Minimum amounts:",
+                    f"{usdt_icon} 100 USDT",
+                    f"{btc_icon} 0.001 BTC",
+                    f"{eth_icon} 1 ETH",
+                    f"{ltc_icon} 1 LTC",
+                    f"{sol_icon} 1 SOL",
+                    f"{xrp_icon} 10 XRP",
+                    "",
+                    "Please deposit funds to your account before attempting a withdrawal.",
+                ],
+            ),
             reply_markup=_profile_menu(),
+            parse_mode=ParseMode.HTML,
         )
         return ConversationHandler.END
 
     keyboard = [[InlineKeyboardButton(a, callback_data=f"wd_asset:{a}")] for a in available_assets]
     keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="wd_back_profile")])
-    await query.edit_message_text("Select withdrawal currency:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await query.edit_message_text(_profile_block_html("<b>Select withdrawal currency:</b>"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
     return WD_SELECT_ASSET
 
 
@@ -993,8 +1023,9 @@ async def withdraw_select_asset(update: Update, context: ContextTypes.DEFAULT_TY
         return ConversationHandler.END
     context.user_data["wd_asset"] = query.data.split(":", 1)[1]
     await query.edit_message_text(
-        f"Enter {context.user_data['wd_asset']} withdrawal amount:",
+        _profile_section("<b>🏦 Withdraw</b>", [f"Enter {html.escape(str(context.user_data['wd_asset']))} withdrawal amount:"]),
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="wd_back_assets")]]),
+        parse_mode=ParseMode.HTML,
     )
     return WD_ENTER_AMOUNT
 
@@ -1004,31 +1035,32 @@ async def withdraw_amount_input(update: Update, context: ContextTypes.DEFAULT_TY
         return WD_ENTER_AMOUNT
     asset = context.user_data.get("wd_asset")
     if not asset:
-        await update.effective_message.reply_text("Withdrawal session expired")
+        await update.effective_message.reply_text(_profile_section("<b>🏦 Withdraw</b>", ["Withdrawal session expired."]), parse_mode=ParseMode.HTML)
         return ConversationHandler.END
     try:
         amount = Decimal(update.effective_message.text.strip())
     except InvalidOperation:
-        await update.effective_message.reply_text("Enter a valid numeric amount")
+        await update.effective_message.reply_text(_profile_section("<b>🏦 Withdraw</b>", ["Enter a valid numeric amount."]), parse_mode=ParseMode.HTML)
         return WD_ENTER_AMOUNT
     if amount <= 0:
-        await update.effective_message.reply_text("Amount must be positive")
+        await update.effective_message.reply_text(_profile_section("<b>🏦 Withdraw</b>", ["Amount must be positive."]), parse_mode=ParseMode.HTML)
         return WD_ENTER_AMOUNT
     if amount < WITHDRAW_MINIMUMS[asset]:
-        await update.effective_message.reply_text(f"Minimum withdrawal for {asset} is {WITHDRAW_MINIMUMS[asset]}")
+        await update.effective_message.reply_text(_profile_section("<b>🏦 Withdraw</b>", [f"Minimum withdrawal for {html.escape(str(asset))} is {html.escape(str(WITHDRAW_MINIMUMS[asset]))}."]), parse_mode=ParseMode.HTML)
         return WD_ENTER_AMOUNT
     conn, wallet, tenant, _ = _services()
     try:
         user_id = tenant.ensure_user(update.effective_user.id, update.effective_user.username)
         if wallet.available_balance(user_id, asset) < amount:
-            await update.effective_message.reply_text("Insufficient available balance")
+            await update.effective_message.reply_text(_profile_section("<b>🏦 Withdraw</b>", ["Insufficient available balance."]), parse_mode=ParseMode.HTML)
             return WD_ENTER_AMOUNT
     finally:
         conn.close()
     context.user_data["wd_amount"] = amount
     await update.effective_message.reply_text(
-        f"Enter your {asset} withdrawal address:",
+        _profile_section("<b>🏦 Withdraw</b>", [f"Enter your {html.escape(str(asset))} withdrawal address:"]),
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="wd_back_amount")]]),
+        parse_mode=ParseMode.HTML,
     )
     return WD_ENTER_ADDRESS
 
@@ -1036,7 +1068,7 @@ async def withdraw_amount_input(update: Update, context: ContextTypes.DEFAULT_TY
 async def withdraw_address_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     address = update.effective_message.text.strip()
     if not address:
-        await update.effective_message.reply_text("Address is required")
+        await update.effective_message.reply_text(_profile_section("<b>🏦 Withdraw</b>", ["Address is required."]), parse_mode=ParseMode.HTML)
         return WD_ENTER_ADDRESS
     asset = context.user_data.get("wd_asset")
     conn, wallet, _, _ = _services()
@@ -1044,14 +1076,15 @@ async def withdraw_address_input(update: Update, context: ContextTypes.DEFAULT_T
         try:
             wallet.validate_withdrawal_address(asset, address)
         except ValueError as exc:
-            await update.effective_message.reply_text(str(exc))
+            await update.effective_message.reply_text(_profile_section("<b>🏦 Withdraw</b>", [html.escape(str(exc))]), parse_mode=ParseMode.HTML)
             return WD_ENTER_ADDRESS
     finally:
         conn.close()
     context.user_data["wd_address"] = address
     await update.effective_message.reply_text(
-        f"Is this address correct? {address}",
+        _profile_section("<b>🏦 Confirm withdrawal</b>", [f"Address: {html.escape(address)}", "", "Is this address correct?"]),
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Confirm", callback_data="wd_confirm"), InlineKeyboardButton("Cancel", callback_data="wd_cancel_addr")]]),
+        parse_mode=ParseMode.HTML,
     )
     return WD_CONFIRM
 
@@ -1061,8 +1094,9 @@ async def withdraw_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await query.answer()
     if query.data == "wd_cancel_addr":
         await query.edit_message_text(
-            f"Enter your {context.user_data.get('wd_asset','ASSET')} withdrawal address:",
+            _profile_section("<b>🏦 Withdraw</b>", [f"Enter your {html.escape(str(context.user_data.get('wd_asset', 'ASSET')))} withdrawal address:"]),
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="wd_back_amount")]]),
+            parse_mode=ParseMode.HTML,
         )
         return WD_ENTER_ADDRESS
     if await _enforce_rate_limit(query, query.from_user.id, "withdraw_confirm", limit=3, window_s=20):
@@ -1078,7 +1112,7 @@ async def withdraw_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             wallet.request_withdrawal(user_id, context.user_data["wd_asset"], Decimal(context.user_data["wd_amount"]), context.user_data["wd_address"])
         except ValueError as exc:
             conn.rollback()
-            await query.edit_message_text(str(exc), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="profile_open")]]))
+            await query.edit_message_text(_profile_section("<b>🏦 Withdraw</b>", [html.escape(str(exc))]), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="profile_open")]]), parse_mode=ParseMode.HTML)
             return ConversationHandler.END
         conn.commit()
     finally:
@@ -1087,8 +1121,9 @@ async def withdraw_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     for k in ["wd_asset", "wd_amount", "wd_address"]:
         context.user_data.pop(k, None)
     await query.edit_message_text(
-        "Withdrawal request submitted. Funds will arrive within a few minutes.",
+        _profile_section("<b>🏦 Withdraw</b>", ["Withdrawal request submitted.", "Funds will arrive within a few minutes."]),
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="profile_open")]]),
+        parse_mode=ParseMode.HTML,
     )
     return ConversationHandler.END
 
@@ -1100,8 +1135,9 @@ async def withdraw_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return await withdraw_start(update, context)
     if query.data == "wd_back_amount":
         await query.edit_message_text(
-            f"Enter {context.user_data.get('wd_asset','ASSET')} withdrawal amount:",
+            _profile_section("<b>🏦 Withdraw</b>", [f"Enter {html.escape(str(context.user_data.get('wd_asset', 'ASSET')))} withdrawal amount:"]),
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="wd_back_assets")]]),
+            parse_mode=ParseMode.HTML,
         )
         return WD_ENTER_AMOUNT
     if query.data == "wd_back_profile":
@@ -1448,14 +1484,14 @@ async def deal_new_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     _clear_draft_flow(context)
 
-    await query.edit_message_text(_deal_search_prompt_text(), reply_markup=_deal_search_prompt_markup())
+    await query.edit_message_text(_deal_search_prompt_text(), reply_markup=_deal_search_prompt_markup(), parse_mode=ParseMode.HTML)
     return DEAL_SEARCH_INPUT
 
 
 async def deal_check_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _clear_draft_flow(context)
     if not context.args:
-        await update.effective_message.reply_text(_deal_search_prompt_text(), reply_markup=_deal_search_prompt_markup())
+        await update.effective_message.reply_text(_deal_search_prompt_text(), reply_markup=_deal_search_prompt_markup(), parse_mode=ParseMode.HTML)
         return DEAL_SEARCH_INPUT
     return await _seller_lookup_and_render(update, context, context.args[0].strip())
 
@@ -1470,7 +1506,7 @@ async def deal_search_result_cb(update: Update, context: ContextTypes.DEFAULT_TY
         return ConversationHandler.END
     if query.data == "deal_search_again":
         _clear_draft_flow(context)
-        await query.edit_message_text(_deal_search_prompt_text(), reply_markup=_deal_search_prompt_markup())
+        await query.edit_message_text(_deal_search_prompt_text(), reply_markup=_deal_search_prompt_markup(), parse_mode=ParseMode.HTML)
         return DEAL_SEARCH_INPUT
 
     if query.data == "deal_create":
@@ -1487,7 +1523,7 @@ async def deal_search_result_cb(update: Update, context: ContextTypes.DEFAULT_TY
             if row:
                 keyboard.append(row)
         keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="deal_back_main")])
-        await query.edit_message_text("Select the currency for this deal:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(_profile_block_html('<b>Select the currency for this deal:</b>'), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
         return DEAL_ENTER_AMOUNT
 
     return DEAL_SEARCH_RESULT
@@ -1500,15 +1536,19 @@ async def _show_deal_amount_prompt(query, buyer_id: int, asset: str) -> None:
     finally:
         conn.close()
     await query.edit_message_text(
-        "💰 Your balances:\n"
-        f"• {_asset_display(asset)}: {balance}    ⚠️ min: 40\n\n"
-        "Enter the deal amount ✍️:",
+        "\n".join([
+            _profile_block_html("<b>💰 Your balances:</b>"),
+            f"• {_asset_profile_icon(asset)} {_profile_block(_decimal_text(balance))}    ⚠️ min: 40 USD",
+            "",
+            _profile_block_html("<b>Enter the deal amount ✍️:</b>"),
+        ]),
         reply_markup=InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("Deposit", callback_data="profile_deposit")],
                 [InlineKeyboardButton("❌ Cancel", callback_data="deal_back_main")],
             ]
         ),
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -1571,7 +1611,7 @@ async def deal_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     try:
         amount = Decimal(text)
     except (InvalidOperation, ValueError):
-        await update.effective_message.reply_text("Please enter a valid numeric amount")
+        await update.effective_message.reply_text(_profile_block_html("<b>Please enter a valid numeric amount</b>"), parse_mode=ParseMode.HTML)
         return DEAL_ENTER_AMOUNT
 
     conn, wallet, tenant, escrow_service = _services()
@@ -1589,25 +1629,30 @@ async def deal_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await update.effective_message.reply_text("You cannot create a deal with yourself")
             return ConversationHandler.END
         if amount <= 0:
-            await update.effective_message.reply_text("Amount must be positive")
+            await update.effective_message.reply_text(_profile_section("<b>🏦 Withdraw</b>", ["Amount must be positive."]), parse_mode=ParseMode.HTML)
             return DEAL_ENTER_AMOUNT
 
         if escrow_service.price_service.get_usd_value(asset, amount) < Decimal("40"):
-            await update.effective_message.reply_text("Amount must be at least $40 equivalent")
+            await update.effective_message.reply_text(_profile_block_html("<b>Amount must be at least $40 equivalent</b>"), parse_mode=ParseMode.HTML)
             return DEAL_ENTER_AMOUNT
         balance = wallet.available_balance(buyer_id, asset)
         if balance < amount:
             difference = amount - balance
             await update.effective_message.reply_text(
-                f"Insufficient balance. You need {amount} {_asset_display(asset)}, but you have {balance} {_asset_display(asset)}.\n\n"
-                f"You need {difference} {_asset_display(asset)} more.\n\n"
-                "Top up your balance or enter a different amount.",
+                "\n".join([
+                    _profile_block_html("<b>Insufficient balance</b>"),
+                    f"Requested: {_profile_block(_crypto_quote_text(asset, amount))}",
+                    f"Available: {_profile_block(_crypto_quote_text(asset, balance))}",
+                    f"Difference: {_profile_block(_crypto_quote_text(asset, difference))}",
+                    "Top up your balance or enter a different amount.",
+                ]),
                 reply_markup=InlineKeyboardMarkup(
                     [
                         [InlineKeyboardButton("Deposit", callback_data="profile_deposit")],
                         [InlineKeyboardButton("❌ Cancel", callback_data="deal_back_main")],
                     ]
                 ),
+                parse_mode=ParseMode.HTML,
             )
             return DEAL_ENTER_AMOUNT
 
@@ -1615,8 +1660,12 @@ async def deal_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data["asset"] = asset
 
         await update.effective_message.reply_text(
-            "Describe the deal in detail, including ALL terms. THIS WILL AFFECT HOW DISPUTES ARE RESOLVED LATER. Describe ALL deal conditions",
+            "\n".join([
+                _profile_block_html("<b>Describe the deal in detail</b>"),
+                "Include all terms. This will affect how disputes are resolved later.",
+            ]),
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="deal_back_to_amount")]]),
+            parse_mode=ParseMode.HTML,
         )
         conn.commit()
         return DEAL_ENTER_CONDITIONS
@@ -1651,7 +1700,7 @@ async def deal_conditions_input(update: Update, context: ContextTypes.DEFAULT_TY
             view = escrow.create_escrow(bot_id=runtime_bot_id, buyer_id=buyer_id, seller_id=seller_id, asset=asset, amount=amount, description=conditions)
         except ValueError as exc:
             conn.rollback()
-            await update.effective_message.reply_text(str(exc))
+            await update.effective_message.reply_text(_profile_section("<b>🏦 Withdraw</b>", [html.escape(str(exc))]), parse_mode=ParseMode.HTML)
             return DEAL_ENTER_CONDITIONS
         context.user_data["escrow_id"] = view.escrow_id
 
