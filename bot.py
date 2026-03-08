@@ -161,6 +161,31 @@ def _profile_chip(value: object) -> str:
     return f"<code>{html.escape(str(value))}</code>"
 
 
+def _profile_blockquote(*lines: str) -> str:
+    filtered = [line for line in lines if line is not None]
+    return '<blockquote>' + '\n'.join(filtered) + '</blockquote>'
+
+
+def _format_decimal_value(value: Decimal | int | str, *, places: int = 8, trim: bool = True) -> str:
+    try:
+        decimal_value = Decimal(str(value))
+    except Exception:
+        return str(value)
+    quant = Decimal('1').scaleb(-places)
+    rendered = f"{decimal_value.quantize(quant, rounding=ROUND_HALF_UP):f}"
+    if trim and '.' in rendered:
+        rendered = rendered.rstrip('0').rstrip('.')
+    return rendered or '0'
+
+
+def _format_usd_value(value: Decimal | int | str) -> str:
+    try:
+        decimal_value = Decimal(str(value))
+    except Exception:
+        return str(value)
+    return f"${decimal_value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):f}"
+
+
 def _profile_custom_emoji(env_key: str, fallback: str) -> str:
     emoji_id = (os.getenv(env_key, "") or "").strip()
     if emoji_id.isdigit():
@@ -272,54 +297,65 @@ def _user_profile(conn, user_row) -> dict:
 
 
 def _render_user_profile(profile: dict) -> str:
-    username = html.escape(str(profile.get("username") or "unknown"))
-    first_name = profile.get("first_name")
-    lines = [
-        f"👤 Profile: {_profile_chip(f'@{username}')}",
-        f"👤 Telegram Id: {_profile_chip(profile.get('telegram_id', 'unknown'))}",
-    ]
-    if first_name:
-        lines.append(f"👤 First Name: {html.escape(str(first_name))}")
-    lines.extend([
-        "",
-        f"📅 Registered: {_date_short(profile.get('registered_date'))}",
-        "",
-        f"🛡️ Trust level: {html.escape(str(profile.get('trust_level') or '🔴 Low'))}",
-    ])
+    username = str(profile.get("username") or "unknown")
+    first_name = str(profile.get("first_name") or "unknown")
+    registered_label = _date_short(profile.get("registered_date"))
+    trust_level = html.escape(str(profile.get("trust_level") or "🔴 Low"))
 
     review_count = int(profile.get("review_count", 0) or 0)
     rating = float(profile.get("rating", 0.0) or 0.0)
     if review_count < 3:
-        lines.append("⭐ Rating: Too few reviews")
+        rating_line = "⭐ Rating: Too few reviews"
     else:
-        lines.append(f"⭐ Rating: {_profile_rating_stars(rating)} ({rating:.1f}/5 from {review_count} reviews)")
+        rating_line = f"⭐ Rating: {_profile_rating_stars(rating)} ({rating:.1f}/5 from {review_count} reviews)"
 
-    lines.extend([
-        "",
-        "🤝 Deals:",
+    deal_lines = [
         _profile_stats_line("✅", "Successful:", profile.get("successful_deals", 0)),
         _profile_stats_line("🚫", "Cancelled:", profile.get("cancelled_deals", 0)),
         _profile_stats_line("⚠️", "Disputes lost:", profile.get("disputes_lost", 0)),
-        "",
-        "📈 Total Spent/Earned:",
-    ])
+    ]
 
+    asset_lines: list[str] = []
     asset_totals = profile.get("asset_totals") or {}
     if asset_totals:
         for asset in sorted(asset_totals.keys(), key=lambda a: BASE_ASSETS.index(a) if a in BASE_ASSETS else 999):
-            lines.append(_profile_asset_line(asset, asset_totals[asset]))
+            asset_lines.append(_profile_asset_line(asset, _format_decimal_value(asset_totals[asset])))
     else:
-        lines.append(f"• {_profile_chip('No completed volume yet')}")
+        asset_lines.append(f"• {_profile_chip('No completed volume yet')}")
 
-    lines.extend(["", "📝 Last 3 reviews:"])
+    review_lines: list[str] = []
     reviews = profile.get("last_reviews") or []
     if not reviews:
-        lines.append("• No reviews yet")
+        review_lines.append("• No reviews yet")
     else:
         for review in reviews:
-            lines.append(_profile_review_line(review))
+            review_lines.append(_profile_review_line(review))
 
-    return "\n".join(lines)
+    return "\n".join(
+        [
+            _profile_blockquote(
+                f"👤 Profile: {_profile_chip(f'@{username}')}",
+                f"👤 Telegram Id: {_profile_chip(profile.get('telegram_id', 'unknown'))}",
+                f"👤 First Name: {_profile_chip(first_name)}",
+            ),
+            "",
+            _profile_blockquote(f"📅 Registered: {_profile_chip(registered_label)}"),
+            "",
+            _profile_blockquote(
+                f"🛡️ Trust level: {trust_level}",
+                rating_line,
+            ),
+            "",
+            "🤝 Deals:",
+            _profile_blockquote(*deal_lines),
+            "",
+            "📈 Total Spent/Earned:",
+            _profile_blockquote(*asset_lines),
+            "",
+            "📝 Last 3 reviews:",
+            _profile_blockquote(*review_lines),
+        ]
+    )
 
 
 def _format_db_timestamp(ts: str | None) -> str:
@@ -581,74 +617,84 @@ def _date_short(ts: str | None) -> str:
 def _render_self_profile(conn, telegram_user, user_id: int, wallet: WalletService) -> str:
     user_row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
     if not user_row:
-        first_name = html.escape(str(getattr(telegram_user, "first_name", "") or "unknown"))
+        first_name = str(getattr(telegram_user, "first_name", "") or "unknown")
         return "\n".join([
-            f"👤 Your Telegram Id: {_profile_chip(getattr(telegram_user, 'id', 'unknown'))}",
-            f"👤 First Name: {first_name}",
+            _profile_blockquote(
+                f"👤 Your Telegram Id: {_profile_chip(getattr(telegram_user, 'id', 'unknown'))}",
+                f"👤 First Name: {_profile_chip(first_name)}",
+            ),
             "",
             "💰 Balance:",
-            f"• {_profile_chip('No balance yet')}",
+            _profile_blockquote(f"• {_profile_chip('No balance yet')}"),
         ])
 
     profile = _user_profile(conn, user_row)
     profile["first_name"] = getattr(telegram_user, "first_name", None)
 
-    lines = [
-        f"👤 Your Telegram Id: {_profile_chip(profile.get('telegram_id', 'unknown'))}",
-        f"👤 First Name: {html.escape(str(profile.get('first_name') or 'unknown'))}",
-        "",
-        "💰 Balance:",
-    ]
-
-    balances_added = False
+    balance_lines: list[str] = []
     for asset in _enabled_assets():
         available = wallet.available_balance(user_id, asset)
         if available > 0:
-            lines.append(_profile_asset_line(asset, available))
-            balances_added = True
-    if not balances_added:
-        lines.append(f"• {_profile_chip('No balance yet')}")
-
-    lines.extend([
-        "",
-        f"📅 Registered: {_date_short(profile.get('registered_date'))}",
-        "",
-        f"🛡️ Trust level: {html.escape(str(profile.get('trust_level') or '🔴 Low'))}",
-    ])
+            balance_lines.append(_profile_asset_line(asset, _format_decimal_value(available)))
+    if not balance_lines:
+        balance_lines.append(f"• {_profile_chip('No balance yet')}")
 
     review_count = int(profile.get("review_count", 0) or 0)
     rating = float(profile.get("rating", 0.0) or 0.0)
     if review_count < 3:
-        lines.append("⭐ Rating: Too few reviews")
+        rating_line = "⭐ Rating: Too few reviews"
     else:
-        lines.append(f"⭐ Rating: {_profile_rating_stars(rating)} ({rating:.1f}/5 from {review_count} reviews)")
+        rating_line = f"⭐ Rating: {_profile_rating_stars(rating)} ({rating:.1f}/5 from {review_count} reviews)"
 
-    lines.extend([
-        "",
-        "🤝 Deals:",
-        _profile_stats_line("✅", "<b>Successful:</b>", profile.get("successful_deals", 0)),
+    deal_lines = [
+        _profile_stats_line("✅", "Successful:", profile.get("successful_deals", 0)),
         _profile_stats_line("🚫", "Cancelled:", profile.get("cancelled_deals", 0)),
         _profile_stats_line("⚠️", "Disputes lost:", profile.get("disputes_lost", 0)),
-        "",
-        "📈 Total Spent/Earned:",
-    ])
+    ]
 
+    volume_lines: list[str] = []
     asset_totals = profile.get("asset_totals") or {}
     if asset_totals:
         for asset in sorted(asset_totals.keys(), key=lambda a: BASE_ASSETS.index(a) if a in BASE_ASSETS else 999):
-            lines.append(_profile_asset_line(asset, asset_totals[asset]))
+            volume_lines.append(_profile_asset_line(asset, _format_decimal_value(asset_totals[asset])))
     else:
-        lines.append(f"• {_profile_chip('No completed volume yet')}")
+        volume_lines.append(f"• {_profile_chip('No completed volume yet')}")
 
-    lines.extend(["", "📝 Last 3 reviews:"])
+    review_lines: list[str] = []
     reviews = profile.get("last_reviews") or []
     if not reviews:
-        lines.append("• No reviews yet")
+        review_lines.append("• No reviews yet")
     else:
         for review in reviews:
-            lines.append(_profile_review_line(review))
-    return "\n".join(lines)
+            review_lines.append(_profile_review_line(review))
 
+    return "\n".join(
+        [
+            _profile_blockquote(
+                f"👤 Your Telegram Id: {_profile_chip(profile.get('telegram_id', 'unknown'))}",
+                f"👤 First Name: {_profile_chip(profile.get('first_name') or 'unknown')}",
+            ),
+            "",
+            "💰 Balance:",
+            _profile_blockquote(*balance_lines),
+            "",
+            _profile_blockquote(f"📅 Registered: {_profile_chip(_date_short(profile.get('registered_date')))}"),
+            "",
+            _profile_blockquote(
+                f"🛡️ Trust level: {html.escape(str(profile.get('trust_level') or '🔴 Low'))}",
+                rating_line,
+            ),
+            "",
+            "🤝 Deals:",
+            _profile_blockquote(*deal_lines),
+            "",
+            "📈 Total Spent/Earned:",
+            _profile_blockquote(*volume_lines),
+            "",
+            "📝 Last 3 reviews:",
+            _profile_blockquote(*review_lines),
+        ]
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -816,13 +862,27 @@ async def deposit_select_asset(update: Update, context: ContextTypes.DEFAULT_TYP
     asset = query.data.split(":", 1)[1]
     context.user_data["dep_asset"] = asset
     icon = _asset_icon(asset)
+
+    conn, _, _, escrow_service = _services()
+    try:
+        asset_usd_price = escrow_service.price_service.get_usd_price(asset)
+    finally:
+        conn.close()
+
+    example_usd = Decimal("100")
+    example_send_asset = (example_usd * Decimal("1.03")) / asset_usd_price
+    example_credit_asset = (example_usd * Decimal("0.98")) / asset_usd_price
+
     await query.edit_message_text(
         f"{icon} {asset} Deposit\n\n"
-        f"Enter the amount in {asset} to deposit (min 45, max 10000).\n\n"
-        "Provider fee (3%): included in invoice.\n"
-        "Platform deposit fee (2%): deducted from credited amount.\n\n"
-        f"Example: deposit 100 {asset} → pay 103 {asset} → receive 98 {asset}.\n\n"
-        "Send /cancel to abort.",
+        "Enter the amount in USD you want to deposit (min $45, max $10,000).\n\n"
+        "Provider fee: 3%.\n"
+        "Platform deposit fee: 2%.\n\n"
+        "Example:\n"
+        f"• You enter: {_format_usd_value(example_usd)}\n"
+        f"• You send: ~{_format_decimal_value(example_send_asset)} {asset}\n"
+        f"• You receive: ~{_format_decimal_value(example_credit_asset)} {asset}\n\n"
+        "The crypto amount is calculated from the USD value at the current rate.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="profile_deposit")]]),
     )
     return DEPOSIT_ENTER_AMOUNT
@@ -836,21 +896,27 @@ async def deposit_amount_input(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.effective_message.reply_text("Deposit session expired. Please select asset again.")
         return ConversationHandler.END
     try:
-        amount = Decimal(update.effective_message.text.strip())
+        usd_amount = Decimal(update.effective_message.text.strip())
     except (InvalidOperation, ValueError):
-        await update.effective_message.reply_text(f"Please enter a valid {asset} amount.")
+        await update.effective_message.reply_text("Please enter a valid USD amount.")
         return DEPOSIT_ENTER_AMOUNT
-    if amount < Decimal("45") or amount > Decimal("10000"):
-        await update.effective_message.reply_text(f"Enter an amount between 45 and 10000 {asset}.")
+    if usd_amount < Decimal("45") or usd_amount > Decimal("10000"):
+        await update.effective_message.reply_text("Enter an amount between $45 and $10,000.")
         return DEPOSIT_ENTER_AMOUNT
 
-    conn, wallet, tenant, _ = _services()
+    conn, wallet, tenant, escrow_service = _services()
     try:
         user_id = tenant.ensure_user(update.effective_user.id, update.effective_user.username)
         route = wallet.get_or_create_deposit_address(user_id, asset)
+        asset_usd_price = escrow_service.price_service.get_usd_price(asset)
         conn.commit()
     finally:
         conn.close()
+
+    send_usd = usd_amount * Decimal("1.03")
+    credit_usd = usd_amount * Decimal("0.98")
+    send_asset = send_usd / asset_usd_price
+    credit_asset = credit_usd / asset_usd_price
 
     explorer_template = DEPOSIT_EXPLORERS.get(asset, "https://etherscan.io/address/{address}")
     buttons = [
@@ -858,7 +924,14 @@ async def deposit_amount_input(update: Update, context: ContextTypes.DEFAULT_TYP
         [InlineKeyboardButton("🔗 View Address", url=explorer_template.format(address=route.address))],
     ]
     await update.effective_message.reply_text(
-        f"📥 Deposit\n\nAddress:\n{route.address}\n\nDeposit fee: 2% will be held — {asset} network",
+        "📥 Deposit\n\n"
+        f"Selected amount: {_format_usd_value(usd_amount)}\n"
+        f"You need to send approximately: {_format_decimal_value(send_asset)} {asset}\n"
+        f"Estimated credited balance: {_format_decimal_value(credit_asset)} {asset}\n\n"
+        f"Deposit address:\n{route.address}\n\n"
+        f"This quote is based on ~{_format_usd_value(asset_usd_price)} per {asset}.\n"
+        "Provider fee 3% is included in the send amount.\n"
+        "Platform deposit fee 2% is reflected in the credited amount.",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
     if route.destination_tag:
