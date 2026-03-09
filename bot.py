@@ -57,6 +57,13 @@ BASE_ASSETS = ["USDT", "BTC", "ETH", "LTC"]
 DEPOSIT_ISSUANCE_READY = True
 DEPOSIT_ISSUANCE_ERROR: str | None = None
 
+WITHDRAWAL_STATUS_LABELS = {
+    "pending": "Pending",
+    "broadcasted": "Broadcasted",
+    "failed": "Failed",
+    "signer_retry": "Awaiting reconciliation",
+}
+
 
 def _enabled_assets() -> list[str]:
     return list(BASE_ASSETS)
@@ -825,6 +832,16 @@ async def profile_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data == "profile_deposit":
+        if not DEPOSIT_ISSUANCE_READY:
+            await query.edit_message_text(
+                _profile_section(
+                    "<b>💰 Deposit</b>",
+                    ["Deposit address issuance is currently unavailable. Please try again later."],
+                ),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="profile_open")]]),
+                parse_mode=ParseMode.HTML,
+            )
+            return
         keyboard = [[InlineKeyboardButton(_asset_with_icon(asset), callback_data=f"dep_asset:{asset}")] for asset in _enabled_assets()]
         keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="profile_open")])
         await query.edit_message_text(_profile_block_html("<b>💰 Deposit currency:</b>"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
@@ -962,7 +979,7 @@ async def profile_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         if entry_type == "WITHDRAWAL_RESERVE":
             wd_status = str(r["wd_status"] or "").strip().lower()
-            status_label = {"pending": "Pending", "broadcasted": "Broadcasted", "failed": "Failed"}.get(wd_status, "Pending")
+            status_label = WITHDRAWAL_STATUS_LABELS.get(wd_status, "Awaiting reconciliation")
             if r["destination_address"]:
                 addr = wallet._decrypt_field(r["destination_address"])
                 lines.append(f"<b>Address:</b> <code>{html.escape(str(addr))}</code>")
@@ -990,6 +1007,16 @@ async def profile_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def deposit_select_asset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+    if not DEPOSIT_ISSUANCE_READY:
+        await query.edit_message_text(
+            _profile_section(
+                "<b>💰 Deposit</b>",
+                ["Deposit address issuance is currently unavailable. Please try again later."],
+            ),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="profile_open")]]),
+            parse_mode=ParseMode.HTML,
+        )
+        return ConversationHandler.END
     asset = query.data.split(":", 1)[1]
     if asset not in _enabled_assets():
         await query.edit_message_text("Unsupported deposit currency.", reply_markup=_profile_menu())
@@ -2294,15 +2321,34 @@ async def watcher_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     conn, _, _, _ = _services()
     try:
-        status = read_watcher_status(conn, ["btc_watcher", "eth_watcher"])
+        status = read_watcher_status(conn, ["btc_watcher", "eth_watcher", "signer_loop"])
         b = status["btc_watcher"]
         e = status["eth_watcher"]
+        s = status["signer_loop"]
+        retry_rows = conn.execute(
+            "SELECT asset, COALESCE(SUM(CAST(amount AS REAL)),0) AS total_amount, COUNT(*) AS count FROM withdrawals WHERE status='signer_retry' GROUP BY asset ORDER BY asset"
+        ).fetchall()
+        retry_total = conn.execute("SELECT COUNT(*) AS c FROM withdrawals WHERE status='signer_retry'").fetchone()["c"]
+        retry_lines = [f"- total in signer_retry: {retry_total}"]
+        for row in retry_rows:
+            retry_lines.append(f"- {row['asset']}: {Decimal(str(row['total_amount'] or 0))} ({row['count']} requests)")
+
         msg = (
             f"BTC watcher\n- last run: {b['last_run_at']}\n- last success: {b['last_success_at']}\n"
             f"- consecutive failures: {b['consecutive_failures']}\n- last error: {b['last_error']}\n\n"
             f"ETH watcher\n- last run: {e['last_run_at']}\n- last success: {e['last_success_at']}\n"
-            f"- consecutive failures: {e['consecutive_failures']}\n- last error: {e['last_error']}"
+            f"- consecutive failures: {e['consecutive_failures']}\n- last error: {e['last_error']}\n\n"
+            f"Signer loop\n- last run: {s['last_run_at']}\n- last success: {s['last_success_at']}\n"
+            f"- consecutive failures: {s['consecutive_failures']}\n- last error: {s['last_error']}\n\n"
+            f"Deposit issuance readiness\n- ready: {'yes' if DEPOSIT_ISSUANCE_READY else 'no'}\n"
+            f"- detail: {DEPOSIT_ISSUANCE_ERROR or 'ok'}\n\n"
+            f"Signer retry backlog\n" + "\n".join(retry_lines)
         )
+        conn.execute(
+            "INSERT INTO admin_actions(admin_user_id,action_type,data_json) VALUES(?,?,?)",
+            (update.effective_user.id, "view_watcher_status", json.dumps({"watchers": ["btc_watcher", "eth_watcher", "signer_loop"]})),
+        )
+        conn.commit()
         await update.effective_message.reply_text(msg)
     finally:
         conn.close()

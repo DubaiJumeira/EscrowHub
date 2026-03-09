@@ -44,7 +44,7 @@ These run as independent long-running loops. Watchers and signer are **not** sta
 - consecutive_failures
 - updated_at
 
-Use bot admin command `/watcher_status` to read BTC/ETH watcher health.
+Use bot admin command `/watcher_status` to read BTC/ETH watcher health, signer loop health, bot deposit-issuance readiness, and signer_retry backlog totals.
 
 ## Active assets
 Only BTC, LTC, ETH, and USDT are supported in active runtime.
