@@ -119,6 +119,14 @@ CREATE TABLE IF NOT EXISTS admin_actions (
 );
 
 
+
+CREATE TABLE IF NOT EXISTS rate_limit_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS watcher_status (
   watcher_name TEXT PRIMARY KEY,
   last_run_at TEXT,
@@ -146,3 +154,5 @@ CREATE INDEX IF NOT EXISTS idx_escrow_locks_user_asset_status ON escrow_locks(us
 CREATE INDEX IF NOT EXISTS idx_wallet_addresses_asset_address ON wallet_addresses(asset, address);
 CREATE INDEX IF NOT EXISTS idx_escrows_status_buyer_seller_created ON escrows(status, buyer_id, seller_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_reviews_reviewed_created ON reviews(reviewed_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_rate_limit_events_user_action_created ON rate_limit_events(user_id, action, created_at);

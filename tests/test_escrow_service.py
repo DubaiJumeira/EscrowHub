@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 import sqlite3
 
-from bot import _RATE_BUCKETS, _clear_draft_flow, _is_rate_limited, _is_user_frozen, _notify_safe, _render_user_profile, _user_profile
+from bot import _clear_draft_flow, _is_rate_limited, _is_user_frozen, _notify_safe, _render_user_profile, _set_frozen_state, _user_profile
 from escrow_service import EscrowService
 from fee_service import FeeService
 from hd_wallet import HDWalletDeriver
@@ -72,7 +72,8 @@ def test_dispute_resolution_outcomes(conn):
     assert escrow.wallet_service.account_revenue_balance("BOT_OWNER_REVENUE", owner, "USDT") == Decimal("20.0")
 
 
-def test_eth_watcher_entrypoint_no_rpc(conn):
+def test_eth_watcher_entrypoint_no_rpc(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "test")
     assert run_eth_once({}) == 0
 
 
@@ -166,7 +167,7 @@ def test_release_moves_pending_to_completed(conn):
     escrow.wallet_service.credit_deposit_if_confirmed(buyer, "USDT", Decimal("100"), "tx2", "tx2:0", "ETHEREUM", 12, True)
     view = escrow.create_escrow(1, buyer, seller, "USDT", Decimal("60"), "deal")
 
-    conn.execute("UPDATE escrows SET status='active' WHERE id=?", (view.escrow_id,))
+    escrow.accept_escrow(view.escrow_id, seller)
     released = escrow.release(view.escrow_id, actor_user_id=buyer)
 
     assert released.status == "completed"
@@ -231,7 +232,7 @@ def test_check_user_profile_render_uses_db_metrics(conn):
     escrow = EscrowService(conn)
     escrow.wallet_service.credit_deposit_if_confirmed(buyer, "USDT", Decimal("200"), "txp", "txp:0", "ETHEREUM", 12, True)
     view = escrow.create_escrow(1, buyer, seller, "USDT", Decimal("80"), "goods")
-    conn.execute("UPDATE escrows SET status='active' WHERE id=?", (view.escrow_id,))
+    escrow.accept_escrow(view.escrow_id, seller)
     escrow.release(view.escrow_id, actor_user_id=buyer)
     conn.execute("INSERT INTO reviews(reviewer_id,reviewed_id,escrow_id,rating) VALUES(?,?,?,?)", (buyer, seller, view.escrow_id, 5))
 
@@ -310,21 +311,19 @@ def test_eth_rpc_adapter_parses_erc20_transfer_event(monkeypatch):
     assert dep.amount == Decimal("1.5")
 
 
-def test_rate_limiter_bucket_eviction(monkeypatch):
-    _RATE_BUCKETS.clear()
-    fake_time = [1000.0]
-
-    def _now():
-        return fake_time[0]
-
-    monkeypatch.setattr("bot.time.time", _now)
-    assert _is_rate_limited(1, "x", limit=2, window_s=10) is False
-    assert _is_rate_limited(1, "x", limit=2, window_s=10) is False
-    assert _is_rate_limited(1, "x", limit=2, window_s=10) is True
-    fake_time[0] = 1200.0
-    assert _is_rate_limited(2, "y", limit=2, window_s=10) is False
-    # old key should be pruned after grace window
-    assert (1, "x") not in _RATE_BUCKETS
+def test_rate_limiter_db_backed_across_connections(tmp_path):
+    db = tmp_path / "rl.db"
+    c1 = sqlite3.connect(db)
+    c1.row_factory = sqlite3.Row
+    c1.execute("PRAGMA foreign_keys=ON")
+    init_db(c1)
+    c2 = sqlite3.connect(db)
+    c2.row_factory = sqlite3.Row
+    c2.execute("PRAGMA foreign_keys=ON")
+    assert _is_rate_limited(c1, 1, "x", limit=2, window_s=30) is False
+    assert _is_rate_limited(c2, 1, "x", limit=2, window_s=30) is False
+    assert _is_rate_limited(c1, 1, "x", limit=2, window_s=30) is True
+    c1.close(); c2.close()
 
 
 def test_frozen_user_withdrawal_rejected(conn):
@@ -389,7 +388,7 @@ def test_production_rejects_fallback_derivation(monkeypatch):
     monkeypatch.setenv("APP_ENV", "production")
     d = HDWalletDeriver()
     with pytest.raises(RuntimeError):
-        d._derive_fallback("m/84'/0'/1'/0/0", "bc1q")
+        d._derive_fallback_address("m/84'/0'/1'/0/0", "bc1q")
 
 
 def test_production_rejects_hd_signer(monkeypatch):
@@ -453,3 +452,136 @@ def test_concurrent_withdrawal_race_only_one_succeeds(tmp_path):
             pass
         cx.close()
     assert ok == 1
+
+
+def test_accept_escrow_transitions_and_event(conn):
+    _, buyer, seller, _ = _seed_tenant(conn)
+    escrow = EscrowService(conn)
+    escrow.wallet_service.credit_deposit_if_confirmed(buyer, "USDT", Decimal("100"), "txa", "txa:0", "ETHEREUM", 12, True)
+    view = escrow.create_escrow(1, buyer, seller, "USDT", Decimal("50"), "deal")
+    escrow.accept_escrow(view.escrow_id, seller)
+    row = conn.execute("SELECT status FROM escrows WHERE id=?", (view.escrow_id,)).fetchone()
+    ev = conn.execute("SELECT event_type FROM escrow_events WHERE escrow_id=? ORDER BY id DESC LIMIT 1", (view.escrow_id,)).fetchone()
+    assert row["status"] == "active"
+    assert ev["event_type"] == "accepted"
+
+
+def test_active_escrow_cannot_be_cancelled_unilaterally(conn):
+    _, buyer, seller, _ = _seed_tenant(conn)
+    escrow = EscrowService(conn)
+    escrow.wallet_service.credit_deposit_if_confirmed(buyer, "USDT", Decimal("100"), "txac", "txac:0", "ETHEREUM", 12, True)
+    view = escrow.create_escrow(1, buyer, seller, "USDT", Decimal("50"), "deal")
+    escrow.accept_escrow(view.escrow_id, seller)
+    with pytest.raises(ValueError):
+        escrow.cancel_escrow(view.escrow_id, buyer)
+    with pytest.raises(ValueError):
+        escrow.cancel_escrow(view.escrow_id, seller)
+
+
+def test_pending_escrow_cancellation_still_works(conn):
+    _, buyer, seller, _ = _seed_tenant(conn)
+    escrow = EscrowService(conn)
+    escrow.wallet_service.credit_deposit_if_confirmed(buyer, "USDT", Decimal("100"), "txpc", "txpc:0", "ETHEREUM", 12, True)
+    view = escrow.create_escrow(1, buyer, seller, "USDT", Decimal("40"), "deal")
+    escrow.cancel_escrow(view.escrow_id, buyer)
+    row = conn.execute("SELECT status FROM escrows WHERE id=?", (view.escrow_id,)).fetchone()
+    assert row["status"] == "cancelled"
+
+
+def test_admin_freeze_unfreeze_logs_action(monkeypatch, tmp_path):
+    admin = 999
+    monkeypatch.setattr("bot.ADMIN_IDS", {admin})
+    db = tmp_path / "freeze.db"
+    c = sqlite3.connect(db)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA foreign_keys=ON")
+    init_db(c)
+    c.execute("INSERT INTO users(telegram_id, username, frozen) VALUES(?,?,0)", (12345, "target"))
+    c.commit()
+    def _svc():
+        cx = sqlite3.connect(db)
+        cx.row_factory = sqlite3.Row
+        cx.execute("PRAGMA foreign_keys=ON")
+        return (cx, None, None, None)
+    monkeypatch.setattr("bot._services", _svc)
+
+    class Msg:
+        def __init__(self, text):
+            self.text = text
+            self.replies = []
+        async def reply_text(self, txt):
+            self.replies.append(txt)
+
+    class U:
+        id = admin
+
+    import asyncio
+    msg = Msg('/freeze @target')
+    upd = SimpleNamespace(effective_user=U(), effective_message=msg, message=msg)
+    asyncio.run(_set_frozen_state(upd, True))
+    c1 = sqlite3.connect(db); c1.row_factory = sqlite3.Row
+    assert c1.execute("SELECT frozen FROM users WHERE username='target'").fetchone()["frozen"] == 1
+    assert c1.execute("SELECT COUNT(*) c FROM admin_actions WHERE action_type='freeze_user'").fetchone()["c"] == 1
+    c1.close()
+
+    msg2 = Msg('/unfreeze 12345')
+    upd2 = SimpleNamespace(effective_user=U(), effective_message=msg2, message=msg2)
+    asyncio.run(_set_frozen_state(upd2, False))
+    c2 = sqlite3.connect(db); c2.row_factory = sqlite3.Row
+    assert c2.execute("SELECT frozen FROM users WHERE username='target'").fetchone()["frozen"] == 0
+    assert c2.execute("SELECT COUNT(*) c FROM admin_actions WHERE action_type='unfreeze_user'").fetchone()["c"] == 1
+    c2.close()
+
+
+def test_address_derivation_path_returns_address_only(monkeypatch):
+    monkeypatch.setenv("HD_WALLET_SEED_HEX", "aa" * 32)
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setattr(Settings, "allow_fallback_derivation", True)
+    d = HDWalletDeriver()
+    addr = d.derive_eth_address(5)
+    assert hasattr(addr, "public_address")
+    assert not hasattr(addr, "private_key_hex")
+
+
+def test_eth_env_ingestion_only_in_test(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("ETH_DEPOSIT_EVENTS_JSON", '[{"to":"0x1"}]')
+    with pytest.raises(RuntimeError):
+        EthRpcAdapter({}).fetch_deposits()
+
+
+def test_vault_signer_does_not_fabricate_txid(monkeypatch):
+    from signer.signer_service import VaultSignerProvider
+
+    monkeypatch.setenv("VAULT_ADDR", "http://vault")
+    monkeypatch.setenv("VAULT_TOKEN", "x")
+
+    class Resp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b'{"data":{"signature":"abc"}}'
+
+    monkeypatch.setattr("signer.signer_service.urlopen", lambda *a, **k: Resp())
+    with pytest.raises(RuntimeError):
+        VaultSignerProvider().sign_and_broadcast("ETH", "0x" + "1"*40, "1")
+
+
+def test_withdrawn_usd_last_24h_uses_usd_conversion(conn):
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(987)
+    conn.execute("INSERT INTO withdrawals(user_id,asset,amount,destination_address,status) VALUES(?,?,?,?,?)", (uid, "BTC", "0.1", "bc1qabc", "broadcasted"))
+    assert wallet._withdrawn_usd_last_24h(uid) == Decimal("6500.0")
+
+
+def test_account_revenue_balance_decimal_sum(conn):
+    wallet = WalletService(conn)
+    conn.execute("INSERT INTO ledger_entries(account_type,account_owner_id,user_id,asset,amount,entry_type,ref_type,ref_id) VALUES(?,?,?,?,?,?,?,?)", ("PLATFORM_REVENUE", None, None, "USDT", "1.10", "x", "x", 1))
+    conn.execute("INSERT INTO ledger_entries(account_type,account_owner_id,user_id,asset,amount,entry_type,ref_type,ref_id) VALUES(?,?,?,?,?,?,?,?)", ("PLATFORM_REVENUE", None, None, "USDT", "2.20", "x", "x", 2))
+    assert wallet.account_revenue_balance("PLATFORM_REVENUE", None, "USDT") == Decimal("3.30")
+
+
+def test_credit_deposit_duplicate_returns_false(conn):
+    wallet = WalletService(conn)
+    assert wallet.credit_deposit_if_confirmed(1, "USDT", Decimal("10"), "txd1", "dup:key", "ETHEREUM", 12, True) is True
+    assert wallet.credit_deposit_if_confirmed(1, "USDT", Decimal("10"), "txd1", "dup:key", "ETHEREUM", 12, True) is False

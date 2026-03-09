@@ -4,7 +4,7 @@ import html
 import logging
 import os
 import time
-from collections import defaultdict, deque
+import json
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
@@ -59,43 +59,50 @@ def _enabled_assets() -> list[str]:
     return list(BASE_ASSETS)
 
 
-_RATE_BUCKETS: dict[tuple[int, str], deque[float]] = defaultdict(deque)
-_MAX_RATE_BUCKETS = 10000
-_EVICTION_GRACE_S = 60
-
-
-def _prune_rate_buckets(now: float) -> None:
-    # In-process limiter only (per worker). Replaceable with shared backend later if needed.
-    stale_keys: list[tuple[int, str]] = []
-    for key, bucket in _RATE_BUCKETS.items():
-        while bucket and (now - bucket[0]) > _EVICTION_GRACE_S:
-            bucket.popleft()
-        if not bucket:
-            stale_keys.append(key)
-    for key in stale_keys:
-        _RATE_BUCKETS.pop(key, None)
-
-
-def _is_rate_limited(user_id: int, action: str, limit: int, window_s: int) -> bool:
-    now = time.time()
-    _prune_rate_buckets(now)
-    if len(_RATE_BUCKETS) > _MAX_RATE_BUCKETS:
-        # deterministic shedding of oldest single-event buckets when memory grows too much
-        for key in sorted(_RATE_BUCKETS.keys())[: len(_RATE_BUCKETS) - _MAX_RATE_BUCKETS]:
-            _RATE_BUCKETS.pop(key, None)
-    key = (int(user_id), action)
-    bucket = _RATE_BUCKETS[key]
-    while bucket and (now - bucket[0]) > window_s:
-        bucket.popleft()
-    if len(bucket) >= limit:
-        return True
-    bucket.append(now)
-    return False
+def _is_rate_limited(conn, user_id: int, action: str, limit: int, window_s: int) -> bool:
+    now = int(time.time())
+    cutoff = now - int(window_s)
+    prune_cutoff = now - max(int(window_s), 60)
+    managed_tx = not bool(getattr(conn, "in_transaction", False))
+    if managed_tx:
+        conn.execute("BEGIN IMMEDIATE")
+    else:
+        conn.execute("SAVEPOINT rate_limit")
+    try:
+        conn.execute("DELETE FROM rate_limit_events WHERE created_at < ?", (prune_cutoff,))
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM rate_limit_events WHERE user_id=? AND action=? AND created_at >= ?",
+            (int(user_id), action, cutoff),
+        ).fetchone()
+        if int(row["c"] or 0) >= int(limit):
+            limited = True
+        else:
+            conn.execute(
+                "INSERT INTO rate_limit_events(user_id, action, created_at) VALUES(?,?,?)",
+                (int(user_id), action, now),
+            )
+            limited = False
+        if managed_tx:
+            conn.commit()
+        else:
+            conn.execute("RELEASE SAVEPOINT rate_limit")
+        return limited
+    except Exception:
+        if managed_tx:
+            conn.rollback()
+        else:
+            conn.execute("ROLLBACK TO SAVEPOINT rate_limit")
+            conn.execute("RELEASE SAVEPOINT rate_limit")
+        raise
 
 
 async def _enforce_rate_limit(query, user_id: int, action: str, limit: int = 4, window_s: int = 10) -> bool:
-    if not _is_rate_limited(user_id, action, limit, window_s):
-        return False
+    conn = get_connection()
+    try:
+        if not _is_rate_limited(conn, user_id, action, limit, window_s):
+            return False
+    finally:
+        conn.close()
     try:
         await query.answer("Too many requests. Please slow down.", show_alert=False)
     except Exception:
@@ -104,8 +111,12 @@ async def _enforce_rate_limit(query, user_id: int, action: str, limit: int = 4, 
 
 
 async def _enforce_text_rate_limit(update: Update, action: str, limit: int = 4, window_s: int = 10) -> bool:
-    if not _is_rate_limited(update.effective_user.id, action, limit, window_s):
-        return False
+    conn = get_connection()
+    try:
+        if not _is_rate_limited(conn, update.effective_user.id, action, limit, window_s):
+            return False
+    finally:
+        conn.close()
     await update.effective_message.reply_text("Too many requests. Please slow down.")
     return True
 
@@ -1851,7 +1862,7 @@ async def deal_conditions_input(update: Update, context: ContextTypes.DEFAULT_TY
         asset = context.user_data.get("asset", "USDT")
         context.user_data["conditions"] = conditions
 
-        if _is_rate_limited(update.effective_user.id, "create_escrow", limit=2, window_s=20):
+        if _is_rate_limited(conn, update.effective_user.id, "create_escrow", limit=2, window_s=20):
             await update.effective_message.reply_text("Too many requests. Please slow down.")
             return DEAL_ENTER_CONDITIONS
         try:
@@ -2281,6 +2292,50 @@ async def run_signer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         conn.close()
 
 
+
+
+async def _set_frozen_state(update: Update, freeze: bool) -> None:
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.effective_message.reply_text("Admin only")
+        return
+    if not update.message or not update.message.text:
+        await update.effective_message.reply_text("Usage: /freeze <telegram_id|@username>" if freeze else "Usage: /unfreeze <telegram_id|@username>")
+        return
+    parts = update.message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await update.effective_message.reply_text("Usage: /freeze <telegram_id|@username>" if freeze else "Usage: /unfreeze <telegram_id|@username>")
+        return
+    target = parts[1].strip()
+    conn, _, _, _ = _services()
+    try:
+        if target.lstrip("-").isdigit():
+            row = conn.execute("SELECT id, telegram_id, username, frozen FROM users WHERE telegram_id=?", (int(target),)).fetchone()
+        else:
+            uname = target.lstrip("@").strip().lower()
+            row = conn.execute("SELECT id, telegram_id, username, frozen FROM users WHERE LOWER(username)=?", (uname,)).fetchone()
+        if not row:
+            await update.effective_message.reply_text("User not found.")
+            return
+        conn.execute("UPDATE users SET frozen=? WHERE id=?", (1 if freeze else 0, int(row["id"])))
+        conn.execute(
+            "INSERT INTO admin_actions(admin_user_id,action_type,data_json) VALUES(?,?,?)",
+            (update.effective_user.id, "freeze_user" if freeze else "unfreeze_user", json.dumps({"target_user_id": int(row["id"]), "target_telegram_id": int(row["telegram_id"]), "target_username": row["username"]})),
+        )
+        conn.commit()
+        action_word = "frozen" if freeze else "unfrozen"
+        await update.effective_message.reply_text(f"✅ User {row['telegram_id']} (@{row['username'] or 'unknown'}) is now {action_word}.")
+    finally:
+        conn.close()
+
+
+async def freeze_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _set_frozen_state(update, True)
+
+
+async def unfreeze_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _set_frozen_state(update, False)
+
+
 async def check_user_hint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text("Use /check_user <@username|telegram_id>")
 
@@ -2346,8 +2401,7 @@ async def escrow_accept_decline(update: Update, context: ContextTypes.DEFAULT_TY
         icon = _asset_icon(row["asset"])
 
         if action == "escrow_accept":
-            conn.execute("UPDATE escrows SET status='active', updated_at=CURRENT_TIMESTAMP WHERE id=?", (escrow_id,))
-            conn.commit()
+            escrow_svc.accept_escrow(escrow_id, int(row["seller_id"]))
             # Notify seller
             try:
                 _p2 = _services()[3].price_service.get_usd_value(row["asset"], Decimal(str(row["amount"])))
@@ -3219,6 +3273,8 @@ def main() -> None:
     app.add_handler(CommandHandler("watcher_status", watcher_status))
     app.add_handler(CommandHandler("run_signer", run_signer))
     app.add_handler(CommandHandler("support", support_team))
+    app.add_handler(CommandHandler("freeze", freeze_user))
+    app.add_handler(CommandHandler("unfreeze", unfreeze_user))
     app.add_handler(CallbackQueryHandler(seller_rate_buyer_callback, pattern=r"^deal_rate_buyer:\d+:\d+$"))
     app.add_handler(withdraw_conv)
     app.add_handler(deposit_conv)

@@ -43,5 +43,3 @@ class FeeService:
         seller_payout = self._money(amount - total_fee)
         return FeeBreakdown(platform_fee=platform_fee, bot_fee=bot_fee, total_fee=total_fee, seller_payout=seller_payout)
 
-    def apply_payouts(self, amount: Decimal, bot_extra_fee_percent: Decimal) -> FeeBreakdown:
-        return self.calculate_total_fees(amount, bot_extra_fee_percent)

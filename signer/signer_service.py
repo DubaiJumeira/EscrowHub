@@ -65,10 +65,8 @@ class VaultSignerProvider(SignerProvider):
         if not isinstance(signature, str) or not signature:
             raise RuntimeError("vault signer response missing signature")
 
-        txid = f"vault_tx_{abs(hash(signature))}"
-        if not txid:
-            raise RuntimeError("vault signer produced invalid txid")
-        return txid
+        # WARNING: Vault transit sign API does not broadcast transactions; no real txid is available.
+        raise RuntimeError("vault signer cannot broadcast and cannot provide a real txid; use a broadcaster-integrated signer")
 
 
 class HDWalletSignerProvider(SignerProvider):
@@ -143,6 +141,8 @@ class SignerService:
         if provider == "vault":
             self.provider: SignerProvider = VaultSignerProvider()
         elif provider == "mock":
+            if Settings.is_production:
+                raise RuntimeError("SIGNER_PROVIDER=mock is not allowed in production")
             self.provider = MockSignerProvider()
         else:
             self.provider = HDWalletSignerProvider()
