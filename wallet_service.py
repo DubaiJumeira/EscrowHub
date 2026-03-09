@@ -6,6 +6,7 @@ from decimal import Decimal
 import base64
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 
@@ -18,6 +19,8 @@ from ledger_service import LedgerService
 from price_service import CoinGeckoPriceService, StaticPriceService
 
 SUPPORTED_ASSETS = set(Settings.supported_assets)
+LOGGER = logging.getLogger(__name__)
+
 NETWORK_LABELS = {
     "BTC": "BTC",
     "ETH": "ETH",
@@ -128,8 +131,8 @@ class WalletService:
             raise ValueError("account is frozen")
 
     def verify_address_derivation_consistency(self, sample_size: int | None = 25) -> None:
-        self.hd.validate_xpub_configuration()
         mismatches: list[str] = []
+        checked_legacy_mode = False
         last_id = 0
         remaining = None if sample_size is None else int(sample_size)
 
@@ -151,6 +154,9 @@ class WalletService:
                 provider_origin = str(row["provider_origin"] or "") if "provider_origin" in row.keys() else ""
                 if provider_origin and provider_origin != "legacy_seed":
                     continue
+                if not checked_legacy_mode:
+                    self.hd.validate_xpub_configuration()
+                    checked_legacy_mode = True
                 if asset == "BTC":
                     derived = self.hd.derive_btc_address(user_id).public_address
                 elif asset == "LTC":
@@ -167,6 +173,26 @@ class WalletService:
             # Secure alternative: migrate addresses with explicit per-row derivation metadata and verified replay before production startup.
             raise RuntimeError("wallet derivation mismatch detected; abort startup and run migration: " + ", ".join(mismatches[:5]))
 
+
+    def _validate_deposit_address(self, asset: str, deposit_address: str) -> None:
+        symbol = self._asset(asset)
+        address = (deposit_address or "").strip()
+        if not address:
+            raise RuntimeError(f"address provider returned empty {symbol} deposit address")
+        try:
+            self._validate_withdrawal_address(symbol, address)
+        except (RuntimeError, ValueError) as exc:
+            raise RuntimeError(f"address provider returned invalid {symbol} deposit address") from exc
+
+    def _route_from_row(self, row) -> DepositRoute:
+        return DepositRoute(
+            self._decrypt_field(row["address"]),
+            row["asset"],
+            row["chain_family"],
+            row["destination_tag"],
+            self._decrypt_field(row["derivation_path"]),
+        )
+
     def assert_startup_deposit_issuance_ready(self) -> None:
         if not Settings.is_production:
             return
@@ -177,32 +203,75 @@ class WalletService:
     def get_or_create_deposit_address(self, user_id: int, asset: str) -> DepositRoute:
         symbol = self._asset(asset)
         resolved_user_id = self._ensure_user_row(user_id)
-        row = self.conn.execute("SELECT * FROM wallet_addresses WHERE user_id=? AND asset=?", (resolved_user_id, symbol)).fetchone()
-        if row:
-            return DepositRoute(self._decrypt_field(row["address"]), row["asset"], row["chain_family"], row["destination_tag"], self._decrypt_field(row["derivation_path"]))
+        managed_tx = not bool(getattr(self.conn, "in_transaction", False))
+        if managed_tx:
+            self.conn.execute("BEGIN IMMEDIATE")
+        else:
+            self.conn.execute("SAVEPOINT deposit_route_issue")
+        try:
+            row = self.conn.execute("SELECT * FROM wallet_addresses WHERE user_id=? AND asset=?", (resolved_user_id, symbol)).fetchone()
+            if row:
+                if managed_tx:
+                    self.conn.commit()
+                else:
+                    self.conn.execute("RELEASE SAVEPOINT deposit_route_issue")
+                return self._route_from_row(row)
 
-        if Settings.is_production:
-            issued = self.address_provider.get_or_create_address(resolved_user_id, symbol)
+            if Settings.is_production:
+                issued = self.address_provider.get_or_create_address(resolved_user_id, symbol)
+                self._validate_deposit_address(symbol, issued.address)
+                encrypted_addr = self._encrypt_field(issued.address)
+                try:
+                    self.conn.execute(
+                        "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,derivation_index,destination_tag,derivation_path,provider_origin,provider_ref) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (resolved_user_id, symbol, self._chain_family(symbol), encrypted_addr, None, None, None, issued.provider_origin, issued.provider_ref),
+                    )
+                except sqlite3.IntegrityError:
+                    row = self.conn.execute("SELECT * FROM wallet_addresses WHERE user_id=? AND asset=?", (resolved_user_id, symbol)).fetchone()
+                    if not row:
+                        raise
+                    stored_route = self._route_from_row(row)
+                    stored_origin = str(row["provider_origin"] or "")
+                    stored_ref = str(row["provider_ref"] or "")
+                    if stored_route.address != issued.address or stored_origin != issued.provider_origin or stored_ref != issued.provider_ref:
+                        LOGGER.error("Deposit route issuance conflict for user_id=%s asset=%s stored_address=%s issued_address=%s stored_origin=%s issued_origin=%s stored_ref=%s issued_ref=%s", resolved_user_id, symbol, stored_route.address, issued.address, stored_origin, issued.provider_origin, stored_ref, issued.provider_ref)
+                        raise RuntimeError("address provider route conflict for existing deposit address")
+                    if managed_tx:
+                        self.conn.commit()
+                    else:
+                        self.conn.execute("RELEASE SAVEPOINT deposit_route_issue")
+                    return stored_route
+                if managed_tx:
+                    self.conn.commit()
+                else:
+                    self.conn.execute("RELEASE SAVEPOINT deposit_route_issue")
+                return DepositRoute(issued.address, symbol, self._chain_family(symbol), None, None)
+
+            if symbol == "BTC":
+                k = self.hd.derive_btc_address(resolved_user_id)
+            elif symbol == "LTC":
+                k = self.hd.derive_ltc_address(resolved_user_id)
+            elif symbol in {"ETH", "USDT"}:
+                k = self.hd.derive_eth_address(resolved_user_id)
+            else:
+                raise RuntimeError(f"unsupported production derivation for {symbol}")
+
             self.conn.execute(
                 "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,derivation_index,destination_tag,derivation_path,provider_origin,provider_ref) VALUES(?,?,?,?,?,?,?,?,?)",
-                (resolved_user_id, symbol, self._chain_family(symbol), self._encrypt_field(issued.address), None, None, None, issued.provider_origin, issued.provider_ref),
+                (resolved_user_id, symbol, self._chain_family(symbol), self._encrypt_field(k.public_address), resolved_user_id, None, self._encrypt_field(k.path), "legacy_seed", f"user:{resolved_user_id}:{symbol}"),
             )
-            return DepositRoute(issued.address, symbol, self._chain_family(symbol), None, None)
-
-        if symbol == "BTC":
-            k = self.hd.derive_btc_address(resolved_user_id)
-        elif symbol == "LTC":
-            k = self.hd.derive_ltc_address(resolved_user_id)
-        elif symbol in {"ETH", "USDT"}:
-            k = self.hd.derive_eth_address(resolved_user_id)
-        else:
-            raise RuntimeError(f"unsupported production derivation for {symbol}")
-
-        self.conn.execute(
-            "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,derivation_index,destination_tag,derivation_path,provider_origin,provider_ref) VALUES(?,?,?,?,?,?,?,?,?)",
-            (resolved_user_id, symbol, self._chain_family(symbol), self._encrypt_field(k.public_address), resolved_user_id, None, self._encrypt_field(k.path), "legacy_seed", f"user:{resolved_user_id}:{symbol}"),
-        )
-        return DepositRoute(k.public_address, symbol, self._chain_family(symbol), None, k.path)
+            if managed_tx:
+                self.conn.commit()
+            else:
+                self.conn.execute("RELEASE SAVEPOINT deposit_route_issue")
+            return DepositRoute(k.public_address, symbol, self._chain_family(symbol), None, k.path)
+        except Exception:
+            if managed_tx:
+                self.conn.rollback()
+            else:
+                self.conn.execute("ROLLBACK TO SAVEPOINT deposit_route_issue")
+                self.conn.execute("RELEASE SAVEPOINT deposit_route_issue")
+            raise
 
     def credit_deposit_if_confirmed(self, user_id: int, asset: str, amount: Decimal, txid: str, unique_key: str, chain_family: str, confirmations: int, finalized: bool) -> bool:
         resolved_user_id = self._ensure_user_row(user_id)

@@ -17,7 +17,7 @@
 - `HD_WALLET_SEED_HEX` (seed derivation in non-production/dev flows only)
 - `ADDRESS_PROVIDER` (`http` or `disabled`)
 - `ADDRESS_PROVIDER_URL` (required when `ADDRESS_PROVIDER=http`)
-- `ADDRESS_PROVIDER_TOKEN` (optional bearer token)
+- `ADDRESS_PROVIDER_TOKEN` (required bearer token in production)
 
 ### Deposit address provider contract
 Production deposit issuance is externalized and fail-closed.

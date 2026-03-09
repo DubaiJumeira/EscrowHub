@@ -58,6 +58,30 @@ def _apply_security_constraints(conn: sqlite3.Connection) -> None:
         )
 
 
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS trg_wallet_addresses_chain_addr_user_guard_ins BEFORE INSERT ON wallet_addresses "
+        "WHEN EXISTS (SELECT 1 FROM wallet_addresses w WHERE w.chain_family=NEW.chain_family AND w.address=NEW.address AND w.user_id != NEW.user_id) "
+        "BEGIN SELECT RAISE(ABORT, 'wallet chain/address already assigned to a different user'); END;"
+    )
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS trg_wallet_addresses_chain_addr_user_guard_upd BEFORE UPDATE OF chain_family, address, user_id ON wallet_addresses "
+        "WHEN EXISTS (SELECT 1 FROM wallet_addresses w WHERE w.id != NEW.id AND w.chain_family=NEW.chain_family AND w.address=NEW.address AND w.user_id != NEW.user_id) "
+        "BEGIN SELECT RAISE(ABORT, 'wallet chain/address already assigned to a different user'); END;"
+    )
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS trg_wallet_addresses_provider_ref_guard_ins BEFORE INSERT ON wallet_addresses "
+        "WHEN COALESCE(NEW.provider_origin, '') != '' AND COALESCE(NEW.provider_ref, '') != '' AND "
+        "EXISTS (SELECT 1 FROM wallet_addresses w WHERE w.provider_origin=NEW.provider_origin AND w.provider_ref=NEW.provider_ref AND (w.user_id != NEW.user_id OR w.address != NEW.address)) "
+        "BEGIN SELECT RAISE(ABORT, 'provider_ref cannot be rebound to another route'); END;"
+    )
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS trg_wallet_addresses_provider_ref_guard_upd BEFORE UPDATE OF provider_origin, provider_ref, user_id, address ON wallet_addresses "
+        "WHEN COALESCE(NEW.provider_origin, '') != '' AND COALESCE(NEW.provider_ref, '') != '' AND "
+        "EXISTS (SELECT 1 FROM wallet_addresses w WHERE w.id != NEW.id AND w.provider_origin=NEW.provider_origin AND w.provider_ref=NEW.provider_ref AND (w.user_id != NEW.user_id OR w.address != NEW.address)) "
+        "BEGIN SELECT RAISE(ABORT, 'provider_ref cannot be rebound to another route'); END;"
+    )
+
+
 def _normalized_username_collisions(conn: sqlite3.Connection) -> list[str]:
     rows = conn.execute(
         """
@@ -74,6 +98,38 @@ def _normalized_username_collisions(conn: sqlite3.Connection) -> list[str]:
     ).fetchall()
     return [f"{row['norm']} (bot_ids: {row['ids']})" for row in rows]
 
+
+
+
+def _wallet_route_collisions(conn: sqlite3.Connection) -> list[str]:
+    collisions: list[str] = []
+    addr_rows = conn.execute(
+        """
+        SELECT chain_family, address, GROUP_CONCAT(DISTINCT user_id) AS users, COUNT(DISTINCT user_id) AS user_count
+        FROM wallet_addresses
+        GROUP BY chain_family, address
+        HAVING COUNT(DISTINCT user_id) > 1
+        ORDER BY chain_family, address
+        """
+    ).fetchall()
+    for row in addr_rows:
+        collisions.append(f"chain/address collision family={row['chain_family']} users={row['users']}")
+
+    ref_rows = conn.execute(
+        """
+        SELECT provider_origin, provider_ref, GROUP_CONCAT(DISTINCT user_id) AS users, COUNT(DISTINCT user_id) AS user_count, COUNT(DISTINCT address) AS address_count
+        FROM wallet_addresses
+        WHERE COALESCE(provider_origin, '') != '' AND COALESCE(provider_ref, '') != ''
+        GROUP BY provider_origin, provider_ref
+        HAVING COUNT(DISTINCT user_id) > 1 OR COUNT(DISTINCT address) > 1
+        ORDER BY provider_origin, provider_ref
+        """
+    ).fetchall()
+    for row in ref_rows:
+        collisions.append(
+            f"provider_ref collision origin={row['provider_origin']} ref={row['provider_ref']} users={row['users']} address_count={row['address_count']}"
+        )
+    return collisions
 
 def init_db(conn: sqlite3.Connection) -> None:
     schema = Path("infra/db/schema.sql").read_text()
@@ -136,5 +192,14 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.execute("UPDATE bots SET telegram_username=lower(ltrim(trim(telegram_username),'@')) WHERE telegram_username IS NOT NULL")
     conn.execute("UPDATE bots SET telegram_username=NULL WHERE telegram_username=''")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_bots_telegram_username ON bots(telegram_username)")
+
+    wallet_collisions = _wallet_route_collisions(conn)
+    if wallet_collisions:
+        details = "; ".join(wallet_collisions[:5])
+        raise RuntimeError(
+            "wallet address routing collisions detected during migration. "
+            f"Resolve collisions before startup: {details}"
+        )
+
     _apply_security_constraints(conn)
     conn.commit()

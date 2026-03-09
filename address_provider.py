@@ -47,7 +47,21 @@ class HttpAddressProvider(AddressProvider):
             headers["Authorization"] = f"Bearer {self.token}"
         return headers
 
+    def _validate_production_config(self) -> None:
+        if not Settings.is_production:
+            return
+        if not self.base_url:
+            raise RuntimeError("ADDRESS_PROVIDER_URL is missing")
+        if not self.base_url.startswith("https://"):
+            raise RuntimeError("ADDRESS_PROVIDER_URL must use https:// in production")
+        if not self.token:
+            raise RuntimeError("ADDRESS_PROVIDER_TOKEN is required in production")
+
     def is_ready(self) -> tuple[bool, str | None]:
+        try:
+            self._validate_production_config()
+        except RuntimeError as exc:
+            return False, str(exc)
         if not self.base_url:
             return False, "ADDRESS_PROVIDER_URL is missing"
         req = Request(f"{self.base_url}/health", method="GET", headers=self._headers())
@@ -58,8 +72,8 @@ class HttpAddressProvider(AddressProvider):
                 body = json.loads(resp.read().decode() or "{}")
         except (HTTPError, URLError, TimeoutError, ValueError) as exc:
             return False, f"provider healthcheck failed: {exc}"
-        ready = bool(body.get("ready", True))
-        if not ready:
+        ready = body.get("ready")
+        if ready is not True:
             return False, str(body.get("error") or "provider not ready")
         return True, None
 
@@ -67,6 +81,7 @@ class HttpAddressProvider(AddressProvider):
         symbol = asset.upper().strip()
         if symbol not in SUPPORTED_ASSETS:
             raise ValueError(f"unsupported asset: {symbol}")
+        self._validate_production_config()
         if not self.base_url:
             raise RuntimeError("ADDRESS_PROVIDER_URL is missing")
         payload = json.dumps({"user_id": int(user_id), "asset": symbol}).encode()
