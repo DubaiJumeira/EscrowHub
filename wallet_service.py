@@ -3,11 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import sqlite3
 import re
 
 from config.settings import Settings
 from hd_wallet import HDWalletDeriver
 from ledger_service import LedgerService
+from price_service import StaticPriceService
 
 SUPPORTED_ASSETS = set(Settings.supported_assets)
 NETWORK_LABELS = {
@@ -32,6 +34,7 @@ class WalletService:
         self.conn = conn
         self.ledger = LedgerService(conn)
         self.hd = HDWalletDeriver()
+        self.price_service = StaticPriceService({"BTC": Decimal("65000"), "ETH": Decimal("3500"), "LTC": Decimal("80"), "USDT": Decimal("1")})
 
     @staticmethod
     def _asset(asset: str) -> str:
@@ -87,7 +90,7 @@ class WalletService:
                 "INSERT INTO deposits(user_id,asset,amount,txid,unique_key,chain_family,confirmations,status) VALUES(?,?,?,?,?,?,?,?)",
                 (resolved_user_id, self._asset(asset), str(Decimal(amount)), txid, unique_key, chain_family, confirmations, "credited" if finalized else "seen"),
             )
-        except Exception:
+        except sqlite3.IntegrityError:
             return False
         if finalized:
             self.ledger.add_entry("USER", resolved_user_id, resolved_user_id, asset, Decimal(amount), "DEPOSIT", "deposit", int(cur.lastrowid))
@@ -149,11 +152,15 @@ class WalletService:
 
     def _withdrawn_usd_last_24h(self, user_id: int) -> Decimal:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
-        row = self.conn.execute(
-            "SELECT COALESCE(SUM(CAST(amount AS REAL)), 0) AS total FROM withdrawals WHERE user_id=? AND status IN ('pending','broadcasted') AND created_at >= ?",
+        rows = self.conn.execute(
+            "SELECT asset, amount FROM withdrawals WHERE user_id=? AND status IN ('pending','broadcasted') AND created_at >= ?",
             (user_id, cutoff),
-        ).fetchone()
-        return Decimal(str(row["total"] or 0))
+        ).fetchall()
+        total = Decimal("0")
+        for row in rows:
+            amount = Decimal(str(row["amount"] or "0"))
+            total += self.price_service.get_usd_value(str(row["asset"]), amount)
+        return total
 
     def request_withdrawal(self, user_id: int, asset: str, amount: Decimal, destination_address: str):
         symbol = self._asset(asset)
@@ -222,16 +229,19 @@ class WalletService:
     def account_revenue_balance(self, account_type: str, owner_id: int | None, asset: str) -> Decimal:
         symbol = self._asset(asset)
         if account_type == "BOT_OWNER_REVENUE":
-            row = self.conn.execute(
-                "SELECT COALESCE(SUM(CAST(amount AS REAL)), 0) AS total FROM ledger_entries WHERE account_type=? AND asset=? AND account_owner_id=?",
+            rows = self.conn.execute(
+                "SELECT amount FROM ledger_entries WHERE account_type=? AND asset=? AND account_owner_id=?",
                 (account_type, symbol, owner_id),
-            ).fetchone()
+            ).fetchall()
         else:
-            row = self.conn.execute(
-                "SELECT COALESCE(SUM(CAST(amount AS REAL)), 0) AS total FROM ledger_entries WHERE account_type=? AND asset=?",
+            rows = self.conn.execute(
+                "SELECT amount FROM ledger_entries WHERE account_type=? AND asset=?",
                 (account_type, symbol),
-            ).fetchone()
-        return Decimal(str(row["total"] or 0))
+            ).fetchall()
+        total = Decimal("0")
+        for row in rows:
+            total += Decimal(str(row["amount"] or "0"))
+        return total
 
     def withdrawal_history(self, user_id: int, page: int = 1, per_page: int = 10):
         resolved_user_id = self._ensure_user_row(user_id)

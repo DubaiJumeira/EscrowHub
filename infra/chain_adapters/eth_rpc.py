@@ -95,8 +95,10 @@ class EthRpcAdapter(ChainAdapter):
 
     def _fetch_env_events(self) -> list[dict]:
         raw_events = os.getenv("ETH_DEPOSIT_EVENTS_JSON", "[]")
-        if raw_events.strip() not in {"", "[]"} and os.getenv("APP_ENV", "dev").lower() == "production":
-            raise RuntimeError("ETH_DEPOSIT_EVENTS_JSON ingestion is disabled in production")
+        app_env = os.getenv("APP_ENV", "dev").lower()
+        if raw_events.strip() not in {"", "[]"} and app_env != "test":
+            # WARNING: Environment-fed deposit events are insecure outside tests.
+            raise RuntimeError("ETH_DEPOSIT_EVENTS_JSON ingestion is allowed only in APP_ENV=test")
         try:
             events = json.loads(raw_events)
             return events if isinstance(events, list) else []
@@ -105,7 +107,11 @@ class EthRpcAdapter(ChainAdapter):
 
     def fetch_deposits(self) -> list[ChainDeposit]:
         # TODO: add full RPC log polling implementation.
-        # For now, only dev/test can feed normalized events via env variable.
+        # WARNING: Environment-fed deposits are test-only. Use real eth_getLogs polling for non-test deployments.
+        app_env = os.getenv("APP_ENV", "dev").lower()
+        if app_env != "test":
+            raise RuntimeError("ETH deposit polling is not implemented for non-test environments; refusing unsafe ingestion")
+        # For now, only tests can feed normalized events via env variable.
         events = self._fetch_env_events()
         deposits: list[ChainDeposit] = []
         for ev in events:

@@ -52,11 +52,10 @@ class HDWalletDeriver:
                 raise RuntimeError("hdwallet library missing") from exc
             return None
 
-    def _derive_fallback(self, path: str, prefix: str) -> DerivedKey:
+    def _derive_fallback_address(self, path: str, prefix: str) -> DerivedAddress:
         self._allow_fallback()
         seed = self._require_seed()
         digest = hashlib.sha256(f"{seed}:{path}".encode()).hexdigest()
-        priv = hashlib.sha256(f"priv:{digest}".encode()).hexdigest()
         if prefix == "0x":
             address = "0x" + digest[:40]
         elif prefix == "bc1q":
@@ -65,13 +64,13 @@ class HDWalletDeriver:
             address = "ltc1q" + digest[:37]
         else:
             address = f"{prefix}_{digest[:40]}"
-        return DerivedKey(path=path, private_key_hex=priv, public_address=address)
+        return DerivedAddress(path=path, public_address=address)
 
-    def _derive_hdwallet_address(self, symbol: str, path: str) -> DerivedKey:
+    def _derive_hdwallet_address(self, symbol: str, path: str) -> DerivedAddress:
         lib = self._require_hdwallet()
         if lib is None:
             prefix = {"BTC": "bc1q", "LTC": "ltc1q", "ETH": "0x"}[symbol]
-            return self._derive_fallback(path, prefix)
+            return self._derive_fallback_address(path, prefix)
 
         seed_hex = self._require_seed()
         try:
@@ -99,46 +98,55 @@ class HDWalletDeriver:
             else:
                 raise RuntimeError("unsupported hdwallet derivation API")
 
-            priv = ""
-            if hasattr(wallet, "private_key"):
-                priv = str(wallet.private_key())
-            elif hasattr(wallet, "wif"):
-                priv = str(wallet.wif())
-
             if symbol in {"BTC", "LTC"}:
                 addr = str(wallet.p2wpkh_address()) if hasattr(wallet, "p2wpkh_address") else str(wallet.address())
             else:
                 addr = str(wallet.address())
-            return DerivedKey(path=path, private_key_hex=priv, public_address=addr)
+            return DerivedAddress(path=path, public_address=addr)
         except Exception as exc:
             if self.app_env == "production":
                 raise RuntimeError(f"hdwallet derivation failed for {symbol}") from exc
             prefix = {"BTC": "bc1q", "LTC": "ltc1q", "ETH": "0x"}[symbol]
-            return self._derive_fallback(path, prefix)
+            return self._derive_fallback_address(path, prefix)
 
     def derive_btc(self, user_id: int) -> DerivedKey:
+        # WARNING: Private-key derivation is only for non-production signer flows.
+        if self.app_env == "production":
+            raise RuntimeError("private-key derivation is disabled in production; use external signer")
+        path = f"m/84'/0'/{user_id}'/0/0"
+        addr = self._derive_hdwallet_address("BTC", path)
+        priv = hashlib.sha256(f"priv:{self._require_seed()}:{path}".encode()).hexdigest()
+        return DerivedKey(path=path, private_key_hex=priv, public_address=addr.public_address)
+
+    def derive_ltc(self, user_id: int) -> DerivedKey:
+        # WARNING: Private-key derivation is only for non-production signer flows.
+        if self.app_env == "production":
+            raise RuntimeError("private-key derivation is disabled in production; use external signer")
+        path = f"m/84'/2'/{user_id}'/0/0"
+        addr = self._derive_hdwallet_address("LTC", path)
+        priv = hashlib.sha256(f"priv:{self._require_seed()}:{path}".encode()).hexdigest()
+        return DerivedKey(path=path, private_key_hex=priv, public_address=addr.public_address)
+
+    def derive_eth(self, user_id: int) -> DerivedKey:
+        # WARNING: Private-key derivation is only for non-production signer flows.
+        if self.app_env == "production":
+            raise RuntimeError("private-key derivation is disabled in production; use external signer")
+        path = f"m/44'/60'/{user_id}'/0/0"
+        addr = self._derive_hdwallet_address("ETH", path)
+        priv = hashlib.sha256(f"priv:{self._require_seed()}:{path}".encode()).hexdigest()
+        return DerivedKey(path=path, private_key_hex=priv, public_address=addr.public_address)
+
+    def derive_btc_address(self, user_id: int) -> DerivedAddress:
         path = f"m/84'/0'/{user_id}'/0/0"
         return self._derive_hdwallet_address("BTC", path)
 
-    def derive_ltc(self, user_id: int) -> DerivedKey:
+    def derive_ltc_address(self, user_id: int) -> DerivedAddress:
         path = f"m/84'/2'/{user_id}'/0/0"
         return self._derive_hdwallet_address("LTC", path)
 
-    def derive_eth(self, user_id: int) -> DerivedKey:
+    def derive_eth_address(self, user_id: int) -> DerivedAddress:
         path = f"m/44'/60'/{user_id}'/0/0"
         return self._derive_hdwallet_address("ETH", path)
-
-    def derive_btc_address(self, user_id: int) -> DerivedAddress:
-        d = self.derive_btc(user_id)
-        return DerivedAddress(path=d.path, public_address=d.public_address)
-
-    def derive_ltc_address(self, user_id: int) -> DerivedAddress:
-        d = self.derive_ltc(user_id)
-        return DerivedAddress(path=d.path, public_address=d.public_address)
-
-    def derive_eth_address(self, user_id: int) -> DerivedAddress:
-        d = self.derive_eth(user_id)
-        return DerivedAddress(path=d.path, public_address=d.public_address)
 
     def derive_sol(self, user_id: int) -> DerivedKey:
         raise RuntimeError("SOL derivation disabled")
