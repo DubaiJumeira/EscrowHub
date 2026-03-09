@@ -42,3 +42,15 @@ Secure alternatives:
 - `price_service.py`
 - `tenant_service.py`
 - `bot.py`
+
+
+## Runtime startup/readiness behavior
+- Database runtime is SQLite (`SQLITE_DB_PATH`) for all services.
+- `run_startup_preflight` is service-scoped: watchers/signer require DB init + derivation consistency only.
+- Bot checks deposit issuance readiness; if unavailable, bot remains online in degraded mode and deposit issuance handlers fail closed.
+
+## Legacy entrypoint
+`apps/bot_main/main.py` is quarantined and not production-capable. Production should run `run_bot.py`.
+
+## Withdrawals
+`WITHDRAWALS_ENABLED` remains fail-closed by default. Ambiguous signer/provider errors move withdrawals into `signer_retry` and do not release reserved balances automatically.

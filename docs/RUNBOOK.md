@@ -3,7 +3,7 @@
 ## Required environment variables
 - `TELEGRAM_BOT_TOKEN`
 - `APP_ENV` (`dev` or `production`)
-- `SQLITE_DB_PATH` (or external DB wiring)
+- `SQLITE_DB_PATH` (SQLite runtime path; required in production)
 - `ETH_RPC_URL` (Alchemy/Infura RPC)
 
 ## Runtime controls / limits
@@ -21,7 +21,7 @@
 
 ### xpub safety note
 With the current path contract (`m/.../{user_id}'/...`), xpubs are **not derivation-compatible** because hardened user nodes cannot be derived from public keys. Startup preflight fails closed when xpub mode is configured.
-Production bot/watcher startup also fails closed when new deposit issuance cannot be satisfied by an approved external derivation/address service.
+Only bot startup evaluates deposit issuance readiness. If unavailable, bot runs in degraded mode and deposit issuance entrypoints fail closed with a controlled user message. Watchers and signer still start after DB + derivation consistency checks.
 
 Secure alternatives:
 - external address service / HSM-backed derivation service, or
@@ -56,3 +56,10 @@ Only BTC, LTC, ETH, and USDT are supported in active runtime.
 - Never commit or store `HD_WALLET_SEED_HEX` in code or DB.
 - Store seed backup in offline encrypted secret manager/HSM process.
 - Rotating/changing `HD_WALLET_SEED_HEX` changes all derived addresses.
+
+
+## Legacy entrypoint quarantine
+`apps/bot_main/main.py` is blocked in production and requires explicit non-production opt-in (`ALLOW_LEGACY_BOT_MAIN=true`). Use `run_bot.py` in production.
+
+## Withdrawal failure semantics
+Withdrawals remain disabled by default. If enabled for controlled testing, ambiguous signer/provider failures are moved to `signer_retry` state (funds stay reserved) and are not auto-released until operator reconciliation.

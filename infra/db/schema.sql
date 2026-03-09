@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS withdrawals (
   asset TEXT NOT NULL CHECK(asset IN ('BTC','LTC','ETH','USDT')),
   amount TEXT NOT NULL,
   destination_address TEXT NOT NULL,
-  status TEXT NOT NULL CHECK(status IN ('pending','broadcasted','failed')),
+  status TEXT NOT NULL CHECK(status IN ('pending','broadcasted','failed','signer_retry')),
   txid TEXT,
   failure_reason TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,

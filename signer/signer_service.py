@@ -57,6 +57,12 @@ class DisabledSignerProvider(SignerProvider):
         raise RuntimeError("signing provider disabled: configure a real chain-aware signer+broadcaster")
 
 
+def _is_ambiguous_signer_failure(exc: Exception) -> bool:
+    text = str(exc or "").lower()
+    indicators = ("timeout", "timed out", "temporar", "connection", "network", "unavailable", "request failed")
+    return any(token in text for token in indicators)
+
+
 class SignerService:
     def __init__(self) -> None:
         provider = os.getenv("SIGNER_PROVIDER", "vault").lower()
@@ -86,5 +92,10 @@ class SignerService:
                 processed += 1
             except Exception as exc:
                 LOGGER.exception("withdrawal processing failed id=%s", w["id"])
-                wallet_service.mark_withdrawal_failed(int(w["id"]), str(exc))
+                if _is_ambiguous_signer_failure(exc):
+                    # WARNING: Ambiguous signer/provider failures may have broadcast side-effects; do not auto-release reserved funds.
+                    # Secure alternative: reconcile tx state with an authoritative broadcaster before releasing any balance.
+                    wallet_service.mark_withdrawal_signer_retry(int(w["id"]), str(exc))
+                else:
+                    wallet_service.mark_withdrawal_failed(int(w["id"]), str(exc))
         return processed

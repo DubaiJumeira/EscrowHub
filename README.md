@@ -14,6 +14,8 @@ Run each service separately:
 - `run_eth_watcher.py`
 - `run_signer.py`
 
+Database mode: SQLite only. Configure `SQLITE_DB_PATH` for all environments (required in production).
+
 `bot.py` remains Telegram-only and does not start watcher threads.
 
 ## HD derivation paths (active assets only)
@@ -31,5 +33,11 @@ Secure alternatives:
 - external address derivation service / HSM-backed derivation service, or
 - planned explicit migration to an xpub-compatible non-hardened user index path.
 - production startup preflight now also requires an approved external derivation/address service for new deposit issuance; otherwise startup fails closed.
+
+Service preflight is role-aware: bot may run in degraded mode when new deposit issuance is unavailable; watchers and signer still run after DB init + derivation consistency checks. Deposit address entrypoints fail closed with a controlled message when issuance is unavailable.
+
+`apps/bot_main/main.py` is a quarantined legacy entrypoint and is blocked in production; use `run_bot.py`.
+
+Withdrawals remain disabled by default (`WITHDRAWALS_ENABLED=false`).
 
 See `docs/RUNBOOK.md` for setup and operations.

@@ -396,7 +396,7 @@ def test_production_rejects_hd_signer(monkeypatch):
 
 def test_removed_assets_rejected(conn):
     wallet = WalletService(conn)
-    for symbol in ("USDC", "SOL", "XRP"):
+    for symbol in ("DOGE", "TRX", "BNB"):
         with pytest.raises(ValueError):
             wallet.validate_withdrawal_address(symbol, "x")
 
@@ -663,7 +663,7 @@ def test_deposit_flow_provider_failure_is_controlled(monkeypatch, conn):
     import bot
     result = asyncio.run(bot.deposit_amount_input(upd, ctx))
     assert result == bot.ConversationHandler.END
-    assert "temporarily unavailable" in msg.replies[-1].lower()
+    assert "issuance is currently unavailable" in msg.replies[-1].lower()
 
 
 def test_tx_detail_withdrawal_decrypts_address_and_hides_internal_failures(monkeypatch, tmp_path):

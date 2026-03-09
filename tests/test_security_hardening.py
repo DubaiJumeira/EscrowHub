@@ -1,5 +1,6 @@
 from decimal import Decimal
 import json
+import os
 
 import pytest
 
@@ -16,7 +17,7 @@ import bot
 import run_signer
 import run_btc_watcher
 import run_eth_watcher
-from runtime_preflight import run_startup_preflight
+from runtime_preflight import PreflightStatus, run_startup_preflight
 from watchers.sweep_job import run_once as run_sweep_once
 
 
@@ -242,7 +243,12 @@ def test_preflight_runs_derivation_check_before_bot_polling(monkeypatch):
     called = []
 
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
-    monkeypatch.setattr(bot, "run_startup_preflight", lambda _: called.append("preflight"))
+
+    def _preflight(_service):
+        called.append("preflight")
+        return PreflightStatus(service_name="bot", deposit_issuance_ready=False, deposit_issuance_error="down")
+
+    monkeypatch.setattr(bot, "run_startup_preflight", _preflight)
 
     class DummyApp:
         def add_handler(self, *_a, **_k):
@@ -314,14 +320,15 @@ def test_agents_line_exactly_once():
     assert text.count(line) == 1
 
 
-def test_preflight_fails_closed_when_production_deposit_issuance_unavailable(monkeypatch, tmp_path):
+def test_preflight_reports_bot_degraded_mode_when_deposit_issuance_unavailable(monkeypatch, tmp_path):
     monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "prod.sqlite3"))
     monkeypatch.setattr(Settings, "is_production", True)
     monkeypatch.setattr(Settings, "btc_xpub", "")
     monkeypatch.setattr(Settings, "ltc_xpub", "")
     monkeypatch.setattr(Settings, "eth_xpub", "")
-    with pytest.raises(RuntimeError, match="Production deposit issuance unavailable"):
-        run_startup_preflight("bot")
+    status = run_startup_preflight("bot")
+    assert status.deposit_issuance_ready is False
+    assert "Production deposit issuance unavailable" in (status.deposit_issuance_error or "")
 
 
 def test_watcher_entrypoints_run_full_startup_preflight(monkeypatch):
@@ -379,3 +386,58 @@ def test_withdrawal_failure_reason_stored_without_txid(conn):
     assert row["status"] == "failed"
     assert row["txid"] is None
     assert "provider internals" in row["failure_reason"]
+
+
+def test_production_settings_require_sqlite_db_path():
+    import subprocess
+    env = os.environ.copy()
+    env["APP_ENV"] = "production"
+    env.pop("SQLITE_DB_PATH", None)
+    result = subprocess.run(["python", "-c", "import config.settings"], capture_output=True, text=True, env=env)
+    assert result.returncode != 0
+    assert "SQLITE_DB_PATH is required in production" in (result.stderr + result.stdout)
+
+
+def test_watcher_and_signer_preflight_does_not_require_deposit_issuance(monkeypatch, tmp_path):
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "db.sqlite3"))
+    monkeypatch.setattr(Settings, "is_production", True)
+    monkeypatch.setattr(Settings, "btc_xpub", "")
+    monkeypatch.setattr(Settings, "ltc_xpub", "")
+    monkeypatch.setattr(Settings, "eth_xpub", "")
+    run_startup_preflight("btc_watcher")
+    run_startup_preflight("eth_watcher")
+    run_startup_preflight("signer")
+
+
+def test_legacy_bot_entrypoint_blocked_in_production(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("ALLOW_LEGACY_BOT_MAIN", "true")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("legacy_main_mod", os.path.join("apps", "bot_main", "main.py"))
+    mod = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    with pytest.raises(ImportError):
+        spec.loader.exec_module(mod)
+    text = open("apps/bot_main/main.py", "r", encoding="utf-8").read()
+    assert "Use run_bot.py" in text
+
+
+def test_signer_ambiguous_error_moves_to_retry_without_releasing(conn, monkeypatch):
+    monkeypatch.setattr(Settings, "withdrawals_enabled", True)
+
+    class TimeoutProvider:
+        def sign_and_broadcast(self, *_a, **_k):
+            raise RuntimeError("network timeout")
+
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(12345)
+    wallet.ledger.add_entry("USER", uid, uid, "USDT", Decimal("10"), "DEPOSIT", "deposit", 1)
+    req = wallet.request_withdrawal(uid, "USDT", Decimal("1"), "0x1111111111111111111111111111111111111111")
+
+    svc = SignerService()
+    svc.provider = TimeoutProvider()
+    assert svc.process_pending_withdrawals(wallet) == 0
+
+    row = conn.execute("SELECT status FROM withdrawals WHERE id=?", (req["id"],)).fetchone()
+    assert row["status"] == "signer_retry"
+    assert wallet.available_balance(uid, "USDT") == Decimal("9")
