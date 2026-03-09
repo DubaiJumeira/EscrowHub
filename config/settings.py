@@ -33,7 +33,6 @@ class Settings:
     supported_assets = ("BTC", "LTC", "ETH", "USDT")
     withdrawal_daily_limit_usd = os.getenv("WITHDRAWAL_DAILY_LIMIT_USD", "5000").strip()
     withdrawal_min_interval_seconds = int(os.getenv("WITHDRAWAL_MIN_INTERVAL_SECONDS", "30"))
-    allow_fallback_derivation = _as_bool("ALLOW_FALLBACK_DERIVATION", "false")
     allow_dev_bot_bootstrap = _as_bool("ALLOW_DEV_BOT_BOOTSTRAP", "false")
     withdrawals_enabled = _as_bool("WITHDRAWALS_ENABLED", "false")
     eth_max_blocks_per_run = int(os.getenv("ETH_MAX_BLOCKS_PER_RUN", "500"))

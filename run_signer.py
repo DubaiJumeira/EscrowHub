@@ -8,6 +8,7 @@ from infra.db.database import get_connection, init_db
 from signer.signer_service import SignerService
 from runtime_preflight import run_startup_preflight
 from wallet_service import WalletService
+from watcher_status_service import upsert_watcher_status
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 LOGGER = logging.getLogger("run_signer")
@@ -24,10 +25,13 @@ def main() -> None:
             start = time.time()
             wallet = WalletService(conn)
             count = SignerService().process_pending_withdrawals(wallet)
+            upsert_watcher_status(conn, "signer_loop", success=True)
             conn.commit()
             LOGGER.info("signer cycle success processed=%s duration=%.2fs", count, time.time() - start)
-        except Exception:
+        except Exception as exc:
             conn.rollback()
+            upsert_watcher_status(conn, "signer_loop", success=False, error=str(exc))
+            conn.commit()
             LOGGER.exception("signer cycle failed")
         finally:
             conn.close()

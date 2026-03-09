@@ -285,7 +285,7 @@ class WalletService:
     def _withdrawn_usd_last_24h(self, user_id: int) -> Decimal:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
         rows = self.conn.execute(
-            "SELECT asset, amount FROM withdrawals WHERE user_id=? AND status IN ('pending','broadcasted') AND created_at >= ?",
+            "SELECT asset, amount FROM withdrawals WHERE user_id=? AND status IN ('pending','broadcasted','signer_retry') AND created_at >= ?",
             (user_id, cutoff),
         ).fetchall()
         total = Decimal("0")

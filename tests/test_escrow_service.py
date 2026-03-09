@@ -531,7 +531,6 @@ def test_admin_freeze_unfreeze_logs_action(monkeypatch, tmp_path):
 def test_address_derivation_path_returns_address_only(monkeypatch):
     monkeypatch.setenv("HD_WALLET_SEED_HEX", "aa" * 32)
     monkeypatch.setenv("APP_ENV", "dev")
-    monkeypatch.setattr(Settings, "allow_fallback_derivation", True)
     d = HDWalletDeriver()
     addr = d.derive_eth_address(5)
     assert hasattr(addr, "public_address")
@@ -711,3 +710,103 @@ def test_tx_detail_withdrawal_decrypts_address_and_hides_internal_failures(monke
     assert "Status:</b> Failed" in q.text
     assert "TxID:" not in q.text
     assert "provider boom internal" not in q.text
+
+
+def test_withdrawn_usd_last_24h_counts_signer_retry(conn):
+    wallet = WalletService(conn)
+    wallet.price_service = StaticPriceService({"USDT": Decimal("1")})
+    uid = wallet._ensure_user_row(988)
+    conn.execute(
+        "INSERT INTO withdrawals(user_id,asset,amount,destination_address,status) VALUES(?,?,?,?,?)",
+        (uid, "USDT", "100", "enc", "signer_retry"),
+    )
+    assert wallet._withdrawn_usd_last_24h(uid) == Decimal("100")
+
+
+def test_tx_detail_withdrawal_shows_reconciliation_status(monkeypatch, tmp_path):
+    import asyncio
+    import bot
+
+    db = tmp_path / "tx_detail_retry.db"
+    c = sqlite3.connect(db)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA foreign_keys=ON")
+    init_db(c)
+    wallet = WalletService(c)
+    tenant = TenantService(c)
+    uid = tenant.ensure_user(7778, "tester2")
+    enc_addr = wallet._encrypt_field("0x" + "3" * 40)
+    c.execute(
+        "INSERT INTO withdrawals(id,user_id,asset,amount,destination_address,status,txid,failure_reason) VALUES(?,?,?,?,?,?,?,?)",
+        (10, uid, "USDT", "2", enc_addr, "signer_retry", "pretend-txid", "provider error"),
+    )
+    c.execute(
+        "INSERT INTO ledger_entries(id,account_type,account_owner_id,user_id,asset,amount,entry_type,ref_type,ref_id) VALUES(?,?,?,?,?,?,?,?,?)",
+        (20, "USER", uid, uid, "USDT", "-2", "WITHDRAWAL_RESERVE", "withdrawal", 10),
+    )
+    c.commit()
+    c.close()
+
+    def _svc():
+        cx = sqlite3.connect(db)
+        cx.row_factory = sqlite3.Row
+        cx.execute("PRAGMA foreign_keys=ON")
+        return (cx, WalletService(cx), TenantService(cx), None)
+
+    monkeypatch.setattr(bot, "_services", _svc)
+
+    class Q:
+        data = "tx_detail:20:1"
+        from_user = SimpleNamespace(id=7778, username="tester2")
+        text = None
+
+        async def answer(self, *a, **k):
+            return None
+
+        async def edit_message_text(self, txt, **kwargs):
+            self.text = txt
+
+    q = Q()
+    upd = SimpleNamespace(callback_query=q)
+    asyncio.run(bot.profile_actions(upd, SimpleNamespace(user_data={})))
+    assert "Status:</b> Awaiting reconciliation" in q.text
+    assert "TxID:" not in q.text
+
+
+def test_watcher_status_command_includes_signer_and_backlog(monkeypatch, conn):
+    import asyncio
+    import bot
+
+    upsert_watcher_status(conn, "btc_watcher", success=True)
+    upsert_watcher_status(conn, "eth_watcher", success=False, error="eth down")
+    upsert_watcher_status(conn, "signer_loop", success=True)
+    conn.execute(
+        "INSERT INTO withdrawals(user_id,asset,amount,destination_address,status) VALUES(?,?,?,?,?)",
+        (1, "USDT", "5", "enc", "signer_retry"),
+    )
+
+    monkeypatch.setattr(bot, "ADMIN_IDS", {999})
+    monkeypatch.setattr(bot, "_services", lambda: (conn, None, None, None))
+    monkeypatch.setattr(bot, "DEPOSIT_ISSUANCE_READY", False)
+    monkeypatch.setattr(bot, "DEPOSIT_ISSUANCE_ERROR", "degraded")
+
+    class Msg:
+        def __init__(self):
+            self.replies = []
+
+        async def reply_text(self, txt, **kwargs):
+            self.replies.append(txt)
+
+    denied_msg = Msg()
+    denied = SimpleNamespace(effective_user=SimpleNamespace(id=1), effective_message=denied_msg)
+    asyncio.run(bot.watcher_status(denied, None))
+    assert denied_msg.replies[-1] == "Admin only"
+
+    allowed_msg = Msg()
+    allowed = SimpleNamespace(effective_user=SimpleNamespace(id=999), effective_message=allowed_msg)
+    asyncio.run(bot.watcher_status(allowed, None))
+    text = allowed_msg.replies[-1]
+    assert "Signer loop" in text
+    assert "Deposit issuance readiness" in text
+    assert "Signer retry backlog" in text
+    assert "total in signer_retry: 1" in text

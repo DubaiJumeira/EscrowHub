@@ -1,6 +1,7 @@
 from decimal import Decimal
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -441,3 +442,49 @@ def test_signer_ambiguous_error_moves_to_retry_without_releasing(conn, monkeypat
     row = conn.execute("SELECT status FROM withdrawals WHERE id=?", (req["id"],)).fetchone()
     assert row["status"] == "signer_retry"
     assert wallet.available_balance(uid, "USDT") == Decimal("9")
+
+
+def test_profile_deposit_fails_closed_when_issuance_degraded(monkeypatch):
+    import asyncio
+    import bot
+
+    monkeypatch.setattr(bot, "DEPOSIT_ISSUANCE_READY", False)
+
+    class Q:
+        data = "profile_deposit"
+        from_user = SimpleNamespace(id=42, username="u")
+        text = None
+
+        async def answer(self, *a, **k):
+            return None
+
+        async def edit_message_text(self, txt, **kwargs):
+            self.text = txt
+
+    q = Q()
+    upd = SimpleNamespace(callback_query=q)
+    asyncio.run(bot.profile_actions(upd, SimpleNamespace(user_data={})))
+    assert "issuance is currently unavailable" in (q.text or "").lower()
+
+
+def test_deposit_select_asset_fails_closed_when_issuance_degraded(monkeypatch):
+    import asyncio
+    import bot
+
+    monkeypatch.setattr(bot, "DEPOSIT_ISSUANCE_READY", False)
+
+    class Q:
+        data = "dep_asset:BTC"
+        text = None
+
+        async def answer(self, *a, **k):
+            return None
+
+        async def edit_message_text(self, txt, **kwargs):
+            self.text = txt
+
+    q = Q()
+    upd = SimpleNamespace(callback_query=q)
+    result = asyncio.run(bot.deposit_select_asset(upd, SimpleNamespace(user_data={})))
+    assert result == bot.ConversationHandler.END
+    assert "issuance is currently unavailable" in (q.text or "").lower()
