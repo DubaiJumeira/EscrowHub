@@ -22,6 +22,7 @@ def run_startup_preflight(service_name: str) -> PreflightStatus:
     try:
         init_db(conn)
         wallet = WalletService(conn)
+        wallet.ensure_wallet_route_integrity()
         wallet.verify_address_derivation_consistency(sample_size=None)
 
         if service_name == "bot":
@@ -39,7 +40,7 @@ def run_startup_preflight(service_name: str) -> PreflightStatus:
                     deposit_issuance_error=str(exc),
                 )
 
-        LOGGER.info("startup preflight (%s): derivation consistency check passed", service_name)
+        LOGGER.info("startup preflight (%s): route integrity and derivation consistency checks passed", service_name)
         return PreflightStatus(service_name=service_name, deposit_issuance_ready=False)
     finally:
         conn.close()

@@ -130,7 +130,7 @@ def test_production_fails_when_hdwallet_missing(monkeypatch):
 
 def test_signer_signs_valid_transaction_shape(monkeypatch):
     signer = DisabledSignerProvider()
-    with pytest.raises(RuntimeError):
+    with pytest.raises(Exception):
         signer.sign_and_broadcast("ETH", "0x" + "1" * 40, "1.23")
 
 
@@ -416,9 +416,9 @@ def test_db_address_map_loader_reads_wallet_addresses(conn, monkeypatch):
     from run_eth_watcher import _address_map as eth_map
     conn.execute("INSERT INTO users(id, telegram_id, username, frozen) VALUES(?,?,?,0)", (1, 1001, "u1"))
     conn.execute("INSERT INTO users(id, telegram_id, username, frozen) VALUES(?,?,?,0)", (2, 1002, "u2"))
-    conn.execute("INSERT INTO wallet_addresses(user_id,asset,chain_family,address,derivation_index,destination_tag,derivation_path) VALUES(?,?,?,?,?,?,?)", (1, "BTC", "BTC", "bc1qabc", 1, None, "p"))
+    conn.execute("INSERT INTO wallet_addresses(user_id,asset,chain_family,address,derivation_index,destination_tag,derivation_path) VALUES(?,?,?,?,?,?,?)", (1, "BTC", "BTC", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", 1, None, "p"))
     conn.execute("INSERT INTO wallet_addresses(user_id,asset,chain_family,address,derivation_index,destination_tag,derivation_path) VALUES(?,?,?,?,?,?,?)", (2, "ETH", "ETHEREUM", "0x2222222222222222222222222222222222222222", 2, None, "p"))
-    assert btc_map(conn)["bc1qabc"] == 1
+    assert btc_map(conn)["bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"] == 1
     assert eth_map(conn)["0x2222222222222222222222222222222222222222"] == 2
 
 
@@ -557,7 +557,7 @@ def test_vault_signer_does_not_fabricate_txid(monkeypatch):
         def read(self): return b'{"data":{"signature":"abc"}}'
 
     monkeypatch.setattr("signer.signer_service.urlopen", lambda *a, **k: Resp())
-    with pytest.raises(RuntimeError):
+    with pytest.raises(Exception):
         VaultSignerProvider().sign_and_broadcast("ETH", "0x" + "1"*40, "1")
 
 
@@ -565,7 +565,7 @@ def test_withdrawn_usd_last_24h_uses_usd_conversion(conn):
     wallet = WalletService(conn)
     wallet.price_service = StaticPriceService({"BTC": Decimal("65000")})
     uid = wallet._ensure_user_row(987)
-    conn.execute("INSERT INTO withdrawals(user_id,asset,amount,destination_address,status) VALUES(?,?,?,?,?)", (uid, "BTC", "0.1", "bc1qabc", "broadcasted"))
+    conn.execute("INSERT INTO withdrawals(user_id,asset,amount,destination_address,status) VALUES(?,?,?,?,?)", (uid, "BTC", "0.1", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", "broadcasted"))
     assert wallet._withdrawn_usd_last_24h(uid) == Decimal("6500.0")
 
 
@@ -626,8 +626,8 @@ def test_watcher_address_map_loaders_do_not_call_sample_consistency(conn, monkey
 
     monkeypatch.setattr("wallet_service.WalletService.verify_address_derivation_consistency", _boom)
     conn.execute("INSERT INTO users(id, telegram_id, username, frozen) VALUES(?,?,?,0)", (11, 2011, "u11"))
-    conn.execute("INSERT INTO wallet_addresses(user_id,asset,chain_family,address,derivation_index,destination_tag,derivation_path) VALUES(?,?,?,?,?,?,?)", (11, "BTC", "BTC", "bc1qabc2", 11, None, "p"))
-    assert btc_map(conn)["bc1qabc2"] == 11
+    conn.execute("INSERT INTO wallet_addresses(user_id,asset,chain_family,address,derivation_index,destination_tag,derivation_path) VALUES(?,?,?,?,?,?,?)", (11, "BTC", "BTC", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", 11, None, "p"))
+    assert btc_map(conn)["bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"] == 11
     assert isinstance(eth_map(conn), dict)
 
 

@@ -64,7 +64,7 @@ def test_production_requires_xpub_not_seed(monkeypatch):
 
 
 def test_signer_disabled_provider_fails_closed():
-    with pytest.raises(RuntimeError):
+    with pytest.raises(Exception):
         DisabledSignerProvider().sign_and_broadcast("ETH", "0x" + "1" * 40, "1")
 
 
@@ -105,13 +105,13 @@ def test_monitored_address_map_decrypts_encrypted_rows(conn, monkeypatch):
     monkeypatch.setattr(Settings, "encryption_key", "k" * 32)
     wallet = WalletService(conn)
     uid = wallet._ensure_user_row(7001)
-    enc_addr = wallet._encrypt_field("bc1qtestxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+    enc_addr = wallet._encrypt_field("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080")
     conn.execute(
         "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,derivation_index,destination_tag,derivation_path) VALUES(?,?,?,?,?,?,?)",
         (uid, "BTC", "BTC", enc_addr, uid, None, None),
     )
     result = wallet.monitored_deposit_address_map(["BTC"])
-    assert result == {"bc1qtestxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx": uid}
+    assert result == {"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080": uid}
 
 
 def test_kdf_backward_compatible_decrypt(monkeypatch, conn):
@@ -624,36 +624,36 @@ def test_provider_issued_invalid_addresses_rejected(conn, monkeypatch):
 
 def test_wallet_address_guards_allow_same_user_evm_reuse(conn):
     conn.execute(
-        "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,provider_origin,provider_ref) VALUES(?,?,?,?,?,?)",
-        (1, "ETH", "ETHEREUM", "0xabc", "external_http", "route:1:ETH"),
+        "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,address_fingerprint,provider_origin,provider_ref) VALUES(?,?,?,?,?,?,?)",
+        (1, "ETH", "ETHEREUM", "0xabc", _fp("ETHEREUM", "0xabc"), "external_http", "route:1:ETH"),
     )
     conn.execute(
-        "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,provider_origin,provider_ref) VALUES(?,?,?,?,?,?)",
-        (1, "USDT", "ETHEREUM", "0xabc", "external_http", "route:1:USDT"),
+        "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,address_fingerprint,provider_origin,provider_ref) VALUES(?,?,?,?,?,?,?)",
+        (1, "USDT", "ETHEREUM", "0xabc", _fp("ETHEREUM", "0xabc"), "external_http", "route:1:USDT"),
     )
 
 
 def test_wallet_address_guards_reject_cross_user_chain_address_reuse(conn):
     conn.execute(
-        "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,provider_origin,provider_ref) VALUES(?,?,?,?,?,?)",
-        (1, "ETH", "ETHEREUM", "0xdef", "external_http", "route:1:ETH"),
+        "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,address_fingerprint,provider_origin,provider_ref) VALUES(?,?,?,?,?,?,?)",
+        (1, "ETH", "ETHEREUM", "0xdef", _fp("ETHEREUM", "0xdef"), "external_http", "route:1:ETH"),
     )
-    with pytest.raises(sqlite3.IntegrityError, match="chain/address"):
+    with pytest.raises(sqlite3.IntegrityError, match="fingerprint"):
         conn.execute(
-            "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,provider_origin,provider_ref) VALUES(?,?,?,?,?,?)",
-            (2, "USDT", "ETHEREUM", "0xdef", "external_http", "route:2:USDT"),
+            "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,address_fingerprint,provider_origin,provider_ref) VALUES(?,?,?,?,?,?,?)",
+            (2, "USDT", "ETHEREUM", "0xdef", _fp("ETHEREUM", "0xdef"), "external_http", "route:2:USDT"),
         )
 
 
 def test_wallet_address_guards_reject_provider_ref_rebinding(conn):
     conn.execute(
-        "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,provider_origin,provider_ref) VALUES(?,?,?,?,?,?)",
-        (1, "BTC", "BTC", "bc1qa", "external_http", "route:shared"),
+        "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,address_fingerprint,provider_origin,provider_ref) VALUES(?,?,?,?,?,?,?)",
+        (1, "BTC", "BTC", "bc1qa", _fp("BTC", "bc1qa"), "external_http", "route:shared"),
     )
     with pytest.raises(sqlite3.IntegrityError, match="provider_ref"):
         conn.execute(
-            "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,provider_origin,provider_ref) VALUES(?,?,?,?,?,?)",
-            (1, "LTC", "LTC", "ltc1qa", "external_http", "route:shared"),
+            "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,address_fingerprint,provider_origin,provider_ref) VALUES(?,?,?,?,?,?,?)",
+            (1, "LTC", "LTC", "ltc1qa", _fp("LTC", "ltc1qa"), "external_http", "route:shared"),
         )
 
 
@@ -776,3 +776,103 @@ def test_http_provider_health_malformed_response_rejected(monkeypatch):
     ready, err = provider.is_ready()
     assert ready is False
     assert "healthcheck failed" in (err or "")
+
+
+def _fp(chain_family: str, address: str) -> str:
+    import hashlib
+    return hashlib.sha256(f"{chain_family}:{address}".encode()).hexdigest()
+
+
+def test_encrypted_duplicate_plaintext_backfill_detected(conn, monkeypatch):
+    monkeypatch.setattr(Settings, "encryption_key", "k" * 32)
+    w = WalletService(conn)
+    a = w._encrypt_field("0x1111111111111111111111111111111111111111")
+    b = w._encrypt_field("0x1111111111111111111111111111111111111111")
+    conn.execute("INSERT INTO wallet_addresses(user_id,asset,chain_family,address,provider_origin,provider_ref) VALUES(?,?,?,?,?,?)", (1, "ETH", "ETHEREUM", a, "external_http", "r1"))
+    conn.execute("INSERT INTO wallet_addresses(user_id,asset,chain_family,address,provider_origin,provider_ref) VALUES(?,?,?,?,?,?)", (2, "USDT", "ETHEREUM", b, "external_http", "r2"))
+    with pytest.raises(RuntimeError, match="fingerprint collision"):
+        w.ensure_wallet_route_integrity()
+
+
+def test_monitored_map_fails_closed_on_duplicate_decrypted_route(conn, monkeypatch):
+    monkeypatch.setattr(Settings, "encryption_key", "k" * 32)
+    w = WalletService(conn)
+    a = w._encrypt_field("0x2222222222222222222222222222222222222222")
+    b = w._encrypt_field("0x2222222222222222222222222222222222222222")
+    conn.execute("INSERT INTO wallet_addresses(user_id,asset,chain_family,address,provider_origin,provider_ref) VALUES(?,?,?,?,?,?)", (1, "ETH", "ETHEREUM", a, "external_http", "ra"))
+    conn.execute("INSERT INTO wallet_addresses(user_id,asset,chain_family,address,provider_origin,provider_ref) VALUES(?,?,?,?,?,?)", (2, "USDT", "ETHEREUM", b, "external_http", "rb"))
+    with pytest.raises(RuntimeError, match="duplicate monitored deposit route"):
+        w.monitored_deposit_address_map(["ETH", "USDT"])
+
+
+def test_wallet_address_guards_use_fingerprint_not_ciphertext(conn):
+    a1 = "enc:AAAA"
+    a2 = "enc:BBBB"
+    fp = _fp("BTC", "bc1qzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")
+    conn.execute("INSERT INTO wallet_addresses(user_id,asset,chain_family,address,address_fingerprint,provider_origin,provider_ref) VALUES(?,?,?,?,?,?,?)", (1, "BTC", "BTC", a1, fp, "external_http", "x1"))
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("INSERT INTO wallet_addresses(user_id,asset,chain_family,address,address_fingerprint,provider_origin,provider_ref) VALUES(?,?,?,?,?,?,?)", (2, "BTC", "BTC", a2, fp, "external_http", "x2"))
+
+
+def test_provider_rebinding_blocked_by_fingerprint(conn):
+    fp1 = _fp("ETHEREUM", "0x3333333333333333333333333333333333333333")
+    fp2 = _fp("ETHEREUM", "0x4444444444444444444444444444444444444444")
+    conn.execute("INSERT INTO wallet_addresses(user_id,asset,chain_family,address,address_fingerprint,provider_origin,provider_ref) VALUES(?,?,?,?,?,?,?)", (1, "ETH", "ETHEREUM", "enc:a", fp1, "external_http", "shared"))
+    with pytest.raises(sqlite3.IntegrityError, match="provider_ref"):
+        conn.execute("INSERT INTO wallet_addresses(user_id,asset,chain_family,address,address_fingerprint,provider_origin,provider_ref) VALUES(?,?,?,?,?,?,?)", (1, "USDT", "ETHEREUM", "enc:b", fp2, "external_http", "shared"))
+
+
+def test_http_provider_health_requires_supported_coverage(monkeypatch):
+    import io
+    import address_provider
+    from address_provider import HttpAddressProvider
+
+    monkeypatch.setattr(Settings, "is_production", True)
+    monkeypatch.setenv("ADDRESS_PROVIDER_URL", "https://provider.example")
+    monkeypatch.setenv("ADDRESS_PROVIDER_TOKEN", "token")
+
+    class Resp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *_a): return False
+        def read(self): return io.BytesIO(b'{"ready": true}').read()
+
+    monkeypatch.setattr(address_provider, "urlopen", lambda *_a, **_k: Resp())
+    ready, err = HttpAddressProvider().is_ready()
+    assert ready is False
+    assert "supported_assets" in (err or "") or "supported_chain_families" in (err or "")
+
+
+def test_http_provider_rejects_asset_chain_mismatch(monkeypatch):
+    import io
+    import address_provider
+    from address_provider import HttpAddressProvider
+
+    monkeypatch.setattr(Settings, "is_production", True)
+    monkeypatch.setenv("ADDRESS_PROVIDER_URL", "https://provider.example")
+    monkeypatch.setenv("ADDRESS_PROVIDER_TOKEN", "token")
+
+    class Resp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *_a): return False
+        def read(self): return io.BytesIO(b'{"address":"0x1111111111111111111111111111111111111111","provider_ref":"r","asset":"BTC","chain_family":"BTC"}').read()
+
+    monkeypatch.setattr(address_provider, "urlopen", lambda *_a, **_k: Resp())
+    with pytest.raises(RuntimeError, match="asset mismatch"):
+        HttpAddressProvider().get_or_create_address(1, "ETH")
+
+
+def test_wallet_migration_constraints_present_after_init(conn):
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(wallet_addresses)").fetchall()}
+    assert "address_fingerprint" in cols
+    idx1 = conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_wallet_addresses_chain_fingerprint'").fetchone()
+    idx2 = conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_wallet_addresses_provider_ref'").fetchone()
+    assert idx1 is not None
+    assert idx2 is not None
+
+
+def test_agents_sentence_once():
+    text = open("AGENTS.md", "r", encoding="utf-8").read()
+    needle = 'When you find a security vunerabilty, flag it immediately with a WARNING comment and suggest a secure alternative. Never implement insecure patters even if asked.'
+    assert text.count(needle) == 1

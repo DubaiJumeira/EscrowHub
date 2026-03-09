@@ -16,6 +16,8 @@ class IssuedAddress:
     address: str
     provider_origin: str
     provider_ref: str
+    asset: str | None = None
+    chain_family: str | None = None
 
 
 class AddressProvider:
@@ -72,9 +74,25 @@ class HttpAddressProvider(AddressProvider):
                 body = json.loads(resp.read().decode() or "{}")
         except (HTTPError, URLError, TimeoutError, ValueError) as exc:
             return False, f"provider healthcheck failed: {exc}"
+        if not isinstance(body, dict):
+            return False, "provider healthcheck failed: malformed JSON object"
         ready = body.get("ready")
         if ready is not True:
             return False, str(body.get("error") or "provider not ready")
+        supported_assets = body.get("supported_assets")
+        supported_chains = body.get("supported_chain_families")
+        required_assets = {"BTC", "LTC", "ETH", "USDT"}
+        required_chains = {"BTC", "LTC", "ETHEREUM"}
+        if isinstance(supported_assets, list):
+            advertised = {str(v).upper() for v in supported_assets}
+            if not required_assets.issubset(advertised):
+                return False, "provider healthcheck missing required supported_assets"
+        elif isinstance(supported_chains, list):
+            advertised = {str(v).upper() for v in supported_chains}
+            if not required_chains.issubset(advertised):
+                return False, "provider healthcheck missing required supported_chain_families"
+        else:
+            return False, "provider healthcheck must declare supported_assets or supported_chain_families"
         return True, None
 
     def get_or_create_address(self, user_id: int, asset: str) -> IssuedAddress:
@@ -94,11 +112,20 @@ class HttpAddressProvider(AddressProvider):
         except (HTTPError, URLError, TimeoutError, ValueError) as exc:
             raise RuntimeError("address provider request failed") from exc
 
+        if not isinstance(body, dict):
+            raise RuntimeError("address provider response malformed")
         address = str(body.get("address") or "").strip()
         provider_ref = str(body.get("provider_ref") or body.get("route_id") or "").strip()
+        provider_asset = str(body.get("asset") or symbol).upper().strip()
+        provider_chain = str(body.get("chain_family") or ("ETHEREUM" if symbol in {"ETH", "USDT"} else symbol)).upper().strip()
+        expected_chain = "ETHEREUM" if symbol in {"ETH", "USDT"} else symbol
+        if provider_asset != symbol:
+            raise RuntimeError("address provider response asset mismatch")
+        if provider_chain != expected_chain:
+            raise RuntimeError("address provider response chain mismatch")
         if not address or not provider_ref:
             raise RuntimeError("address provider response missing address/provider_ref")
-        return IssuedAddress(address=address, provider_origin="external_http", provider_ref=provider_ref)
+        return IssuedAddress(address=address, provider_origin="external_http", provider_ref=provider_ref, asset=provider_asset, chain_family=provider_chain)
 
 
 def build_address_provider() -> AddressProvider:

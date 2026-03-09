@@ -59,25 +59,25 @@ def _apply_security_constraints(conn: sqlite3.Connection) -> None:
 
 
     conn.execute(
-        "CREATE TRIGGER IF NOT EXISTS trg_wallet_addresses_chain_addr_user_guard_ins BEFORE INSERT ON wallet_addresses "
-        "WHEN EXISTS (SELECT 1 FROM wallet_addresses w WHERE w.chain_family=NEW.chain_family AND w.address=NEW.address AND w.user_id != NEW.user_id) "
-        "BEGIN SELECT RAISE(ABORT, 'wallet chain/address already assigned to a different user'); END;"
+        "CREATE TRIGGER IF NOT EXISTS trg_wallet_addresses_chain_fp_user_guard_ins BEFORE INSERT ON wallet_addresses "
+        "WHEN COALESCE(NEW.address_fingerprint,'') != '' AND EXISTS (SELECT 1 FROM wallet_addresses w WHERE w.chain_family=NEW.chain_family AND w.address_fingerprint=NEW.address_fingerprint AND w.user_id != NEW.user_id) "
+        "BEGIN SELECT RAISE(ABORT, 'wallet chain/address fingerprint already assigned to a different user'); END;"
     )
     conn.execute(
-        "CREATE TRIGGER IF NOT EXISTS trg_wallet_addresses_chain_addr_user_guard_upd BEFORE UPDATE OF chain_family, address, user_id ON wallet_addresses "
-        "WHEN EXISTS (SELECT 1 FROM wallet_addresses w WHERE w.id != NEW.id AND w.chain_family=NEW.chain_family AND w.address=NEW.address AND w.user_id != NEW.user_id) "
-        "BEGIN SELECT RAISE(ABORT, 'wallet chain/address already assigned to a different user'); END;"
+        "CREATE TRIGGER IF NOT EXISTS trg_wallet_addresses_chain_fp_user_guard_upd BEFORE UPDATE OF chain_family, address_fingerprint, user_id ON wallet_addresses "
+        "WHEN COALESCE(NEW.address_fingerprint,'') != '' AND EXISTS (SELECT 1 FROM wallet_addresses w WHERE w.id != NEW.id AND w.chain_family=NEW.chain_family AND w.address_fingerprint=NEW.address_fingerprint AND w.user_id != NEW.user_id) "
+        "BEGIN SELECT RAISE(ABORT, 'wallet chain/address fingerprint already assigned to a different user'); END;"
     )
     conn.execute(
         "CREATE TRIGGER IF NOT EXISTS trg_wallet_addresses_provider_ref_guard_ins BEFORE INSERT ON wallet_addresses "
         "WHEN COALESCE(NEW.provider_origin, '') != '' AND COALESCE(NEW.provider_ref, '') != '' AND "
-        "EXISTS (SELECT 1 FROM wallet_addresses w WHERE w.provider_origin=NEW.provider_origin AND w.provider_ref=NEW.provider_ref AND (w.user_id != NEW.user_id OR w.address != NEW.address)) "
+        "EXISTS (SELECT 1 FROM wallet_addresses w WHERE w.provider_origin=NEW.provider_origin AND w.provider_ref=NEW.provider_ref AND (w.user_id != NEW.user_id OR COALESCE(w.address_fingerprint,'') != COALESCE(NEW.address_fingerprint,''))) "
         "BEGIN SELECT RAISE(ABORT, 'provider_ref cannot be rebound to another route'); END;"
     )
     conn.execute(
-        "CREATE TRIGGER IF NOT EXISTS trg_wallet_addresses_provider_ref_guard_upd BEFORE UPDATE OF provider_origin, provider_ref, user_id, address ON wallet_addresses "
+        "CREATE TRIGGER IF NOT EXISTS trg_wallet_addresses_provider_ref_guard_upd BEFORE UPDATE OF provider_origin, provider_ref, user_id, address_fingerprint ON wallet_addresses "
         "WHEN COALESCE(NEW.provider_origin, '') != '' AND COALESCE(NEW.provider_ref, '') != '' AND "
-        "EXISTS (SELECT 1 FROM wallet_addresses w WHERE w.id != NEW.id AND w.provider_origin=NEW.provider_origin AND w.provider_ref=NEW.provider_ref AND (w.user_id != NEW.user_id OR w.address != NEW.address)) "
+        "EXISTS (SELECT 1 FROM wallet_addresses w WHERE w.id != NEW.id AND w.provider_origin=NEW.provider_origin AND w.provider_ref=NEW.provider_ref AND (w.user_id != NEW.user_id OR COALESCE(w.address_fingerprint,'') != COALESCE(NEW.address_fingerprint,''))) "
         "BEGIN SELECT RAISE(ABORT, 'provider_ref cannot be rebound to another route'); END;"
     )
 
@@ -105,23 +105,24 @@ def _wallet_route_collisions(conn: sqlite3.Connection) -> list[str]:
     collisions: list[str] = []
     addr_rows = conn.execute(
         """
-        SELECT chain_family, address, GROUP_CONCAT(DISTINCT user_id) AS users, COUNT(DISTINCT user_id) AS user_count
+        SELECT chain_family, address_fingerprint, GROUP_CONCAT(DISTINCT user_id) AS users, COUNT(DISTINCT user_id) AS user_count
         FROM wallet_addresses
-        GROUP BY chain_family, address
+        WHERE COALESCE(address_fingerprint,'') != ''
+        GROUP BY chain_family, address_fingerprint
         HAVING COUNT(DISTINCT user_id) > 1
         ORDER BY chain_family, address
         """
     ).fetchall()
     for row in addr_rows:
-        collisions.append(f"chain/address collision family={row['chain_family']} users={row['users']}")
+        collisions.append(f"chain/fingerprint collision family={row['chain_family']} users={row['users']}")
 
     ref_rows = conn.execute(
         """
-        SELECT provider_origin, provider_ref, GROUP_CONCAT(DISTINCT user_id) AS users, COUNT(DISTINCT user_id) AS user_count, COUNT(DISTINCT address) AS address_count
+        SELECT provider_origin, provider_ref, GROUP_CONCAT(DISTINCT user_id) AS users, COUNT(DISTINCT user_id) AS user_count, COUNT(DISTINCT COALESCE(address_fingerprint,'')) AS address_count
         FROM wallet_addresses
         WHERE COALESCE(provider_origin, '') != '' AND COALESCE(provider_ref, '') != ''
         GROUP BY provider_origin, provider_ref
-        HAVING COUNT(DISTINCT user_id) > 1 OR COUNT(DISTINCT address) > 1
+        HAVING COUNT(DISTINCT user_id) > 1 OR COUNT(DISTINCT COALESCE(address_fingerprint,'')) > 1
         ORDER BY provider_origin, provider_ref
         """
     ).fetchall()
@@ -144,6 +145,8 @@ def init_db(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE wallet_addresses ADD COLUMN provider_origin TEXT")
     if "provider_ref" not in wallet_cols:
         conn.execute("ALTER TABLE wallet_addresses ADD COLUMN provider_ref TEXT")
+    if "address_fingerprint" not in wallet_cols:
+        conn.execute("ALTER TABLE wallet_addresses ADD COLUMN address_fingerprint TEXT")
 
     if "failure_reason" not in withdrawal_cols:
         conn.execute("ALTER TABLE withdrawals ADD COLUMN failure_reason TEXT")
@@ -192,6 +195,12 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.execute("UPDATE bots SET telegram_username=lower(ltrim(trim(telegram_username),'@')) WHERE telegram_username IS NOT NULL")
     conn.execute("UPDATE bots SET telegram_username=NULL WHERE telegram_username=''")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_bots_telegram_username ON bots(telegram_username)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_wallet_addresses_chain_fingerprint ON wallet_addresses(chain_family, address_fingerprint)")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_addresses_provider_ref ON wallet_addresses(provider_origin, provider_ref) WHERE COALESCE(provider_origin, '') != '' AND COALESCE(provider_ref, '') != ''")
+
+    from wallet_service import WalletService
+
+    WalletService(conn).ensure_wallet_route_integrity()
 
     wallet_collisions = _wallet_route_collisions(conn)
     if wallet_collisions:
