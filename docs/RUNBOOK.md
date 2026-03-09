@@ -14,18 +14,18 @@
 - `WITHDRAWALS_ENABLED` (`false` by default; keep disabled unless a full secure signer/broadcaster is deployed)
 
 ## Wallet and derivation variables
-- `HD_WALLET_SEED_HEX` (seed derivation in non-production/dev flows)
-- `BTC_XPUB`
-- `LTC_XPUB`
-- `ETH_XPUB`
+- `HD_WALLET_SEED_HEX` (seed derivation in non-production/dev flows only)
+- `ADDRESS_PROVIDER` (`http` or `disabled`)
+- `ADDRESS_PROVIDER_URL` (required when `ADDRESS_PROVIDER=http`)
+- `ADDRESS_PROVIDER_TOKEN` (optional bearer token)
 
-### xpub safety note
-With the current path contract (`m/.../{user_id}'/...`), xpubs are **not derivation-compatible** because hardened user nodes cannot be derived from public keys. Startup preflight fails closed when xpub mode is configured.
-Only bot startup evaluates deposit issuance readiness. If unavailable, bot runs in degraded mode and deposit issuance entrypoints fail closed with a controlled user message. Watchers and signer still start after DB + derivation consistency checks.
+### Deposit address provider contract
+Production deposit issuance is externalized and fail-closed.
+- Health check: `GET /health` returns JSON with `ready` boolean (and optional `error`).
+- Idempotent issuance: `POST /addresses/get-or-create` with `{"user_id": int, "asset": "BTC|LTC|ETH|USDT"}`.
+- Response must include immutable `address` and `provider_ref`.
 
-Secure alternatives:
-- external address service / HSM-backed derivation service, or
-- explicit migration to a non-hardened xpub-compatible path scheme.
+Only bot startup evaluates deposit issuance readiness. If unavailable, bot runs in degraded mode and deposit issuance entrypoints fail closed with a controlled user message. Watchers and signer still start after DB checks.
 
 ## Service entrypoints (separate processes)
 - `python run_bot.py`

@@ -780,6 +780,7 @@ def test_watcher_status_command_includes_signer_and_backlog(monkeypatch, conn):
     upsert_watcher_status(conn, "btc_watcher", success=True)
     upsert_watcher_status(conn, "eth_watcher", success=False, error="eth down")
     upsert_watcher_status(conn, "signer_loop", success=True)
+    conn.execute("INSERT INTO users(id,telegram_id,username,frozen) VALUES(?,?,?,0)", (1, 1001, "u1"))
     conn.execute(
         "INSERT INTO withdrawals(user_id,asset,amount,destination_address,status) VALUES(?,?,?,?,?)",
         (1, "USDT", "5", "enc", "signer_retry"),

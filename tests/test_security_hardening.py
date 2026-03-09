@@ -10,6 +10,7 @@ from config.settings import Settings
 from escrow_service import EscrowService
 from hd_wallet import HDWalletDeriver
 from infra.chain_adapters.eth_rpc import EthRpcAdapter
+from signer.errors import AmbiguousBroadcastError, DeterministicSigningError
 from signer.signer_service import DisabledSignerProvider, SignerService
 from tenant_service import TenantService
 from wallet_service import WalletService
@@ -488,3 +489,107 @@ def test_deposit_select_asset_fails_closed_when_issuance_degraded(monkeypatch):
     result = asyncio.run(bot.deposit_select_asset(upd, SimpleNamespace(user_data={})))
     assert result == bot.ConversationHandler.END
     assert "issuance is currently unavailable" in (q.text or "").lower()
+
+
+def test_signer_typed_ambiguous_goes_to_retry(conn, monkeypatch):
+    monkeypatch.setattr(Settings, "withdrawals_enabled", True)
+
+    class Provider:
+        def sign_and_broadcast(self, *_a, **_k):
+            raise AmbiguousBroadcastError("network uncertain")
+
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(70001)
+    wallet.ledger.add_entry("USER", uid, uid, "USDT", Decimal("10"), "DEPOSIT", "deposit", 1)
+    req = wallet.request_withdrawal(uid, "USDT", Decimal("1"), "0x1111111111111111111111111111111111111111")
+    svc = SignerService()
+    svc.provider = Provider()
+    svc.process_pending_withdrawals(wallet)
+    row = conn.execute("SELECT status FROM withdrawals WHERE id=?", (req["id"],)).fetchone()
+    assert row["status"] == "signer_retry"
+
+
+def test_signer_typed_deterministic_goes_failed(conn, monkeypatch):
+    monkeypatch.setattr(Settings, "withdrawals_enabled", True)
+
+    class Provider:
+        def sign_and_broadcast(self, *_a, **_k):
+            raise DeterministicSigningError("invalid nonce")
+
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(70002)
+    wallet.ledger.add_entry("USER", uid, uid, "USDT", Decimal("10"), "DEPOSIT", "deposit", 1)
+    req = wallet.request_withdrawal(uid, "USDT", Decimal("1"), "0x1111111111111111111111111111111111111111")
+    svc = SignerService()
+    svc.provider = Provider()
+    svc.process_pending_withdrawals(wallet)
+    row = conn.execute("SELECT status FROM withdrawals WHERE id=?", (req["id"],)).fetchone()
+    assert row["status"] == "failed"
+
+
+def test_signer_unknown_defaults_to_retry(conn, monkeypatch):
+    monkeypatch.setattr(Settings, "withdrawals_enabled", True)
+
+    class Provider:
+        def sign_and_broadcast(self, *_a, **_k):
+            raise RuntimeError("unexpected")
+
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(70003)
+    wallet.ledger.add_entry("USER", uid, uid, "USDT", Decimal("10"), "DEPOSIT", "deposit", 1)
+    req = wallet.request_withdrawal(uid, "USDT", Decimal("1"), "0x1111111111111111111111111111111111111111")
+    svc = SignerService()
+    svc.provider = Provider()
+    svc.process_pending_withdrawals(wallet)
+    row = conn.execute("SELECT status FROM withdrawals WHERE id=?", (req["id"],)).fetchone()
+    assert row["status"] == "signer_retry"
+
+
+def test_withdrawals_rebuild_migration_preserves_fk_and_index(tmp_path):
+    db = tmp_path / "old_withdrawals.db"
+    c = sqlite3.connect(db)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA foreign_keys=ON")
+    c.execute("CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, telegram_id INTEGER UNIQUE NOT NULL, username TEXT, frozen INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+    c.execute("CREATE TABLE withdrawals (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, asset TEXT NOT NULL CHECK(asset IN ('BTC','LTC','ETH','USDT')), amount TEXT NOT NULL, destination_address TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','broadcasted','failed')), txid TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+    init_db(c)
+    sql = c.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='withdrawals'").fetchone()["sql"]
+    assert "signer_retry" in sql
+    cols = {row["name"] for row in c.execute("PRAGMA table_info(withdrawals)").fetchall()}
+    assert "failure_reason" in cols
+    fks = c.execute("PRAGMA foreign_key_list(withdrawals)").fetchall()
+    assert any(row["from"] == "user_id" and row["table"] == "users" for row in fks)
+    idx = c.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_withdrawals_user_status_created'").fetchone()
+    assert idx is not None
+    c.close()
+
+
+def test_production_deposit_issuance_uses_provider_and_persists_metadata(conn, monkeypatch):
+    from address_provider import IssuedAddress
+
+    monkeypatch.setattr(Settings, "is_production", True)
+    monkeypatch.setattr(Settings, "encryption_key", "k" * 32)
+
+    class Provider:
+        def is_ready(self):
+            return True, None
+
+        def get_or_create_address(self, user_id, asset):
+            assert asset in {"BTC", "LTC", "ETH", "USDT"}
+            return IssuedAddress(address="0x" + "2" * 40, provider_origin="external_http", provider_ref=f"route:{user_id}:{asset}")
+
+    wallet = WalletService(conn)
+    wallet.address_provider = Provider()
+    route = wallet.get_or_create_deposit_address(5555, "USDT")
+    assert route.address.startswith("0x")
+    row = conn.execute("SELECT provider_origin, provider_ref, derivation_path FROM wallet_addresses WHERE asset='USDT'").fetchone()
+    assert row["provider_origin"] == "external_http"
+    assert "route:" in row["provider_ref"]
+    assert row["derivation_path"] is None
+
+
+def test_production_deposit_issuance_fails_closed_without_provider(conn, monkeypatch):
+    monkeypatch.setattr(Settings, "is_production", True)
+    wallet = WalletService(conn)
+    with pytest.raises(RuntimeError):
+        wallet.get_or_create_deposit_address(9999, "BTC")

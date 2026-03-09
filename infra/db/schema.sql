@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS wallet_addresses (
   derivation_index INTEGER,
   destination_tag TEXT,
   derivation_path TEXT,
+  provider_origin TEXT,
+  provider_ref TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(user_id, asset),
   FOREIGN KEY(user_id) REFERENCES users(id)
