@@ -83,28 +83,31 @@ def init_db(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE watcher_status ADD COLUMN cursor INTEGER")
 
     withdrawal_cols = {row["name"] for row in conn.execute("PRAGMA table_info(withdrawals)").fetchall()}
+    wallet_cols = {row["name"] for row in conn.execute("PRAGMA table_info(wallet_addresses)").fetchall()}
+    if "provider_origin" not in wallet_cols:
+        conn.execute("ALTER TABLE wallet_addresses ADD COLUMN provider_origin TEXT")
+    if "provider_ref" not in wallet_cols:
+        conn.execute("ALTER TABLE wallet_addresses ADD COLUMN provider_ref TEXT")
+
     if "failure_reason" not in withdrawal_cols:
         conn.execute("ALTER TABLE withdrawals ADD COLUMN failure_reason TEXT")
 
-    status_rows = conn.execute("PRAGMA table_info(withdrawals)").fetchall()
-    status_type = ""
-    for row in status_rows:
-        if row["name"] == "status":
-            status_type = str(row["type"] or "")
-            break
-    if "signer_retry" not in status_type:
+    table_sql_row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='withdrawals'").fetchone()
+    table_sql = str(table_sql_row["sql"] or "") if table_sql_row else ""
+    if "signer_retry" not in table_sql:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS withdrawals_new (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
-              user_id INTEGER NOT NULL,
+              user_id INTEGER,
               asset TEXT NOT NULL CHECK(asset IN ('BTC','LTC','ETH','USDT')),
               amount TEXT NOT NULL,
               destination_address TEXT NOT NULL,
               status TEXT NOT NULL CHECK(status IN ('pending','broadcasted','failed','signer_retry')),
               txid TEXT,
               failure_reason TEXT,
-              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              FOREIGN KEY(user_id) REFERENCES users(id)
             )
             """
         )
@@ -116,6 +119,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
         conn.execute("DROP TABLE withdrawals")
         conn.execute("ALTER TABLE withdrawals_new RENAME TO withdrawals")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_withdrawals_user_status_created ON withdrawals(user_id, status, created_at)")
 
     bot_cols = {row["name"] for row in conn.execute("PRAGMA table_info(bots)").fetchall()}
     if "telegram_username" not in bot_cols:

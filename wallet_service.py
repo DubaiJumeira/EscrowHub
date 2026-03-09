@@ -12,6 +12,7 @@ import sqlite3
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from config.settings import Settings
+from address_provider import build_address_provider
 from hd_wallet import HDWalletDeriver
 from ledger_service import LedgerService
 from price_service import CoinGeckoPriceService, StaticPriceService
@@ -39,6 +40,7 @@ class WalletService:
         self.conn = conn
         self.ledger = LedgerService(conn)
         self.hd = HDWalletDeriver()
+        self.address_provider = build_address_provider()
         self.price_service = CoinGeckoPriceService(ttl_seconds=60)
         self._fallback_price_service = StaticPriceService({"BTC": Decimal("65000"), "ETH": Decimal("3500"), "LTC": Decimal("80"), "USDT": Decimal("1")})
 
@@ -146,6 +148,9 @@ class WalletService:
                 asset = str(row["asset"])
                 user_id = int(row["user_id"])
                 stored = self._decrypt_field(row["address"])
+                provider_origin = str(row["provider_origin"] or "") if "provider_origin" in row.keys() else ""
+                if provider_origin and provider_origin != "legacy_seed":
+                    continue
                 if asset == "BTC":
                     derived = self.hd.derive_btc_address(user_id).public_address
                 elif asset == "LTC":
@@ -165,13 +170,9 @@ class WalletService:
     def assert_startup_deposit_issuance_ready(self) -> None:
         if not Settings.is_production:
             return
-        self.hd.validate_xpub_configuration()
-        # WARNING: Production startup is intentionally blocked until a real external address-derivation service is integrated.
-        # Secure alternative: wire a hardened HSM/address-service provider and validate issuance through that provider only.
-        raise RuntimeError(
-            "Production deposit issuance unavailable: no approved external derivation/address-service provider is configured. "
-            "Refusing startup to avoid false-green deposit readiness."
-        )
+        ready, error = self.address_provider.is_ready()
+        if not ready:
+            raise RuntimeError(error or "external address provider is not ready")
 
     def get_or_create_deposit_address(self, user_id: int, asset: str) -> DepositRoute:
         symbol = self._asset(asset)
@@ -179,6 +180,14 @@ class WalletService:
         row = self.conn.execute("SELECT * FROM wallet_addresses WHERE user_id=? AND asset=?", (resolved_user_id, symbol)).fetchone()
         if row:
             return DepositRoute(self._decrypt_field(row["address"]), row["asset"], row["chain_family"], row["destination_tag"], self._decrypt_field(row["derivation_path"]))
+
+        if Settings.is_production:
+            issued = self.address_provider.get_or_create_address(resolved_user_id, symbol)
+            self.conn.execute(
+                "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,derivation_index,destination_tag,derivation_path,provider_origin,provider_ref) VALUES(?,?,?,?,?,?,?,?,?)",
+                (resolved_user_id, symbol, self._chain_family(symbol), self._encrypt_field(issued.address), None, None, None, issued.provider_origin, issued.provider_ref),
+            )
+            return DepositRoute(issued.address, symbol, self._chain_family(symbol), None, None)
 
         if symbol == "BTC":
             k = self.hd.derive_btc_address(resolved_user_id)
@@ -190,8 +199,8 @@ class WalletService:
             raise RuntimeError(f"unsupported production derivation for {symbol}")
 
         self.conn.execute(
-            "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,derivation_index,destination_tag,derivation_path) VALUES(?,?,?,?,?,?,?)",
-            (resolved_user_id, symbol, self._chain_family(symbol), self._encrypt_field(k.public_address), resolved_user_id, None, self._encrypt_field(k.path)),
+            "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,derivation_index,destination_tag,derivation_path,provider_origin,provider_ref) VALUES(?,?,?,?,?,?,?,?,?)",
+            (resolved_user_id, symbol, self._chain_family(symbol), self._encrypt_field(k.public_address), resolved_user_id, None, self._encrypt_field(k.path), "legacy_seed", f"user:{resolved_user_id}:{symbol}"),
         )
         return DepositRoute(k.public_address, symbol, self._chain_family(symbol), None, k.path)
 
@@ -362,6 +371,43 @@ class WalletService:
             item["destination_address"] = self._decrypt_field(item.get("destination_address"))
             out.append(item)
         return out
+
+    def signer_retry_withdrawals(self, limit: int = 20):
+        rows = self.conn.execute(
+            "SELECT id,user_id,asset,amount,destination_address,failure_reason,created_at FROM withdrawals WHERE status='signer_retry' ORDER BY created_at ASC, id ASC LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            item["destination_address"] = self._decrypt_field(item.get("destination_address"))
+            out.append(item)
+        return out
+
+    def signer_retry_withdrawal(self, withdrawal_id: int):
+        row = self.conn.execute(
+            "SELECT id,user_id,asset,amount,destination_address,failure_reason,created_at,status FROM withdrawals WHERE id=?",
+            (int(withdrawal_id),),
+        ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["destination_address"] = self._decrypt_field(item.get("destination_address"))
+        return item
+
+    def set_withdrawal_status(self, withdrawal_id: int, status: str, reason: str | None = None) -> None:
+        row = self.conn.execute("SELECT * FROM withdrawals WHERE id=?", (int(withdrawal_id),)).fetchone()
+        if not row:
+            raise ValueError("withdrawal not found")
+        if row["status"] != "signer_retry":
+            raise ValueError("withdrawal is not in signer_retry")
+        if status == "pending":
+            self.conn.execute("UPDATE withdrawals SET status='pending', failure_reason=? WHERE id=?", ((reason or "requeued by admin")[:500], int(withdrawal_id)))
+            return
+        if status == "failed":
+            self.mark_withdrawal_failed(int(withdrawal_id), reason or "marked failed by admin")
+            return
+        raise ValueError("unsupported status transition")
 
     def mark_withdrawal_broadcasted(self, withdrawal_id: int, txid: str) -> None:
         self.conn.execute("UPDATE withdrawals SET status='broadcasted', txid=? WHERE id=?", (txid, withdrawal_id))

@@ -57,6 +57,22 @@ BASE_ASSETS = ["USDT", "BTC", "ETH", "LTC"]
 DEPOSIT_ISSUANCE_READY = True
 DEPOSIT_ISSUANCE_ERROR: str | None = None
 
+
+def _sanitize_destination_preview(address: str | None) -> str:
+    value = (address or "").strip()
+    if not value:
+        return "n/a"
+    if len(value) <= 12:
+        return value
+    return f"{value[:6]}...{value[-4:]}"
+
+
+def _sanitize_failure_summary(reason: str | None) -> str:
+    text = " ".join((reason or "").split())
+    if not text:
+        return "n/a"
+    return text[:120]
+
 WITHDRAWAL_STATUS_LABELS = {
     "pending": "Pending",
     "broadcasted": "Broadcasted",
@@ -2355,6 +2371,99 @@ async def watcher_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 
+
+
+async def signer_retry_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.effective_message.reply_text("Admin only")
+        return
+    conn, wallet, _, _ = _services()
+    try:
+        rows = wallet.signer_retry_withdrawals(limit=20)
+        if not rows:
+            await update.effective_message.reply_text("No signer_retry withdrawals.")
+            return
+        lines = ["Signer retry withdrawals (max 20):"]
+        for row in rows:
+            lines.append(
+                f"- id={row['id']} at={row['created_at']} asset={row['asset']} amount={row['amount']} "
+                f"dest={_sanitize_destination_preview(row.get('destination_address'))} reason={_sanitize_failure_summary(row.get('failure_reason'))}"
+            )
+        conn.execute(
+            "INSERT INTO admin_actions(admin_user_id,action_type,data_json) VALUES(?,?,?)",
+            (update.effective_user.id, "list_signer_retry", json.dumps({"count": len(rows)})),
+        )
+        conn.commit()
+        await update.effective_message.reply_text("\n".join(lines))
+    finally:
+        conn.close()
+
+
+async def signer_retry_detail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.effective_message.reply_text("Admin only")
+        return
+    if not update.message or not update.message.text:
+        await update.effective_message.reply_text("Usage: /signer_retry_detail <withdrawal_id>")
+        return
+    parts = update.message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        await update.effective_message.reply_text("Usage: /signer_retry_detail <withdrawal_id>")
+        return
+    withdrawal_id = int(parts[1].strip())
+    conn, wallet, _, _ = _services()
+    try:
+        row = wallet.signer_retry_withdrawal(withdrawal_id)
+        if not row or row.get("status") != "signer_retry":
+            await update.effective_message.reply_text("signer_retry withdrawal not found")
+            return
+        conn.execute(
+            "INSERT INTO admin_actions(admin_user_id,action_type,data_json) VALUES(?,?,?)",
+            (update.effective_user.id, "view_signer_retry_detail", json.dumps({"withdrawal_id": withdrawal_id})),
+        )
+        conn.commit()
+        await update.effective_message.reply_text("\n".join([
+                f"id: {row['id']}",
+                f"created_at: {row['created_at']}",
+                f"asset: {row['asset']}",
+                f"amount: {row['amount']}",
+                f"destination: {_sanitize_destination_preview(row.get('destination_address'))}",
+                f"failure: {_sanitize_failure_summary(row.get('failure_reason'))}",
+            ])
+        )
+    finally:
+        conn.close()
+
+
+async def signer_retry_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.effective_message.reply_text("Admin only")
+        return
+    if not update.message or not update.message.text:
+        await update.effective_message.reply_text("Usage: /signer_retry_action <withdrawal_id> <requeue|fail> CONFIRM")
+        return
+    parts = update.message.text.split()
+    if len(parts) < 4 or not parts[1].isdigit() or parts[3].upper() != "CONFIRM":
+        await update.effective_message.reply_text("Usage: /signer_retry_action <withdrawal_id> <requeue|fail> CONFIRM")
+        return
+    withdrawal_id = int(parts[1])
+    action = parts[2].strip().lower()
+    if action not in {"requeue", "fail"}:
+        await update.effective_message.reply_text("Action must be requeue or fail")
+        return
+    conn, wallet, _, _ = _services()
+    try:
+        target_status = "pending" if action == "requeue" else "failed"
+        wallet.set_withdrawal_status(withdrawal_id, target_status, f"admin action by {update.effective_user.id}")
+        conn.execute(
+            "INSERT INTO admin_actions(admin_user_id,action_type,data_json) VALUES(?,?,?)",
+            (update.effective_user.id, "resolve_signer_retry", json.dumps({"withdrawal_id": withdrawal_id, "action": action})),
+        )
+        conn.commit()
+        await update.effective_message.reply_text(f"Withdrawal {withdrawal_id} moved to {target_status}.")
+    finally:
+        conn.close()
+
 async def revenue_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_IDS:
         await update.effective_message.reply_text("Admin only")
@@ -3364,6 +3473,9 @@ def main() -> None:
     app.add_handler(CommandHandler("history", history))
     app.add_handler(CommandHandler("cancel", cancel_flow))
     app.add_handler(CommandHandler("watcher_status", watcher_status))
+    app.add_handler(CommandHandler("signer_retry_list", signer_retry_list))
+    app.add_handler(CommandHandler("signer_retry_detail", signer_retry_detail))
+    app.add_handler(CommandHandler("signer_retry_action", signer_retry_action))
     app.add_handler(CommandHandler("run_signer", run_signer))
     app.add_handler(CommandHandler("revenue", revenue_report))
     app.add_handler(CommandHandler("support", support_team))

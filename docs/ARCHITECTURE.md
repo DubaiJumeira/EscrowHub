@@ -27,12 +27,11 @@ Each escrow is bound to `bot_id`. Tenant config includes:
 - Internal immutable ledger entries track credits/debits/locks/releases
 - Withdrawals call `SignerService` boundary so private keys are outside Telegram process
 
-### Derivation and xpub constraint
-Current persisted derivation path contract uses hardened user nodes (`m/.../{user_id}'/...`). xpub-only derivation is not cryptographically valid for this contract and is rejected fail-closed at runtime.
+### Deposit issuance provider
+Production deposit addresses are issued by a dedicated external `AddressProvider` boundary (separate from withdrawal signing).
+Wallet rows persist immutable provider metadata (`provider_origin`, `provider_ref`) for audit and migration safety.
 
-Secure alternatives:
-- external address derivation/HSM service, or
-- explicit migration to an xpub-compatible non-hardened user index path.
+Non-production can still use legacy seed derivation for existing tests/dev flows. Production never derives new deposit addresses from local seed paths.
 
 ## Key modules
 

@@ -7,6 +7,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from config.settings import Settings
+from signer.errors import AmbiguousBroadcastError, DeterministicSigningError, SignerConfigurationError
 
 LOGGER = logging.getLogger(__name__)
 SUPPORTED_SIGNING_ASSETS = {"BTC", "LTC", "ETH", "USDT"}
@@ -28,7 +29,7 @@ class VaultSignerProvider(SignerProvider):
         if symbol not in SUPPORTED_SIGNING_ASSETS:
             raise ValueError(f"unsupported signing asset: {symbol}")
         if not self.addr or not self.token:
-            raise RuntimeError("Vault signer configuration missing")
+            raise SignerConfigurationError("Vault signer configuration missing")
 
         payload = {"input": f"{symbol}:{destination_address}:{amount}"}
         req = Request(
@@ -43,24 +44,18 @@ class VaultSignerProvider(SignerProvider):
                 if resp.status and int(resp.status) >= 400:
                     raise RuntimeError(f"vault signer http status={resp.status}")
         except (HTTPError, URLError, TimeoutError) as exc:
-            raise RuntimeError("vault signer request failed") from exc
+            raise AmbiguousBroadcastError("vault signer request failed") from exc
 
         if body.get("errors"):
-            raise RuntimeError("vault signer returned errors")
+            raise DeterministicSigningError("vault signer returned errors")
         # WARNING: Transit-only signing cannot produce a chain-valid tx payload + broadcast txid in this code path.
-        raise RuntimeError("incomplete signer path: no real transaction builder+broadcaster integration")
+        raise DeterministicSigningError("incomplete signer path: no real transaction builder+broadcaster integration")
 
 
 class DisabledSignerProvider(SignerProvider):
     def sign_and_broadcast(self, asset: str, destination_address: str, amount: str, user_id: int | None = None) -> str:
         # WARNING: Fake/non-chain signing is disabled to prevent fabricated withdrawals.
-        raise RuntimeError("signing provider disabled: configure a real chain-aware signer+broadcaster")
-
-
-def _is_ambiguous_signer_failure(exc: Exception) -> bool:
-    text = str(exc or "").lower()
-    indicators = ("timeout", "timed out", "temporar", "connection", "network", "unavailable", "request failed")
-    return any(token in text for token in indicators)
+        raise SignerConfigurationError("signing provider disabled: configure a real chain-aware signer+broadcaster")
 
 
 class SignerService:
@@ -92,10 +87,12 @@ class SignerService:
                 processed += 1
             except Exception as exc:
                 LOGGER.exception("withdrawal processing failed id=%s", w["id"])
-                if _is_ambiguous_signer_failure(exc):
-                    # WARNING: Ambiguous signer/provider failures may have broadcast side-effects; do not auto-release reserved funds.
-                    # Secure alternative: reconcile tx state with an authoritative broadcaster before releasing any balance.
+                if isinstance(exc, AmbiguousBroadcastError):
                     wallet_service.mark_withdrawal_signer_retry(int(w["id"]), str(exc))
-                else:
+                elif isinstance(exc, DeterministicSigningError):
                     wallet_service.mark_withdrawal_failed(int(w["id"]), str(exc))
+                else:
+                    # WARNING: Unclassified signer errors are treated as ambiguous to prevent accidental fund release.
+                    # Secure alternative: map provider failures to explicit typed exceptions and reconcile before any release path.
+                    wallet_service.mark_withdrawal_signer_retry(int(w["id"]), str(exc))
         return processed
