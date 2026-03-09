@@ -14,7 +14,7 @@ def _as_bool(name: str, default: str = "false") -> bool:
 class Settings:
     environment = os.getenv("APP_ENV", "dev")
     is_production = environment.lower() == "production"
-    database_url = os.getenv("DATABASE_URL", "").strip()
+    sqlite_db_path = os.getenv("SQLITE_DB_PATH", "").strip()
     encryption_key = os.getenv("ENCRYPTION_KEY", "")
     telegram_main_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
@@ -45,9 +45,7 @@ class Settings:
 
 if os.getenv("BOT_ID") and not os.getenv("ESCROWHUB_BOT_ID"):
     LOGGER.warning("BOT_ID is deprecated; use ESCROWHUB_BOT_ID")
-if Settings.is_production and not Settings.database_url:
-    raise RuntimeError("DATABASE_URL is required in production")
-if not Settings.database_url and not Settings.is_production:
-    Settings.database_url = "sqlite:///escrowhub.db"
+if Settings.is_production and not Settings.sqlite_db_path:
+    raise RuntimeError("SQLITE_DB_PATH is required in production")
 if not Settings.moderator_ids:
     LOGGER.warning("No moderator IDs configured; dispute moderation controls are disabled")

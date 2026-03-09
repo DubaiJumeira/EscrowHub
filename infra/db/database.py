@@ -1,14 +1,20 @@
 from __future__ import annotations
 
-import os
 import sqlite3
 from pathlib import Path
 
-DB_PATH = os.getenv("SQLITE_DB_PATH", str(Path("escrowhub.db").resolve()))
+from config.settings import Settings
+
+
+def _db_path() -> str:
+    configured = (Settings.sqlite_db_path or "").strip()
+    if configured:
+        return configured
+    return str(Path("escrowhub.db").resolve())
 
 
 def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(_db_path())
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
@@ -79,6 +85,37 @@ def init_db(conn: sqlite3.Connection) -> None:
     withdrawal_cols = {row["name"] for row in conn.execute("PRAGMA table_info(withdrawals)").fetchall()}
     if "failure_reason" not in withdrawal_cols:
         conn.execute("ALTER TABLE withdrawals ADD COLUMN failure_reason TEXT")
+
+    status_rows = conn.execute("PRAGMA table_info(withdrawals)").fetchall()
+    status_type = ""
+    for row in status_rows:
+        if row["name"] == "status":
+            status_type = str(row["type"] or "")
+            break
+    if "signer_retry" not in status_type:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS withdrawals_new (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id INTEGER NOT NULL,
+              asset TEXT NOT NULL CHECK(asset IN ('BTC','LTC','ETH','USDT')),
+              amount TEXT NOT NULL,
+              destination_address TEXT NOT NULL,
+              status TEXT NOT NULL CHECK(status IN ('pending','broadcasted','failed','signer_retry')),
+              txid TEXT,
+              failure_reason TEXT,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO withdrawals_new(id,user_id,asset,amount,destination_address,status,txid,failure_reason,created_at)
+            SELECT id,user_id,asset,amount,destination_address,status,txid,failure_reason,created_at FROM withdrawals
+            """
+        )
+        conn.execute("DROP TABLE withdrawals")
+        conn.execute("ALTER TABLE withdrawals_new RENAME TO withdrawals")
 
     bot_cols = {row["name"] for row in conn.execute("PRAGMA table_info(bots)").fetchall()}
     if "telegram_username" not in bot_cols:

@@ -366,6 +366,15 @@ class WalletService:
     def mark_withdrawal_broadcasted(self, withdrawal_id: int, txid: str) -> None:
         self.conn.execute("UPDATE withdrawals SET status='broadcasted', txid=? WHERE id=?", (txid, withdrawal_id))
 
+    def mark_withdrawal_signer_retry(self, withdrawal_id: int, reason: str) -> None:
+        row = self.conn.execute("SELECT * FROM withdrawals WHERE id=?", (withdrawal_id,)).fetchone()
+        if not row:
+            return
+        self.conn.execute(
+            "UPDATE withdrawals SET status=?, txid=NULL, failure_reason=? WHERE id=?",
+            ("signer_retry", (reason or "unknown signer/provider error")[:500], withdrawal_id),
+        )
+
     def mark_withdrawal_failed(self, withdrawal_id: int, reason: str) -> None:
         row = self.conn.execute("SELECT * FROM withdrawals WHERE id=?", (withdrawal_id,)).fetchone()
         if not row:

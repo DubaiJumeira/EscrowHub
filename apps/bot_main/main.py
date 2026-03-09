@@ -31,6 +31,13 @@ def build_handlers() -> MainBotHandlers:
 
 
 def main() -> None:
+    env = os.getenv("APP_ENV", "dev").strip().lower()
+    allow_legacy = os.getenv("ALLOW_LEGACY_BOT_MAIN", "false").strip().lower() == "true"
+    if env == "production":
+        raise RuntimeError("apps/bot_main/main.py is blocked in production. Use run_bot.py instead.")
+    if not allow_legacy:
+        raise RuntimeError("Legacy entrypoint blocked by default. Set ALLOW_LEGACY_BOT_MAIN=true in non-production to run it.")
+
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is required")

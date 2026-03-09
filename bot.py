@@ -54,6 +54,8 @@ def _parse_admin_ids() -> set[int]:
 ADMIN_IDS = _parse_admin_ids()
 
 BASE_ASSETS = ["USDT", "BTC", "ETH", "LTC"]
+DEPOSIT_ISSUANCE_READY = True
+DEPOSIT_ISSUANCE_ERROR: str | None = None
 
 
 def _enabled_assets() -> list[str]:
@@ -1042,6 +1044,10 @@ async def deposit_amount_input(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.effective_message.reply_text("Maximum deposit is $10,000 USD.")
         return DEPOSIT_ENTER_AMOUNT
 
+    if not DEPOSIT_ISSUANCE_READY:
+        await update.effective_message.reply_text("Deposit address issuance is currently unavailable. Please try again later.")
+        return ConversationHandler.END
+
     conn, wallet, tenant, escrow_service = _services()
     try:
         user_id = tenant.ensure_user(update.effective_user.id, update.effective_user.username)
@@ -1049,7 +1055,7 @@ async def deposit_amount_input(update: Update, context: ContextTypes.DEFAULT_TYP
             route = wallet.get_or_create_deposit_address(user_id, asset)
         except Exception:
             LOGGER.exception("deposit address issuance failed for user_id=%s asset=%s", user_id, asset)
-            await update.effective_message.reply_text("Deposit address is temporarily unavailable. Please try again later.")
+            await update.effective_message.reply_text("Deposit address issuance is currently unavailable. Please try again later.")
             return ConversationHandler.END
         price_usd = escrow_service.price_service.get_usd_price(asset)
         conn.commit()
@@ -3232,7 +3238,12 @@ def main() -> None:
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
 
-    run_startup_preflight("bot")
+    global DEPOSIT_ISSUANCE_READY, DEPOSIT_ISSUANCE_ERROR
+    preflight = run_startup_preflight("bot")
+    DEPOSIT_ISSUANCE_READY = bool(preflight.deposit_issuance_ready)
+    DEPOSIT_ISSUANCE_ERROR = preflight.deposit_issuance_error
+    if not DEPOSIT_ISSUANCE_READY:
+        LOGGER.warning("bot startup degraded mode: deposit issuance unavailable: %s", DEPOSIT_ISSUANCE_ERROR or "unknown")
 
     conv = ConversationHandler(
         entry_points=[
