@@ -14,7 +14,7 @@ def _as_bool(name: str, default: str = "false") -> bool:
 class Settings:
     environment = os.getenv("APP_ENV", "dev")
     is_production = environment.lower() == "production"
-    database_url = os.getenv("DATABASE_URL", "postgresql://escrow:escrow@localhost:5432/escrow")
+    database_url = os.getenv("DATABASE_URL", "").strip()
     encryption_key = os.getenv("ENCRYPTION_KEY", "")
     telegram_main_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
@@ -24,14 +24,11 @@ class Settings:
 
     bot_id = int(os.getenv("ESCROWHUB_BOT_ID", os.getenv("BOT_ID", "1")))
 
-    moderator_username = os.getenv("MODERATOR_USERNAME", os.getenv("ESCROWHUB_MODERATOR_USERNAME", "")).lstrip("@")
     moderator_ids = {
         int(v.strip())
         for v in os.getenv("MODERATOR_TELEGRAM_IDS", "").split(",")
         if v.strip().isdigit()
     }
-    # Backward compatibility alias; prefer `moderator_username`.
-    MODERATOR_USERNAME = moderator_username
 
     sol_enabled = _as_bool("SOL_ENABLED", "false")
     supported_assets = ("BTC", "LTC", "ETH", "USDT")
@@ -43,7 +40,9 @@ class Settings:
 
 if os.getenv("BOT_ID") and not os.getenv("ESCROWHUB_BOT_ID"):
     LOGGER.warning("BOT_ID is deprecated; use ESCROWHUB_BOT_ID")
-if os.getenv("ESCROWHUB_MODERATOR_USERNAME") and not os.getenv("MODERATOR_USERNAME"):
-    LOGGER.warning("ESCROWHUB_MODERATOR_USERNAME is deprecated; use MODERATOR_USERNAME")
-if not Settings.moderator_ids and not Settings.moderator_username:
+if Settings.is_production and not Settings.database_url:
+    raise RuntimeError("DATABASE_URL is required in production")
+if not Settings.database_url and not Settings.is_production:
+    Settings.database_url = "sqlite:///escrowhub.db"
+if not Settings.moderator_ids:
     LOGGER.warning("No moderator IDs configured; dispute moderation controls are disabled")

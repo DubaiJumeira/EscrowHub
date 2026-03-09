@@ -4,6 +4,8 @@ import json
 from dataclasses import dataclass
 from decimal import Decimal
 
+from config.settings import Settings
+
 from fee_service import FeeBreakdown, FeeService
 from price_service import PriceService, StaticPriceService, validate_minimum_escrow_usd
 from tenant_service import TenantService
@@ -41,6 +43,11 @@ class EscrowService:
             raise ValueError("buyer cannot create deal with self")
         validate_minimum_escrow_usd(self.price_service, asset, Decimal(amount))
         amount = Decimal(amount)
+        description = (description or "").strip()
+        if not description:
+            raise ValueError("description is required")
+        if len(description) > 500:
+            raise ValueError("description is too long (max 500 chars)")
         fees = self.fee_service.calculate_total_fees(amount, tenant.bot_extra_fee_percent)
         managed_tx = not bool(getattr(self.conn, "in_transaction", False))
         if managed_tx:
@@ -102,18 +109,35 @@ class EscrowService:
         return EscrowView(escrow_id, int(row["bot_id"]), int(row["buyer_id"]), int(row["seller_id"]), row["asset"], amount, row["status"], fees, row["description"] or "")
 
     def release(self, escrow_id: int, actor_user_id: int) -> EscrowView:
-        row = self._escrow(escrow_id)
-        if row["status"] != "active":
-            raise ValueError("escrow must be active")
-        if int(row["buyer_id"]) != int(actor_user_id):
-            raise ValueError("only buyer can release own escrow")
+        managed_tx = not bool(getattr(self.conn, "in_transaction", False))
+        if managed_tx:
+            self.conn.execute("BEGIN IMMEDIATE")
+        else:
+            self.conn.execute("SAVEPOINT escrow_release")
+        try:
+            row = self._escrow(escrow_id)
+            if row["status"] != "active":
+                raise ValueError("escrow must be active")
+            if int(row["buyer_id"]) != int(actor_user_id):
+                raise ValueError("only buyer can release own escrow")
 
-        tenant = self.tenant_service.get_tenant(int(row["bot_id"]))
-        amount = Decimal(row["amount"])
-        fees = self.fee_service.calculate_total_fees(amount, tenant.bot_extra_fee_percent)
-        self.wallet_service.release_escrow(escrow_id, int(row["seller_id"]), fees.platform_fee, fees.bot_fee, fees.seller_payout, tenant.owner_user_id, row["asset"])
-        self.conn.execute("UPDATE escrows SET status='completed', updated_at=CURRENT_TIMESTAMP WHERE id=?", (escrow_id,))
-        self._event(escrow_id, "released", {"seller_payout": str(fees.seller_payout), "actor_user_id": actor_user_id})
+            tenant = self.tenant_service.get_tenant(int(row["bot_id"]))
+            amount = Decimal(row["amount"])
+            fees = self.fee_service.calculate_total_fees(amount, tenant.bot_extra_fee_percent)
+            self.wallet_service.release_escrow(escrow_id, int(row["seller_id"]), fees.platform_fee, fees.bot_fee, fees.seller_payout, tenant.owner_user_id, row["asset"])
+            self.conn.execute("UPDATE escrows SET status='completed', updated_at=CURRENT_TIMESTAMP WHERE id=?", (escrow_id,))
+            self._event(escrow_id, "released", {"seller_payout": str(fees.seller_payout), "actor_user_id": actor_user_id})
+            if managed_tx:
+                self.conn.commit()
+            else:
+                self.conn.execute("RELEASE SAVEPOINT escrow_release")
+        except Exception:
+            if managed_tx:
+                self.conn.rollback()
+            else:
+                self.conn.execute("ROLLBACK TO SAVEPOINT escrow_release")
+                self.conn.execute("RELEASE SAVEPOINT escrow_release")
+            raise
         return EscrowView(escrow_id, int(row["bot_id"]), int(row["buyer_id"]), int(row["seller_id"]), row["asset"], amount, "completed", fees, row["description"] or "")
 
     def dispute(self, escrow_id: int, opened_by_user_id: int, reason: str) -> None:
@@ -174,6 +198,8 @@ class EscrowService:
             raise
 
     def resolve_dispute(self, escrow_id: int, admin_user_id: int, resolution: str, split_percent: Decimal = Decimal("50")) -> None:
+        if int(admin_user_id) not in Settings.moderator_ids:
+            raise PermissionError("unauthorized moderator")
         managed_tx = not bool(getattr(self.conn, "in_transaction", False))
         if managed_tx:
             self.conn.execute("BEGIN IMMEDIATE")

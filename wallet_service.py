@@ -3,13 +3,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import base64
+import hashlib
+import json
+import os
 import sqlite3
-import re
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from config.settings import Settings
 from hd_wallet import HDWalletDeriver
 from ledger_service import LedgerService
-from price_service import StaticPriceService
+from price_service import CoinGeckoPriceService, StaticPriceService
 
 SUPPORTED_ASSETS = set(Settings.supported_assets)
 NETWORK_LABELS = {
@@ -34,7 +39,8 @@ class WalletService:
         self.conn = conn
         self.ledger = LedgerService(conn)
         self.hd = HDWalletDeriver()
-        self.price_service = StaticPriceService({"BTC": Decimal("65000"), "ETH": Decimal("3500"), "LTC": Decimal("80"), "USDT": Decimal("1")})
+        self.price_service = CoinGeckoPriceService(ttl_seconds=60)
+        self._fallback_price_service = StaticPriceService({"BTC": Decimal("65000"), "ETH": Decimal("3500"), "LTC": Decimal("80"), "USDT": Decimal("1")})
 
     @staticmethod
     def _asset(asset: str) -> str:
@@ -56,6 +62,37 @@ class WalletService:
         cur = self.conn.execute("INSERT INTO users(telegram_id, username, frozen) VALUES(?,?,0)", (user_ref, None))
         return int(cur.lastrowid)
 
+
+    def _aead(self):
+        key = (Settings.encryption_key or "").strip()
+        if not key:
+            if Settings.is_production:
+                raise RuntimeError("ENCRYPTION_KEY is required in production")
+            return None
+        raw = hashlib.sha256(key.encode()).digest()
+        return AESGCM(raw)
+
+    def _encrypt_field(self, value: str) -> str:
+        aead = self._aead()
+        if aead is None:
+            return value
+        nonce = os.urandom(12)
+        ct = aead.encrypt(nonce, value.encode(), None)
+        payload = base64.b64encode(nonce + ct).decode()
+        return f"enc:{payload}"
+
+    def _decrypt_field(self, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not str(value).startswith("enc:"):
+            return value
+        aead = self._aead()
+        if aead is None:
+            raise RuntimeError("encrypted data present but ENCRYPTION_KEY is not configured")
+        raw = base64.b64decode(str(value)[4:].encode())
+        nonce, ct = raw[:12], raw[12:]
+        return aead.decrypt(nonce, ct, None).decode()
+
     def _assert_not_frozen(self, resolved_user_id: int) -> None:
         row = self.conn.execute("SELECT frozen FROM users WHERE id=?", (resolved_user_id,)).fetchone()
         if row and int(row["frozen"]):
@@ -66,7 +103,7 @@ class WalletService:
         resolved_user_id = self._ensure_user_row(user_id)
         row = self.conn.execute("SELECT * FROM wallet_addresses WHERE user_id=? AND asset=?", (resolved_user_id, symbol)).fetchone()
         if row:
-            return DepositRoute(row["address"], row["asset"], row["chain_family"], row["destination_tag"], row["derivation_path"])
+            return DepositRoute(self._decrypt_field(row["address"]), row["asset"], row["chain_family"], row["destination_tag"], self._decrypt_field(row["derivation_path"]))
 
         if symbol == "BTC":
             k = self.hd.derive_btc_address(resolved_user_id)
@@ -79,7 +116,7 @@ class WalletService:
 
         self.conn.execute(
             "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,derivation_index,destination_tag,derivation_path) VALUES(?,?,?,?,?,?,?)",
-            (resolved_user_id, symbol, self._chain_family(symbol), k.public_address, resolved_user_id, None, k.path),
+            (resolved_user_id, symbol, self._chain_family(symbol), self._encrypt_field(k.public_address), resolved_user_id, None, self._encrypt_field(k.path)),
         )
         return DepositRoute(k.public_address, symbol, self._chain_family(symbol), None, k.path)
 
@@ -136,16 +173,36 @@ class WalletService:
         address = (destination_address or "").strip()
         if not address:
             raise ValueError("destination address is required")
+        try:
+            import bip_utils
+            from eth_utils import is_address, is_checksum_address
+        except Exception as exc:
+            raise RuntimeError("address validation dependencies are missing") from exc
 
-        patterns = {
-            "ETH": r"^0x[a-fA-F0-9]{40}$",
-            "USDT": r"^0x[a-fA-F0-9]{40}$",
-            "BTC": r"^(bc1[ac-hj-np-z02-9]{11,71}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})$",
-            "LTC": r"^(ltc1[ac-hj-np-z02-9]{11,71}|[LM3][a-km-zA-HJ-NP-Z1-9]{26,34})$",
-        }
-        if not re.match(patterns[symbol], address):
+        if symbol in {"ETH", "USDT"}:
+            if not is_address(address):
+                raise ValueError("Invalid destination address for ETH")
+            if any(c.isalpha() for c in address[2:]) and not is_checksum_address(address):
+                raise ValueError("Invalid checksum for Ethereum address")
+            return
+
+        try:
+            if symbol == "BTC":
+                bip_utils.P2WPKHAddrDecoder.DecodeAddr(address, net_ver=bip_utils.BtcAddrConst.P2WPKH_HRP)
+                return
+            if symbol == "LTC":
+                bip_utils.P2WPKHAddrDecoder.DecodeAddr(address, net_ver=bip_utils.LtcAddrConst.P2WPKH_HRP)
+                return
+        except Exception:
+            pass
+        try:
+            if symbol == "BTC":
+                bip_utils.P2PKHAddrDecoder.DecodeAddr(address, net_ver=bip_utils.BtcAddrConst.P2PKH_NET_VER.Main())
+            else:
+                bip_utils.P2PKHAddrDecoder.DecodeAddr(address, net_ver=bip_utils.LtcAddrConst.P2PKH_NET_VER.Main())
+        except Exception as exc:
             network = NETWORK_LABELS.get(symbol, symbol)
-            raise ValueError(f"Invalid destination address for {network}")
+            raise ValueError(f"Invalid destination address for {network}") from exc
 
     def validate_withdrawal_address(self, asset: str, destination_address: str) -> None:
         self._validate_withdrawal_address(asset, destination_address)
@@ -159,7 +216,10 @@ class WalletService:
         total = Decimal("0")
         for row in rows:
             amount = Decimal(str(row["amount"] or "0"))
-            total += self.price_service.get_usd_value(str(row["asset"]), amount)
+            try:
+                total += self.price_service.get_usd_value(str(row["asset"]), amount)
+            except Exception:
+                total += self._fallback_price_service.get_usd_value(str(row["asset"]), amount)
         return total
 
     def request_withdrawal(self, user_id: int, asset: str, amount: Decimal, destination_address: str):
@@ -189,14 +249,18 @@ class WalletService:
                         raise ValueError("withdrawals are rate-limited; try again shortly")
 
             daily_limit = Decimal(Settings.withdrawal_daily_limit_usd)
-            if self._withdrawn_usd_last_24h(resolved_user_id) + amt > daily_limit:
+            try:
+                request_usd = self.price_service.get_usd_value(symbol, amt)
+            except Exception:
+                request_usd = self._fallback_price_service.get_usd_value(symbol, amt)
+            if self._withdrawn_usd_last_24h(resolved_user_id) + request_usd > daily_limit:
                 raise ValueError("daily withdrawal limit exceeded")
 
             if self.ledger.available_balance(resolved_user_id, symbol) < amt:
                 raise ValueError("insufficient available balance")
             cur = self.conn.execute(
                 "INSERT INTO withdrawals(user_id,asset,amount,destination_address,status) VALUES(?,?,?,?,?)",
-                (resolved_user_id, symbol, str(amt), destination_address, "pending"),
+                (resolved_user_id, symbol, str(amt), self._encrypt_field(destination_address), "pending"),
             )
             wid = int(cur.lastrowid)
             self.ledger.add_entry("USER", resolved_user_id, resolved_user_id, symbol, -amt, "WITHDRAWAL_RESERVE", "withdrawal", wid)
@@ -214,7 +278,13 @@ class WalletService:
             raise
 
     def pending_withdrawals(self):
-        return self.conn.execute("SELECT * FROM withdrawals WHERE status='pending'").fetchall()
+        rows = self.conn.execute("SELECT * FROM withdrawals WHERE status='pending'").fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            item["destination_address"] = self._decrypt_field(item.get("destination_address"))
+            out.append(item)
+        return out
 
     def mark_withdrawal_broadcasted(self, withdrawal_id: int, txid: str) -> None:
         self.conn.execute("UPDATE withdrawals SET status='broadcasted', txid=? WHERE id=?", (txid, withdrawal_id))

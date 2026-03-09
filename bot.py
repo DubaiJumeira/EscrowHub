@@ -1850,6 +1850,13 @@ async def deal_conditions_input(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode=ParseMode.HTML,
         )
         return DEAL_ENTER_CONDITIONS
+    if len(conditions) > 500:
+        await update.effective_message.reply_text(
+            _deal_conditions_prompt("Conditions are too long. Maximum is 500 characters."),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="deal_back_to_amount")]]),
+            parse_mode=ParseMode.HTML,
+        )
+        return DEAL_ENTER_CONDITIONS
 
     conn, _, tenant, escrow = _services()
     try:
@@ -2842,6 +2849,9 @@ async def esc_dispute_submit_handler(update: Update, context: ContextTypes.DEFAU
     reason = context.user_data.get("dispute_reason", "No reason provided")
     context.user_data.pop("dispute_reason", None)
 
+    if await _enforce_rate_limit(query, query.from_user.id, "open_dispute", limit=2, window_s=60):
+        return
+
     conn, _, tenant, escrow_svc = _services()
     try:
         user_id = _resolve_user_id(conn, update.effective_user.id)
@@ -2987,19 +2997,7 @@ async def esc_view_active_handler(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def _is_moderator(telegram_id: int) -> bool:
-    if telegram_id in Settings.moderator_ids:
-        return True
-    if Settings.is_production:
-        return False
-    moderator = (Settings.moderator_username or "").strip().lstrip("@")
-    if not moderator:
-        return False
-    conn, _, _, _ = _services()
-    try:
-        row = conn.execute("SELECT telegram_id FROM users WHERE username=?", (moderator,)).fetchone()
-        return bool(row and int(row["telegram_id"]) == telegram_id)
-    finally:
-        conn.close()
+    return int(telegram_id) in Settings.moderator_ids
 
 
 async def mod_resolve_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
