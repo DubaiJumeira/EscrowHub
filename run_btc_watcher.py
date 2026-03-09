@@ -5,6 +5,7 @@ import os
 import time
 
 from infra.db.database import get_connection, init_db
+from runtime_preflight import run_startup_preflight
 from wallet_service import WalletService
 from watcher_status_service import upsert_watcher_status
 from watchers.btc_watcher import run_once
@@ -15,7 +16,6 @@ LOGGER = logging.getLogger("run_btc_watcher")
 
 def _address_map(conn) -> dict[str, int]:
     wallet = WalletService(conn)
-    wallet.verify_address_derivation_consistency(sample_size=25)
     return wallet.monitored_deposit_address_map(["BTC"])
 
 
@@ -26,6 +26,7 @@ def main() -> None:
         return
     interval = int(os.getenv("WATCHER_POLL_INTERVAL_SECONDS", "30"))
     LOGGER.info("starting BTC watcher loop with interval=%ss", interval)
+    run_startup_preflight("btc_watcher")
 
     while True:
         conn = get_connection()

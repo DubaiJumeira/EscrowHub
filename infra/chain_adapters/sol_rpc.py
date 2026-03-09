@@ -1,16 +1,9 @@
 from __future__ import annotations
 
-import os
+# WARNING: SOL adapter is quarantined and intentionally not part of active runtime asset support (BTC/LTC/ETH/USDT only).
+# Secure alternative: use a vetted chain adapter with strict finality and tx validation if SOL support is reintroduced.
 
-from infra.chain_adapters.base import ChainAdapter
 
-
-class SolRpcAdapter(ChainAdapter):
+class SolRpcAdapter:
     def __init__(self) -> None:
-        self.rpc_url = os.getenv("SOL_RPC_URL", "")
-
-    def fetch_deposits(self):
-        return []
-
-    def broadcast_raw_transaction(self, asset: str, raw_tx_hex: str) -> str:
-        return ""
+        raise RuntimeError("SOL adapter is quarantined: unsupported asset runtime path disabled")

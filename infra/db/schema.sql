@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS withdrawals (
   destination_address TEXT NOT NULL,
   status TEXT NOT NULL CHECK(status IN ('pending','broadcasted','failed')),
   txid TEXT,
+  failure_reason TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY(user_id) REFERENCES users(id)
 );

@@ -14,6 +14,8 @@ from wallet_service import WalletService
 from watcher_status_service import read_watcher_cursor, write_watcher_cursor
 import bot
 import run_signer
+import run_btc_watcher
+import run_eth_watcher
 from runtime_preflight import run_startup_preflight
 from watchers.sweep_job import run_once as run_sweep_once
 
@@ -310,3 +312,70 @@ def test_agents_line_exactly_once():
     text = open("AGENTS.md", "r", encoding="utf-8").read()
     line = "When you find a security vunerabilty, flag it immediately with a WARNING comment and suggest a secure alternative. Never implement insecure patters even if asked."
     assert text.count(line) == 1
+
+
+def test_preflight_fails_closed_when_production_deposit_issuance_unavailable(monkeypatch, tmp_path):
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "prod.sqlite3"))
+    monkeypatch.setattr(Settings, "is_production", True)
+    monkeypatch.setattr(Settings, "btc_xpub", "")
+    monkeypatch.setattr(Settings, "ltc_xpub", "")
+    monkeypatch.setattr(Settings, "eth_xpub", "")
+    with pytest.raises(RuntimeError, match="Production deposit issuance unavailable"):
+        run_startup_preflight("bot")
+
+
+def test_watcher_entrypoints_run_full_startup_preflight(monkeypatch):
+    calls = []
+    monkeypatch.setattr(run_btc_watcher, "run_startup_preflight", lambda s: calls.append(("btc", s)))
+    monkeypatch.setattr(run_eth_watcher, "run_startup_preflight", lambda s: calls.append(("eth", s)))
+    monkeypatch.setenv("BTC_WATCHER_ENABLED", "false")
+    monkeypatch.setenv("ETH_WATCHER_ENABLED", "false")
+    run_btc_watcher.main()
+    run_eth_watcher.main()
+    assert ("btc", "btc_watcher") not in calls
+    monkeypatch.setenv("BTC_WATCHER_ENABLED", "true")
+    monkeypatch.setenv("ETH_WATCHER_ENABLED", "true")
+    monkeypatch.setattr(run_btc_watcher, "get_connection", lambda: (_ for _ in ()).throw(RuntimeError("stop-btc")))
+    monkeypatch.setattr(run_eth_watcher, "get_connection", lambda: (_ for _ in ()).throw(RuntimeError("stop-eth")))
+    with pytest.raises(RuntimeError, match="stop-btc"):
+        run_btc_watcher.main()
+    with pytest.raises(RuntimeError, match="stop-eth"):
+        run_eth_watcher.main()
+    assert ("btc", "btc_watcher") in calls
+    assert ("eth", "eth_watcher") in calls
+
+
+def test_db_username_normalization_collision_fails_clearly(tmp_path):
+    db = tmp_path / "collision.db"
+    c = sqlite3.connect(db)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA foreign_keys=ON")
+    c.execute("CREATE TABLE bots (id INTEGER PRIMARY KEY, owner_user_id INTEGER NOT NULL, bot_extra_fee_percent TEXT NOT NULL DEFAULT '0', support_contact TEXT, display_name TEXT NOT NULL, telegram_username TEXT, created_at TEXT)")
+    c.execute("INSERT INTO bots(id, owner_user_id, bot_extra_fee_percent, display_name, telegram_username) VALUES(?,?,?,?,?)", (1, 1, "0", "A", "Foo"))
+    c.execute("INSERT INTO bots(id, owner_user_id, bot_extra_fee_percent, display_name, telegram_username) VALUES(?,?,?,?,?)", (2, 1, "0", "B", "@foo"))
+    with pytest.raises(RuntimeError, match="normalization collision"):
+        init_db(c)
+    c.close()
+
+
+def test_db_rejects_invalid_asset_chain_family_combo(conn):
+    with pytest.raises(sqlite3.IntegrityError, match="asset/chain_family"):
+        conn.execute(
+            "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,derivation_index,destination_tag,derivation_path) VALUES(?,?,?,?,?,?,?)",
+            (1, "USDT", "BTC", "bad", 1, None, None),
+        )
+
+
+def test_withdrawal_failure_reason_stored_without_txid(conn):
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(4242)
+    conn.execute(
+        "INSERT INTO withdrawals(user_id,asset,amount,destination_address,status) VALUES(?,?,?,?,?)",
+        (uid, "USDT", "1", wallet._encrypt_field("0x" + "1" * 40), "pending"),
+    )
+    wid = conn.execute("SELECT id FROM withdrawals WHERE user_id=?", (uid,)).fetchone()["id"]
+    wallet.mark_withdrawal_failed(int(wid), "provider internals: boom")
+    row = conn.execute("SELECT status, txid, failure_reason FROM withdrawals WHERE id=?", (wid,)).fetchone()
+    assert row["status"] == "failed"
+    assert row["txid"] is None
+    assert "provider internals" in row["failure_reason"]

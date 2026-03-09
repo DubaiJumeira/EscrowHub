@@ -30,7 +30,6 @@ class Settings:
         if v.strip().isdigit()
     }
 
-    sol_enabled = _as_bool("SOL_ENABLED", "false")
     supported_assets = ("BTC", "LTC", "ETH", "USDT")
     withdrawal_daily_limit_usd = os.getenv("WITHDRAWAL_DAILY_LIMIT_USD", "5000").strip()
     withdrawal_min_interval_seconds = int(os.getenv("WITHDRAWAL_MIN_INTERVAL_SECONDS", "30"))

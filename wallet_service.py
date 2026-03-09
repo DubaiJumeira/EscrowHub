@@ -162,6 +162,17 @@ class WalletService:
             # Secure alternative: migrate addresses with explicit per-row derivation metadata and verified replay before production startup.
             raise RuntimeError("wallet derivation mismatch detected; abort startup and run migration: " + ", ".join(mismatches[:5]))
 
+    def assert_startup_deposit_issuance_ready(self) -> None:
+        if not Settings.is_production:
+            return
+        self.hd.validate_xpub_configuration()
+        # WARNING: Production startup is intentionally blocked until a real external address-derivation service is integrated.
+        # Secure alternative: wire a hardened HSM/address-service provider and validate issuance through that provider only.
+        raise RuntimeError(
+            "Production deposit issuance unavailable: no approved external derivation/address-service provider is configured. "
+            "Refusing startup to avoid false-green deposit readiness."
+        )
+
     def get_or_create_deposit_address(self, user_id: int, asset: str) -> DepositRoute:
         symbol = self._asset(asset)
         resolved_user_id = self._ensure_user_row(user_id)
@@ -359,7 +370,10 @@ class WalletService:
         row = self.conn.execute("SELECT * FROM withdrawals WHERE id=?", (withdrawal_id,)).fetchone()
         if not row:
             return
-        self.conn.execute("UPDATE withdrawals SET status=?, txid=? WHERE id=?", ("failed", f"ERROR: {reason}"[:255], withdrawal_id))
+        self.conn.execute(
+            "UPDATE withdrawals SET status=?, txid=NULL, failure_reason=? WHERE id=?",
+            ("failed", (reason or "unknown failure")[:500], withdrawal_id),
+        )
         self.ledger.add_entry("USER", row["user_id"], row["user_id"], row["asset"], Decimal(row["amount"]), "WITHDRAWAL_RELEASE", "withdrawal", withdrawal_id)
 
     def platform_revenue_balances(self) -> dict[str, Decimal]:
