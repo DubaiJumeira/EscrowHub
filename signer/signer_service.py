@@ -98,6 +98,23 @@ class SignerService:
     def process_pending_withdrawals(self, wallet_service) -> int:
         return self.process_withdrawals(wallet_service)
 
+    def reconcile_withdrawal_by_id(self, wallet_service, withdrawal_id: int) -> int:
+        ready, reason = self.readiness()
+        if not ready:
+            LOGGER.info("targeted reconciliation skipped: %s", reason or "not ready")
+            return 0
+        submitted_after_s, broadcasted_after_s, signer_retry_after_s = self._reconcile_intervals()
+        row = wallet_service.unresolved_withdrawal_for_reconcile_by_id(
+            int(withdrawal_id),
+            submitted_after_s=submitted_after_s,
+            broadcasted_after_s=broadcasted_after_s,
+            signer_retry_after_s=signer_retry_after_s,
+        )
+        if not row:
+            # WARNING: targeted reconcile fails closed when row is missing or not yet eligible under backoff gates.
+            return 0
+        return self._reconcile_single(wallet_service, row)
+
     def _execute_single(self, wallet_service, w: dict) -> int:
         try:
             idem = str(w.get("idempotency_key") or "").strip()

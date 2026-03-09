@@ -76,13 +76,13 @@ Withdrawals remain disabled by default. If enabled for controlled testing, ambig
 - `/watcher_status` for provider + signer + backlog health.
 - `/signer_retry_list` for signer_retry backlog summary.
 - `/unresolved_withdrawals` for pending/submitted/broadcasted/signer_retry list.
-- `/withdrawal_reconcile <withdrawal_id> CONFIRM` for explicit reconciliation cycle trigger.
+- `/withdrawal_reconcile <withdrawal_id> CONFIRM` for explicit single-withdrawal reconciliation trigger (targeted; unrelated unresolved rows are not processed).
 - `/signer_retry_action <withdrawal_id> <requeue|fail> CONFIRM` for explicit state action.
 
 
 - Startup preflight is fail-closed for route-integrity/collision/tampering failures across bot, watchers, and signer; these conditions abort startup.
 - Withdrawal idempotency keys are bound per withdrawal row (`wdrow:<id>:...`), allowing legitimate repeated identical business-field withdrawals.
-- Signer reconciliation uses status-aware backoff (`submitted` shorter, `broadcasted` moderate, `signer_retry` slower) gated by `last_reconciled_at`.
+- Signer reconciliation uses status-aware backoff (`submitted` shorter, `broadcasted` moderate, `signer_retry` slower): first attempt is delayed from state timestamp (`submitted_at`/`broadcasted_at`/creation), and all subsequent retries are gated by `last_reconciled_at`.
 - Withdrawal provider identity (`provider_origin`, `provider_ref`) is immutable once assigned and cannot be rebound across withdrawals.
 - External withdrawal provider deployment is still required for true go-live; repo hardening does not replace real custody infrastructure.
 

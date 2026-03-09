@@ -4,7 +4,7 @@ import logging
 import time
 
 from bot import main as bot_main
-from runtime_preflight import PreflightIntegrityError
+from runtime_preflight import FatalStartupError, PreflightIntegrityError
 from signer.errors import SignerConfigurationError
 
 
@@ -13,17 +13,7 @@ LOGGER = logging.getLogger("run_bot")
 
 
 def _is_fatal_startup_error(exc: Exception) -> bool:
-    return isinstance(exc, (PreflightIntegrityError, SignerConfigurationError, RuntimeError)) and any(
-        marker in str(exc).lower()
-        for marker in (
-            "startup aborted",
-            "preflight",
-            "token is required",
-            "configured bot tenant missing",
-            "route integrity",
-            "provider",
-        )
-    )
+    return isinstance(exc, (PreflightIntegrityError, SignerConfigurationError, FatalStartupError))
 
 
 def main() -> None:

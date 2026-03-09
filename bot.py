@@ -25,7 +25,7 @@ from escrow_service import EscrowService
 from error_sanitizer import sanitize_runtime_error
 from infra.db.database import get_connection, init_db
 from signer.signer_service import SignerService
-from runtime_preflight import PreflightIntegrityError, run_startup_preflight
+from runtime_preflight import FatalStartupError, PreflightIntegrityError, run_startup_preflight
 from tenant_service import TenantService
 from wallet_service import NETWORK_LABELS, WalletService
 from watcher_status_service import read_watcher_status
@@ -2521,7 +2521,11 @@ async def withdrawal_reconcile(update: Update, context: ContextTypes.DEFAULT_TYP
         if not row or row["status"] not in {"submitted", "broadcasted", "signer_retry"}:
             await update.effective_message.reply_text("Withdrawal is not in a reconcilable state")
             return
-        count = SignerService().process_withdrawals(wallet)
+        signer = SignerService()
+        count = signer.reconcile_withdrawal_by_id(wallet, wid)
+        if count == 0:
+            await update.effective_message.reply_text("Withdrawal is not in a reconcilable state")
+            return
         conn.execute("INSERT INTO admin_actions(admin_user_id,action_type,data_json) VALUES(?,?,?)", (update.effective_user.id, "withdrawal_reconcile", json.dumps({"withdrawal_id": wid, "processed": count})))
         conn.commit()
         await update.effective_message.reply_text(f"Reconciliation cycle complete (processed={count}).")
@@ -3455,7 +3459,7 @@ async def esc_view_dispute_handler(update: Update, context: ContextTypes.DEFAULT
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
+        raise FatalStartupError("TELEGRAM_BOT_TOKEN is required")
 
     global DEPOSIT_ISSUANCE_READY, DEPOSIT_ISSUANCE_ERROR
     try:

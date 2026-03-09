@@ -24,6 +24,10 @@ class PreflightStatus:
     signer_loop_degraded: bool = False
 
 
+class FatalStartupError(RuntimeError):
+    """Typed fatal startup configuration error."""
+
+
 class PreflightIntegrityError(RuntimeError):
     """Raised when startup integrity checks fail closed."""
 
