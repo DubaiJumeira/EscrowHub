@@ -811,3 +811,23 @@ def test_watcher_status_command_includes_signer_and_backlog(monkeypatch, conn):
     assert "Deposit issuance readiness" in text
     assert "Signer retry backlog" in text
     assert "total in signer_retry: 1" in text
+
+
+def test_withdrawal_idempotency_key_persisted_on_request(conn):
+    Settings.withdrawals_enabled = True
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(92001)
+    wallet.ledger.add_entry("USER", uid, uid, "USDT", Decimal("20"), "DEPOSIT", "deposit", 1)
+    wd = wallet.request_withdrawal(uid, "USDT", Decimal("2"), "0x1111111111111111111111111111111111111111")
+    row = conn.execute("SELECT idempotency_key FROM withdrawals WHERE id=?", (wd["id"],)).fetchone()
+    assert row["idempotency_key"].startswith("wdreq:")
+
+
+def test_withdrawn_usd_last_24h_counts_submitted_state(conn):
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(92002)
+    conn.execute(
+        "INSERT INTO withdrawals(user_id,asset,amount,destination_address,status,idempotency_key) VALUES(?,?,?,?,?,?)",
+        (uid, "USDT", "25", "enc", "submitted", "k1"),
+    )
+    assert wallet._withdrawn_usd_last_24h(uid) >= Decimal("25")

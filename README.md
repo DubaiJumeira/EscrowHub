@@ -38,7 +38,7 @@ Service preflight is role-aware: bot may run in degraded mode when new deposit i
 
 `apps/bot_main/main.py` is a quarantined legacy entrypoint and is blocked in production; use `run_bot.py`.
 
-Withdrawals remain disabled by default (`WITHDRAWALS_ENABLED=false`).
+Withdrawals remain disabled by default (`WITHDRAWALS_ENABLED=false`). When enabled, runtime uses external `WITHDRAWAL_PROVIDER=http` only.
 
 See `docs/RUNBOOK.md` for setup and operations.
 
@@ -48,8 +48,8 @@ Runtime, DB constraints, and tests support only: **BTC, LTC, ETH, USDT**.
 
 ## Withdrawal provider contract (production-safe)
 Withdrawals use a typed signer boundary with deterministic idempotency keys (`wd:<id>:<hash>`), validated request payloads, and explicit result statuses:
-- success-like: `submitted|broadcasted|confirmed` (must include txid)
+- success-like: `submitted|broadcasted|confirmed` (`submitted` may omit txid; `broadcasted|confirmed` require txid)
 - deterministic failure: `rejected|permanent_failure` (safe to release reservation)
 - unresolved: `retryable|ambiguous|unknown` (forced to `signer_retry`, funds remain reserved)
 
-Unknown/malformed provider outcomes fail closed to `signer_retry`.
+Withdrawal rows persist: `provider_origin`, `provider_ref`, `idempotency_key`, `external_status`, `submitted_at`, `broadcasted_at`, `last_reconciled_at`, and optional sanitized `tx_metadata_json`. Unknown/malformed provider outcomes fail closed to `signer_retry`.

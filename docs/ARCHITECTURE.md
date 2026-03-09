@@ -61,7 +61,8 @@ Non-production can still use legacy seed derivation for existing tests/dev flows
 - Signer preflight validates DB safety + typed withdrawal-provider readiness.
 
 ### Withdrawal state machine safety
-Statuses: `pending -> broadcasted|failed|signer_retry`.
-- `failed` is only used for deterministic failures.
+Internal statuses: `pending -> submitted -> broadcasted -> confirmed` with fail paths `failed|signer_retry`.
+- `failed` is only used for deterministic pre-broadcast failures.
 - `signer_retry` is used for ambiguous/retryable/unknown outcomes and **never** auto-releases balances.
-- Daily withdrawal limit accounting includes unresolved `pending|broadcasted|signer_retry` requests.
+- Reconciliation loop re-queries external provider for `submitted|broadcasted|signer_retry`.
+- Daily withdrawal limit accounting includes unresolved `pending|submitted|broadcasted|signer_retry` requests.

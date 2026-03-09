@@ -876,3 +876,57 @@ def test_agents_sentence_once():
     text = open("AGENTS.md", "r", encoding="utf-8").read()
     needle = 'When you find a security vunerabilty, flag it immediately with a WARNING comment and suggest a secure alternative. Never implement insecure patters even if asked.'
     assert text.count(needle) == 1
+
+
+def test_withdrawal_provider_requires_https_and_token_in_production(monkeypatch):
+    from signer.withdrawal_provider import HttpWithdrawalProvider
+
+    monkeypatch.setattr(Settings, "is_production", True)
+    monkeypatch.setenv("WITHDRAWAL_PROVIDER_URL", "http://provider.example")
+    monkeypatch.delenv("WITHDRAWAL_PROVIDER_TOKEN", raising=False)
+    ready, err = HttpWithdrawalProvider().is_ready()
+    assert ready is False
+    assert "https://" in (err or "")
+
+
+def test_withdrawal_provider_malformed_response_fails_closed(conn, monkeypatch):
+    monkeypatch.setattr(Settings, "withdrawals_enabled", True)
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(91001)
+    wallet.ledger.add_entry("USER", uid, uid, "USDT", Decimal("10"), "DEPOSIT", "deposit", 1)
+    req = wallet.request_withdrawal(uid, "USDT", Decimal("1"), "0x1111111111111111111111111111111111111111")
+
+    class Provider:
+        provider_origin = "external_http"
+
+        def is_ready(self):
+            return True, None
+
+        def execute_withdrawal(self, _req):
+            raise RuntimeError("withdrawal provider returned malformed JSON")
+
+        def reconcile_withdrawal(self, _req):
+            raise RuntimeError("bad payload")
+
+    svc = SignerService()
+    svc.provider = Provider()
+    svc.process_withdrawals(wallet)
+    row = conn.execute("SELECT status FROM withdrawals WHERE id=?", (req["id"],)).fetchone()
+    assert row["status"] == "signer_retry"
+
+
+def test_withdrawal_rebuild_migration_preserves_new_columns_and_indexes(tmp_path):
+    db = tmp_path / "old_withdrawals_new.db"
+    c = sqlite3.connect(db)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA foreign_keys=ON")
+    c.execute("CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, telegram_id INTEGER UNIQUE NOT NULL, username TEXT, frozen INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+    c.execute("CREATE TABLE withdrawals (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, asset TEXT NOT NULL CHECK(asset IN ('BTC','LTC','ETH','USDT')), amount TEXT NOT NULL, destination_address TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','broadcasted','failed')), txid TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+    init_db(c)
+    cols = {row["name"] for row in c.execute("PRAGMA table_info(withdrawals)").fetchall()}
+    assert "provider_origin" in cols
+    assert "provider_ref" in cols
+    assert "idempotency_key" in cols
+    idx = c.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_withdrawals_idempotency_key'").fetchone()
+    assert idx is not None
+    c.close()
