@@ -2349,6 +2349,15 @@ async def watcher_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         for row in retry_rows:
             retry_lines.append(f"- {row['asset']}: {Decimal(str(row['total_amount'] or 0))} ({row['count']} requests)")
 
+        signer_ready, signer_reason = SignerService().readiness()
+        wallet = WalletService(conn)
+        dep_ready, dep_reason = wallet.address_provider.is_ready()
+        degraded: list[str] = []
+        if not DEPOSIT_ISSUANCE_READY:
+            degraded.append(f"deposit: {DEPOSIT_ISSUANCE_ERROR or dep_reason or 'not ready'}")
+        if not signer_ready:
+            degraded.append(f"withdrawals/signer: {signer_reason or 'not ready'}")
+
         msg = (
             f"BTC watcher\n- last run: {b['last_run_at']}\n- last success: {b['last_success_at']}\n"
             f"- consecutive failures: {b['consecutive_failures']}\n- last error: {b['last_error']}\n\n"
@@ -2356,9 +2365,12 @@ async def watcher_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"- consecutive failures: {e['consecutive_failures']}\n- last error: {e['last_error']}\n\n"
             f"Signer loop\n- last run: {s['last_run_at']}\n- last success: {s['last_success_at']}\n"
             f"- consecutive failures: {s['consecutive_failures']}\n- last error: {s['last_error']}\n\n"
-            f"Deposit issuance readiness\n- ready: {'yes' if DEPOSIT_ISSUANCE_READY else 'no'}\n"
-            f"- detail: {DEPOSIT_ISSUANCE_ERROR or 'ok'}\n\n"
-            f"Signer retry backlog\n" + "\n".join(retry_lines)
+            f"Deposit issuance readiness\n- ready: {'yes' if dep_ready and DEPOSIT_ISSUANCE_READY else 'no'}\n"
+            f"- detail: {DEPOSIT_ISSUANCE_ERROR or dep_reason or 'ok'}\n\n"
+            f"Withdrawal provider\n- ready: {'yes' if signer_ready else 'no'}\n"
+            f"- detail: {signer_reason or 'ok'}\n\n"
+            f"Signer retry backlog\n" + "\n".join(retry_lines) + "\n\n"
+            f"Degraded mode reasons\n- " + ("\n- ".join(degraded) if degraded else "none")
         )
         conn.execute(
             "INSERT INTO admin_actions(admin_user_id,action_type,data_json) VALUES(?,?,?)",

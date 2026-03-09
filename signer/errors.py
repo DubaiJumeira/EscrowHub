@@ -12,3 +12,7 @@ class DeterministicSigningError(SignerError):
 
 class SignerConfigurationError(DeterministicSigningError):
     """Signer misconfiguration detected."""
+
+
+class RetryableSignerError(AmbiguousBroadcastError):
+    """Transient signer/provider failure that should be retried with reconciliation safeguards."""

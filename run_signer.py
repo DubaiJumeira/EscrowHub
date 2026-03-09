@@ -16,7 +16,9 @@ LOGGER = logging.getLogger("run_signer")
 
 def main() -> None:
     interval = int(os.getenv("WATCHER_POLL_INTERVAL_SECONDS", "30"))
-    run_startup_preflight("signer")
+    preflight = run_startup_preflight("signer")
+    if preflight is not None and not preflight.signer_ready:
+        LOGGER.warning("signer preflight degraded: %s", "; ".join(preflight.reasons) or "not ready")
     LOGGER.info("starting signer loop interval=%ss", interval)
     while True:
         conn = get_connection()

@@ -53,3 +53,15 @@ Non-production can still use legacy seed derivation for existing tests/dev flows
 
 ## Withdrawals
 `WITHDRAWALS_ENABLED` remains fail-closed by default. Ambiguous signer/provider errors move withdrawals into `signer_retry` and do not release reserved balances automatically.
+
+
+### Readiness and degraded modes
+- Bot preflight validates DB safety + route integrity + deposit-provider readiness.
+- Watcher preflight validates DB safety + route integrity; no issuance dependency.
+- Signer preflight validates DB safety + typed withdrawal-provider readiness.
+
+### Withdrawal state machine safety
+Statuses: `pending -> broadcasted|failed|signer_retry`.
+- `failed` is only used for deterministic failures.
+- `signer_retry` is used for ambiguous/retryable/unknown outcomes and **never** auto-releases balances.
+- Daily withdrawal limit accounting includes unresolved `pending|broadcasted|signer_retry` requests.
