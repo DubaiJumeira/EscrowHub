@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS wallet_addresses (
   asset TEXT NOT NULL CHECK(asset IN ('BTC','LTC','ETH','USDT')),
   chain_family TEXT NOT NULL CHECK(chain_family IN ('BTC','LTC','ETHEREUM')),
   address TEXT NOT NULL,
+  address_fingerprint TEXT,
   derivation_index INTEGER,
   destination_tag TEXT,
   derivation_path TEXT,
@@ -157,6 +158,8 @@ CREATE INDEX IF NOT EXISTS idx_ledger_entries_account_owner_asset ON ledger_entr
 CREATE INDEX IF NOT EXISTS idx_withdrawals_user_status_created ON withdrawals(user_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_escrow_locks_user_asset_status ON escrow_locks(user_id, asset, status);
 CREATE INDEX IF NOT EXISTS idx_wallet_addresses_asset_address ON wallet_addresses(asset, address);
+CREATE INDEX IF NOT EXISTS idx_wallet_addresses_chain_fingerprint ON wallet_addresses(chain_family, address_fingerprint);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_addresses_provider_ref ON wallet_addresses(provider_origin, provider_ref) WHERE COALESCE(provider_origin,'') != '' AND COALESCE(provider_ref,'') != '';
 CREATE INDEX IF NOT EXISTS idx_escrows_status_buyer_seller_created ON escrows(status, buyer_id, seller_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_reviews_reviewed_created ON reviews(reviewed_id, created_at);
 

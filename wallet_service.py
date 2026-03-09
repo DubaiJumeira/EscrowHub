@@ -111,19 +111,108 @@ class WalletService:
         nonce, ct = raw[:12], raw[12:]
         return aead.decrypt(nonce, ct, None).decode()
 
+    def _normalize_address_for_chain(self, chain_family: str, address: str) -> str:
+        candidate = (address or "").strip()
+        if not candidate:
+            raise RuntimeError("empty wallet address")
+        family = str(chain_family or "").upper().strip()
+        if family not in {"BTC", "LTC", "ETHEREUM"}:
+            raise RuntimeError(f"unsupported chain_family: {family}")
+        self._validate_withdrawal_address("ETH" if family == "ETHEREUM" else family, candidate)
+        if family == "ETHEREUM":
+            from eth_utils import to_checksum_address
+
+            return str(to_checksum_address(candidate))
+        return candidate
+
+    def _address_fingerprint(self, chain_family: str, normalized_address: str) -> str:
+        payload = f"{chain_family}:{normalized_address}".encode()
+        return hashlib.sha256(payload).hexdigest()
+
+    def _parsed_route_row(self, row) -> tuple[DepositRoute, str, str]:
+        chain_family = str(row["chain_family"])
+        decrypted = self._decrypt_field(row["address"])
+        if not decrypted:
+            raise RuntimeError(f"wallet route id={row['id']} has empty decrypted address")
+        normalized = self._normalize_address_for_chain(chain_family, decrypted)
+        fingerprint = self._address_fingerprint(chain_family, normalized)
+        stored_fingerprint = str(row["address_fingerprint"] or "") if "address_fingerprint" in row.keys() else ""
+        if stored_fingerprint and stored_fingerprint != fingerprint:
+            # WARNING: Fingerprint mismatch indicates tampering/corruption risk in deposit routing state.
+            # Secure alternative: stop startup, audit row history, and repair with an operator-approved migration.
+            raise RuntimeError(
+                f"wallet route id={row['id']} fingerprint mismatch; refusing startup until remediated"
+            )
+        route = DepositRoute(
+            normalized,
+            row["asset"],
+            chain_family,
+            row["destination_tag"],
+            self._decrypt_field(row["derivation_path"]),
+        )
+        return route, normalized, fingerprint
+
     def monitored_deposit_address_map(self, assets: list[str]) -> dict[str, int]:
         normalized = [self._asset(a) for a in assets]
         placeholders = ",".join("?" for _ in normalized)
         rows = self.conn.execute(
-            f"SELECT address, user_id FROM wallet_addresses WHERE asset IN ({placeholders})",
+            f"SELECT id,address,address_fingerprint,asset,chain_family,user_id,destination_tag,derivation_path FROM wallet_addresses WHERE asset IN ({placeholders})",
             tuple(normalized),
         ).fetchall()
         out: dict[str, int] = {}
+        seen_route_keys: dict[tuple[str, str], int] = {}
         for row in rows:
-            addr = self._decrypt_field(row["address"])
-            if addr:
-                out[str(addr)] = int(row["user_id"])
+            route, normalized_addr, fingerprint = self._parsed_route_row(row)
+            key = (route.chain_family, normalized_addr)
+            if key in seen_route_keys and seen_route_keys[key] != int(row["user_id"]):
+                # WARNING: Duplicate decrypted deposit route across users can misroute credits.
+                # Secure alternative: fail closed and force operator remediation before watcher startup.
+                raise RuntimeError(
+                    f"duplicate monitored deposit route chain_family={route.chain_family} address={normalized_addr}; "
+                    "resolve wallet_addresses collision before startup"
+                )
+            seen_route_keys[key] = int(row["user_id"])
+            out[normalized_addr] = int(row["user_id"])
         return out
+
+    def ensure_wallet_route_integrity(self) -> None:
+        rows = self.conn.execute(
+            "SELECT id,user_id,asset,chain_family,address,address_fingerprint,provider_origin,provider_ref,destination_tag,derivation_path FROM wallet_addresses ORDER BY id ASC"
+        ).fetchall()
+        by_fingerprint: dict[tuple[str, str], tuple[int, str, int]] = {}
+        by_provider: dict[tuple[str, str], tuple[int, str, int]] = {}
+        pending_updates: list[tuple[str, int]] = []
+        for row in rows:
+            route, _, fingerprint = self._parsed_route_row(row)
+            stored_fingerprint = str(row["address_fingerprint"] or "")
+            if not stored_fingerprint:
+                pending_updates.append((fingerprint, int(row["id"])))
+            key = (route.chain_family, fingerprint)
+            prior = by_fingerprint.get(key)
+            if prior and (prior[0] != int(row["user_id"]) or prior[1] != str(row["asset"])):
+                raise RuntimeError(
+                    "wallet fingerprint collision detected across rows; "
+                    f"chain_family={route.chain_family} fingerprint={fingerprint} conflicting_row_ids={prior[2]},{int(row['id'])}. "
+                    "Remediation: remove/reassign duplicated deposit route and restart."
+                )
+            by_fingerprint[key] = (int(row["user_id"]), str(row["asset"]), int(row["id"]))
+
+            origin = str(row["provider_origin"] or "")
+            ref = str(row["provider_ref"] or "")
+            if origin and ref:
+                provider_key = (origin, ref)
+                provider_prior = by_provider.get(provider_key)
+                if provider_prior and (
+                    provider_prior[0] != int(row["user_id"]) or provider_prior[1] != fingerprint
+                ):
+                    raise RuntimeError(
+                        "provider_ref rebound detected; "
+                        f"origin={origin} ref={ref} conflicting_row_ids={provider_prior[2]},{int(row['id'])}. "
+                        "Remediation: keep one canonical route and purge the conflicting row."
+                    )
+                by_provider[provider_key] = (int(row["user_id"]), fingerprint, int(row["id"]))
+        if pending_updates:
+            self.conn.executemany("UPDATE wallet_addresses SET address_fingerprint=? WHERE id=?", pending_updates)
 
     def _assert_not_frozen(self, resolved_user_id: int) -> None:
         row = self.conn.execute("SELECT frozen FROM users WHERE id=?", (resolved_user_id,)).fetchone()
@@ -185,24 +274,32 @@ class WalletService:
             raise RuntimeError(f"address provider returned invalid {symbol} deposit address") from exc
 
     def _route_from_row(self, row) -> DepositRoute:
-        return DepositRoute(
-            self._decrypt_field(row["address"]),
-            row["asset"],
-            row["chain_family"],
-            row["destination_tag"],
-            self._decrypt_field(row["derivation_path"]),
-        )
+        route, _, _ = self._parsed_route_row(row)
+        return route
 
     def assert_startup_deposit_issuance_ready(self) -> None:
         if not Settings.is_production:
             return
         ready, error = self.address_provider.is_ready()
         if not ready:
-            raise RuntimeError(error or "external address provider is not ready")
+            raise RuntimeError(f"Production deposit issuance unavailable: {error or 'external address provider is not ready'}")
 
     def get_or_create_deposit_address(self, user_id: int, asset: str) -> DepositRoute:
         symbol = self._asset(asset)
         resolved_user_id = self._ensure_user_row(user_id)
+        row = self.conn.execute("SELECT * FROM wallet_addresses WHERE user_id=? AND asset=?", (resolved_user_id, symbol)).fetchone()
+        if row:
+            return self._route_from_row(row)
+
+        issued = None
+        issued_normalized = ""
+        issued_fingerprint = ""
+        if Settings.is_production:
+            issued = self.address_provider.get_or_create_address(resolved_user_id, symbol)
+            self._validate_deposit_address(symbol, issued.address)
+            issued_normalized = self._normalize_address_for_chain(self._chain_family(symbol), issued.address)
+            issued_fingerprint = self._address_fingerprint(self._chain_family(symbol), issued_normalized)
+
         managed_tx = not bool(getattr(self.conn, "in_transaction", False))
         if managed_tx:
             self.conn.execute("BEGIN IMMEDIATE")
@@ -211,20 +308,32 @@ class WalletService:
         try:
             row = self.conn.execute("SELECT * FROM wallet_addresses WHERE user_id=? AND asset=?", (resolved_user_id, symbol)).fetchone()
             if row:
+                stored_route = self._route_from_row(row)
+                if Settings.is_production and issued is not None:
+                    stored_origin = str(row["provider_origin"] or "")
+                    stored_ref = str(row["provider_ref"] or "")
+                    _, _, stored_fp = self._parsed_route_row(row)
+                    if (
+                        stored_route.address != issued_normalized
+                        or stored_origin != issued.provider_origin
+                        or stored_ref != issued.provider_ref
+                        or stored_fp != issued_fingerprint
+                    ):
+                        LOGGER.error("Deposit route issuance conflict for user_id=%s asset=%s", resolved_user_id, symbol)
+                        raise RuntimeError("address provider route conflict for existing deposit address")
                 if managed_tx:
                     self.conn.commit()
                 else:
                     self.conn.execute("RELEASE SAVEPOINT deposit_route_issue")
-                return self._route_from_row(row)
+                return stored_route
 
             if Settings.is_production:
-                issued = self.address_provider.get_or_create_address(resolved_user_id, symbol)
-                self._validate_deposit_address(symbol, issued.address)
-                encrypted_addr = self._encrypt_field(issued.address)
+                assert issued is not None
+                encrypted_addr = self._encrypt_field(issued_normalized)
                 try:
                     self.conn.execute(
-                        "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,derivation_index,destination_tag,derivation_path,provider_origin,provider_ref) VALUES(?,?,?,?,?,?,?,?,?)",
-                        (resolved_user_id, symbol, self._chain_family(symbol), encrypted_addr, None, None, None, issued.provider_origin, issued.provider_ref),
+                        "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,address_fingerprint,derivation_index,destination_tag,derivation_path,provider_origin,provider_ref) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (resolved_user_id, symbol, self._chain_family(symbol), encrypted_addr, issued_fingerprint, None, None, None, issued.provider_origin, issued.provider_ref),
                     )
                 except sqlite3.IntegrityError:
                     row = self.conn.execute("SELECT * FROM wallet_addresses WHERE user_id=? AND asset=?", (resolved_user_id, symbol)).fetchone()
@@ -233,7 +342,7 @@ class WalletService:
                     stored_route = self._route_from_row(row)
                     stored_origin = str(row["provider_origin"] or "")
                     stored_ref = str(row["provider_ref"] or "")
-                    if stored_route.address != issued.address or stored_origin != issued.provider_origin or stored_ref != issued.provider_ref:
+                    if stored_route.address != issued_normalized or stored_origin != issued.provider_origin or stored_ref != issued.provider_ref:
                         LOGGER.error("Deposit route issuance conflict for user_id=%s asset=%s stored_address=%s issued_address=%s stored_origin=%s issued_origin=%s stored_ref=%s issued_ref=%s", resolved_user_id, symbol, stored_route.address, issued.address, stored_origin, issued.provider_origin, stored_ref, issued.provider_ref)
                         raise RuntimeError("address provider route conflict for existing deposit address")
                     if managed_tx:
@@ -245,7 +354,7 @@ class WalletService:
                     self.conn.commit()
                 else:
                     self.conn.execute("RELEASE SAVEPOINT deposit_route_issue")
-                return DepositRoute(issued.address, symbol, self._chain_family(symbol), None, None)
+                return DepositRoute(issued_normalized, symbol, self._chain_family(symbol), None, None)
 
             if symbol == "BTC":
                 k = self.hd.derive_btc_address(resolved_user_id)
@@ -256,15 +365,16 @@ class WalletService:
             else:
                 raise RuntimeError(f"unsupported production derivation for {symbol}")
 
+            normalized_local = self._normalize_address_for_chain(self._chain_family(symbol), k.public_address)
             self.conn.execute(
-                "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,derivation_index,destination_tag,derivation_path,provider_origin,provider_ref) VALUES(?,?,?,?,?,?,?,?,?)",
-                (resolved_user_id, symbol, self._chain_family(symbol), self._encrypt_field(k.public_address), resolved_user_id, None, self._encrypt_field(k.path), "legacy_seed", f"user:{resolved_user_id}:{symbol}"),
+                "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,address_fingerprint,derivation_index,destination_tag,derivation_path,provider_origin,provider_ref) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (resolved_user_id, symbol, self._chain_family(symbol), self._encrypt_field(normalized_local), self._address_fingerprint(self._chain_family(symbol), normalized_local), resolved_user_id, None, self._encrypt_field(k.path), "legacy_seed", f"user:{resolved_user_id}:{symbol}"),
             )
             if managed_tx:
                 self.conn.commit()
             else:
                 self.conn.execute("RELEASE SAVEPOINT deposit_route_issue")
-            return DepositRoute(k.public_address, symbol, self._chain_family(symbol), None, k.path)
+            return DepositRoute(normalized_local, symbol, self._chain_family(symbol), None, k.path)
         except Exception:
             if managed_tx:
                 self.conn.rollback()
@@ -327,7 +437,6 @@ class WalletService:
         if not address:
             raise ValueError("destination address is required")
         try:
-            import bip_utils
             from eth_utils import is_address, is_checksum_address
         except Exception as exc:
             raise RuntimeError("address validation dependencies are missing") from exc
@@ -339,23 +448,15 @@ class WalletService:
                 raise ValueError("Invalid checksum for Ethereum address")
             return
 
-        try:
-            if symbol == "BTC":
-                bip_utils.P2WPKHAddrDecoder.DecodeAddr(address, net_ver=bip_utils.BtcAddrConst.P2WPKH_HRP)
-                return
-            if symbol == "LTC":
-                bip_utils.P2WPKHAddrDecoder.DecodeAddr(address, net_ver=bip_utils.LtcAddrConst.P2WPKH_HRP)
-                return
-        except Exception:
-            pass
-        try:
-            if symbol == "BTC":
-                bip_utils.P2PKHAddrDecoder.DecodeAddr(address, net_ver=bip_utils.BtcAddrConst.P2PKH_NET_VER.Main())
-            else:
-                bip_utils.P2PKHAddrDecoder.DecodeAddr(address, net_ver=bip_utils.LtcAddrConst.P2PKH_NET_VER.Main())
-        except Exception as exc:
-            network = NETWORK_LABELS.get(symbol, symbol)
-            raise ValueError(f"Invalid destination address for {network}") from exc
+        low = address.lower()
+        bech32_ok = (symbol == "BTC" and low.startswith("bc1")) or (symbol == "LTC" and low.startswith("ltc1"))
+        base58_prefixes = ("1", "3") if symbol == "BTC" else ("l", "m", "3")
+        base58_ok = address[:1].lower() in base58_prefixes
+        valid_charset = all(c.isalnum() for c in address)
+        if valid_charset and 14 <= len(address) <= 90 and (bech32_ok or base58_ok):
+            return
+        network = NETWORK_LABELS.get(symbol, symbol)
+        raise ValueError(f"Invalid destination address for {network}")
 
     def validate_withdrawal_address(self, asset: str, destination_address: str) -> None:
         self._validate_withdrawal_address(asset, destination_address)
