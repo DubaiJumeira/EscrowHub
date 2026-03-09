@@ -30,5 +30,6 @@ Current stored derivation contract uses hardened user nodes (`m/.../{user_id}'/.
 Secure alternatives:
 - external address derivation service / HSM-backed derivation service, or
 - planned explicit migration to an xpub-compatible non-hardened user index path.
+- production startup preflight now also requires an approved external derivation/address service for new deposit issuance; otherwise startup fails closed.
 
 See `docs/RUNBOOK.md` for setup and operations.

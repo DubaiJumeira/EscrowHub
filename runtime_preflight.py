@@ -11,5 +11,6 @@ def run_startup_preflight(service_name: str) -> None:
         init_db(conn)
         wallet = WalletService(conn)
         wallet.verify_address_derivation_consistency(sample_size=None)
+        wallet.assert_startup_deposit_issuance_ready()
     finally:
         conn.close()

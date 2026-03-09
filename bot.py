@@ -909,7 +909,7 @@ async def profile_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 """
                 SELECT le.*, e.buyer_id, e.seller_id, e.description, e.status as escrow_status,
                        ub.username as buyer_name, us.username as seller_name,
-                       w.destination_address, w.status as wd_status, w.txid
+                       w.destination_address, w.status as wd_status, w.txid, w.failure_reason
                 FROM ledger_entries le
                 LEFT JOIN escrows e ON le.ref_type='escrow' AND le.ref_id=e.id
                 LEFT JOIN users ub ON e.buyer_id=ub.id
@@ -959,11 +959,13 @@ async def profile_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 lines.append(f"<b>Deal status:</b> {html.escape(str(r['escrow_status']))}")
 
         if entry_type == "WITHDRAWAL_RESERVE":
+            wd_status = str(r["wd_status"] or "").strip().lower()
+            status_label = {"pending": "Pending", "broadcasted": "Broadcasted", "failed": "Failed"}.get(wd_status, "Pending")
             if r["destination_address"]:
-                lines.append(f"<b>Address:</b> <code>{html.escape(str(r['destination_address']))}</code>")
-            if r["wd_status"]:
-                lines.append(f"<b>Status:</b> {html.escape(str(r['wd_status']))}")
-            if r["txid"]:
+                addr = wallet._decrypt_field(r["destination_address"])
+                lines.append(f"<b>Address:</b> <code>{html.escape(str(addr))}</code>")
+            lines.append(f"<b>Status:</b> {html.escape(status_label)}")
+            if wd_status == "broadcasted" and r["txid"]:
                 lines.append(f"<b>TxID:</b> <code>{html.escape(str(r['txid']))}</code>")
 
         kb = InlineKeyboardMarkup([
@@ -1043,7 +1045,12 @@ async def deposit_amount_input(update: Update, context: ContextTypes.DEFAULT_TYP
     conn, wallet, tenant, escrow_service = _services()
     try:
         user_id = tenant.ensure_user(update.effective_user.id, update.effective_user.username)
-        route = wallet.get_or_create_deposit_address(user_id, asset)
+        try:
+            route = wallet.get_or_create_deposit_address(user_id, asset)
+        except Exception:
+            LOGGER.exception("deposit address issuance failed for user_id=%s asset=%s", user_id, asset)
+            await update.effective_message.reply_text("Deposit address is temporarily unavailable. Please try again later.")
+            return ConversationHandler.END
         price_usd = escrow_service.price_service.get_usd_price(asset)
         conn.commit()
     finally:

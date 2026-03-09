@@ -5,6 +5,7 @@ import os
 import time
 
 from infra.db.database import get_connection, init_db
+from runtime_preflight import run_startup_preflight
 from wallet_service import WalletService
 from watcher_status_service import upsert_watcher_status
 from watchers.eth_watcher import run_once
@@ -15,7 +16,6 @@ LOGGER = logging.getLogger("run_eth_watcher")
 
 def _address_map(conn) -> dict[str, int]:
     wallet = WalletService(conn)
-    wallet.verify_address_derivation_consistency(sample_size=25)
     pairs = wallet.monitored_deposit_address_map(["ETH", "USDT"])
     return {k.lower(): v for k, v in pairs.items()}
 
@@ -33,6 +33,7 @@ def main() -> None:
         return
     interval = int(os.getenv("WATCHER_POLL_INTERVAL_SECONDS", "30"))
     LOGGER.info("starting ETH watcher loop with interval=%ss", interval)
+    run_startup_preflight("eth_watcher")
     _validate_erc20_config()
 
     while True:

@@ -21,6 +21,7 @@
 
 ### xpub safety note
 With the current path contract (`m/.../{user_id}'/...`), xpubs are **not derivation-compatible** because hardened user nodes cannot be derived from public keys. Startup preflight fails closed when xpub mode is configured.
+Production bot/watcher startup also fails closed when new deposit issuance cannot be satisfied by an approved external derivation/address service.
 
 Secure alternatives:
 - external address service / HSM-backed derivation service, or

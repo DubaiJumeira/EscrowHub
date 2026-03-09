@@ -414,8 +414,6 @@ def test_db_address_map_loader_reads_wallet_addresses(conn, monkeypatch):
     monkeypatch.setenv("HD_WALLET_SEED_HEX", "ab" * 32)
     from run_btc_watcher import _address_map as btc_map
     from run_eth_watcher import _address_map as eth_map
-    monkeypatch.setattr("wallet_service.WalletService.verify_address_derivation_consistency", lambda self, sample_size=25: None)
-
     conn.execute("INSERT INTO users(id, telegram_id, username, frozen) VALUES(?,?,?,0)", (1, 1001, "u1"))
     conn.execute("INSERT INTO users(id, telegram_id, username, frozen) VALUES(?,?,?,0)", (2, 1002, "u2"))
     conn.execute("INSERT INTO wallet_addresses(user_id,asset,chain_family,address,derivation_index,destination_tag,derivation_path) VALUES(?,?,?,?,?,?,?)", (1, "BTC", "BTC", "bc1qabc", 1, None, "p"))
@@ -618,3 +616,98 @@ def test_admin_revenue_command_access_control(monkeypatch, conn):
     asyncio.run(revenue_report(allowed, None))
     assert "Platform revenue balances" in allowed_msg.replies[-1]
     assert "USDT: 2.50" in allowed_msg.replies[-1]
+
+
+def test_watcher_address_map_loaders_do_not_call_sample_consistency(conn, monkeypatch):
+    from run_btc_watcher import _address_map as btc_map
+    from run_eth_watcher import _address_map as eth_map
+
+    def _boom(*_a, **_k):
+        raise AssertionError("sample consistency check should not be called in watcher map loader")
+
+    monkeypatch.setattr("wallet_service.WalletService.verify_address_derivation_consistency", _boom)
+    conn.execute("INSERT INTO users(id, telegram_id, username, frozen) VALUES(?,?,?,0)", (11, 2011, "u11"))
+    conn.execute("INSERT INTO wallet_addresses(user_id,asset,chain_family,address,derivation_index,destination_tag,derivation_path) VALUES(?,?,?,?,?,?,?)", (11, "BTC", "BTC", "bc1qabc2", 11, None, "p"))
+    assert btc_map(conn)["bc1qabc2"] == 11
+    assert isinstance(eth_map(conn), dict)
+
+
+def test_deposit_flow_provider_failure_is_controlled(monkeypatch, conn):
+    import asyncio
+    from types import SimpleNamespace
+
+    class Msg:
+        def __init__(self, text):
+            self.text = text
+            self.replies = []
+
+        async def reply_text(self, txt, **kwargs):
+            self.replies.append(txt)
+
+    class User:
+        id = 999
+        username = "u"
+
+    wallet = WalletService(conn)
+    tenant = TenantService(conn)
+
+    class EscrowStub:
+        price_service = StaticPriceService({"BTC": Decimal("65000")})
+
+    monkeypatch.setattr("bot._services", lambda: (conn, wallet, tenant, EscrowStub()))
+    monkeypatch.setattr(wallet, "get_or_create_deposit_address", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("down")))
+
+    msg = Msg("100")
+    upd = SimpleNamespace(effective_message=msg, effective_user=User())
+    ctx = SimpleNamespace(user_data={"dep_asset": "BTC"})
+    import bot
+    result = asyncio.run(bot.deposit_amount_input(upd, ctx))
+    assert result == bot.ConversationHandler.END
+    assert "temporarily unavailable" in msg.replies[-1].lower()
+
+
+def test_tx_detail_withdrawal_decrypts_address_and_hides_internal_failures(monkeypatch, tmp_path):
+    import asyncio
+    import bot
+
+    db = tmp_path / "tx_detail.db"
+    c = sqlite3.connect(db)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA foreign_keys=ON")
+    init_db(c)
+    wallet = WalletService(c)
+    tenant = TenantService(c)
+    uid = tenant.ensure_user(7777, "tester")
+    enc_addr = wallet._encrypt_field("0x" + "2" * 40)
+    c.execute("INSERT INTO withdrawals(id,user_id,asset,amount,destination_address,status,txid,failure_reason) VALUES(?,?,?,?,?,?,?,?)", (9, uid, "USDT", "1", enc_addr, "failed", None, "provider boom internal"))
+    c.execute("INSERT INTO ledger_entries(id,account_type,account_owner_id,user_id,asset,amount,entry_type,ref_type,ref_id) VALUES(?,?,?,?,?,?,?,?,?)", (19, "USER", uid, uid, "USDT", "-1", "WITHDRAWAL_RESERVE", "withdrawal", 9))
+    c.commit()
+    c.close()
+
+    def _svc():
+        cx = sqlite3.connect(db)
+        cx.row_factory = sqlite3.Row
+        cx.execute("PRAGMA foreign_keys=ON")
+        return (cx, WalletService(cx), TenantService(cx), None)
+
+    monkeypatch.setattr(bot, "_services", _svc)
+
+    class Q:
+        data = "tx_detail:19:1"
+        from_user = SimpleNamespace(id=7777, username="tester")
+        text = None
+
+        async def answer(self, *a, **k):
+            return None
+
+        async def edit_message_text(self, txt, **kwargs):
+            self.text = txt
+
+    q = Q()
+    upd = SimpleNamespace(callback_query=q)
+    asyncio.run(bot.profile_actions(upd, SimpleNamespace(user_data={})))
+    assert "Address:" in q.text
+    assert "0x" + "2" * 40 in q.text
+    assert "Status:</b> Failed" in q.text
+    assert "TxID:" not in q.text
+    assert "provider boom internal" not in q.text
