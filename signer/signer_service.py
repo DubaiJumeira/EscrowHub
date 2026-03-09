@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 from decimal import Decimal
@@ -62,10 +61,11 @@ class SignerService:
             return self.provider.is_ready()  # type: ignore[no-any-return]
         return True, None
 
-    def _idempotency_key(self, withdrawal_id: int, user_id: int, asset: str, amount: str, destination: str) -> str:
-        payload = f"{withdrawal_id}|{user_id}|{asset}|{amount}|{destination}".encode()
-        digest = hashlib.sha256(payload).hexdigest()
-        return f"wd:{withdrawal_id}:{digest[:24]}"
+    def _reconcile_intervals(self) -> tuple[int, int, int]:
+        submitted = max(15, int(os.getenv("WITHDRAWAL_RECONCILE_SUBMITTED_INTERVAL_SECONDS", "45")))
+        broadcasted = max(30, int(os.getenv("WITHDRAWAL_RECONCILE_BROADCASTED_INTERVAL_SECONDS", "120")))
+        signer_retry = max(60, int(os.getenv("WITHDRAWAL_RECONCILE_SIGNER_RETRY_INTERVAL_SECONDS", "300")))
+        return submitted, broadcasted, signer_retry
 
     def _map_result(self, result: WithdrawalExecutionResult) -> tuple[str, str | None]:
         status = (result.status or "").strip().lower()
@@ -89,7 +89,8 @@ class SignerService:
         processed = 0
         for w in wallet_service.pending_withdrawals():
             processed += self._execute_single(wallet_service, w)
-        for w in wallet_service.unresolved_withdrawals_for_reconcile(limit=100):
+        submitted_after_s, broadcasted_after_s, signer_retry_after_s = self._reconcile_intervals()
+        for w in wallet_service.unresolved_withdrawals_for_reconcile(limit=100, submitted_after_s=submitted_after_s, broadcasted_after_s=broadcasted_after_s, signer_retry_after_s=signer_retry_after_s):
             processed += self._reconcile_single(wallet_service, w)
         return processed
 
@@ -98,7 +99,9 @@ class SignerService:
 
     def _execute_single(self, wallet_service, w: dict) -> int:
         try:
-            idem = str(w.get("idempotency_key") or "") or self._idempotency_key(int(w["id"]), int(w["user_id"]), str(w["asset"]), str(w["amount"]), str(w["destination_address"]))
+            idem = str(w.get("idempotency_key") or "").strip()
+            if not idem:
+                raise RuntimeError("missing withdrawal idempotency_key")
             wallet_service.persist_withdrawal_idempotency(int(w["id"]), idem)
             request = WithdrawalExecutionRequest(
                 withdrawal_id=int(w["id"]), user_id=int(w["user_id"]), asset=str(w["asset"]).upper().strip(),
@@ -107,6 +110,9 @@ class SignerService:
             if hasattr(self.provider, "execute_withdrawal"):
                 result = self.provider.execute_withdrawal(request)
                 status, txid = self._map_result(result)
+                result_asset = str(getattr(result, "asset", "") or "").strip().upper()
+                if result_asset and result_asset != request.asset:
+                    raise RetryableSignerError("provider response asset mismatch")
                 wallet_service.record_withdrawal_provider_result(int(w["id"]), getattr(self.provider, "provider_origin", "external_http"), idem, result)
                 if status == "submitted":
                     wallet_service.mark_withdrawal_submitted(int(w["id"]), result.provider_ref, result.external_status, result.submitted_at)
@@ -134,6 +140,15 @@ class SignerService:
         try:
             req = WithdrawalReconciliationRequest(withdrawal_id=int(w["id"]), idempotency_key=str(w.get("idempotency_key") or ""), provider_ref=str(w.get("provider_ref") or "") or None)
             result = self.provider.reconcile_withdrawal(req)
+            result_ref = str(getattr(result, "provider_ref", "") or "").strip()
+            stored_ref = str(w.get("provider_ref") or "").strip()
+            if stored_ref and result_ref and stored_ref != result_ref:
+                # WARNING: reconcile provider_ref drift fails closed to prevent cross-withdrawal rebinding.
+                raise RetryableSignerError("provider_ref mismatch during reconcile")
+            result_asset = str(getattr(result, "asset", "") or "").strip().upper()
+            stored_asset = str(w.get("asset") or "").strip().upper()
+            if result_asset and stored_asset and result_asset != stored_asset:
+                raise RetryableSignerError("provider response asset mismatch during reconcile")
             status, txid = self._map_result(result)
             wallet_service.record_withdrawal_provider_result(int(w["id"]), getattr(self.provider, "provider_origin", "external_http"), req.idempotency_key, result)
             wallet_service.mark_withdrawal_reconciled(int(w["id"]))

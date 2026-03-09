@@ -5,7 +5,7 @@ import os
 import time
 
 from infra.db.database import get_connection, init_db
-from runtime_preflight import run_startup_preflight
+from runtime_preflight import PreflightIntegrityError, run_startup_preflight
 from wallet_service import WalletService
 from watcher_status_service import upsert_watcher_status
 from watchers.btc_watcher import run_once
@@ -26,7 +26,12 @@ def main() -> None:
         return
     interval = int(os.getenv("WATCHER_POLL_INTERVAL_SECONDS", "30"))
     LOGGER.info("starting BTC watcher loop with interval=%ss", interval)
-    run_startup_preflight("btc_watcher")
+    try:
+        run_startup_preflight("btc_watcher")
+    except PreflightIntegrityError as exc:
+        # WARNING: startup fails closed when route-integrity checks detect tampering/collision risk.
+        LOGGER.error("btc watcher startup aborted by fatal integrity preflight: %s", "; ".join(exc.status.reasons) or str(exc))
+        raise
 
     while True:
         conn = get_connection()

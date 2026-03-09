@@ -53,3 +53,10 @@ Withdrawals use a typed signer boundary with deterministic idempotency keys (`wd
 - unresolved: `retryable|ambiguous|unknown` (forced to `signer_retry`, funds remain reserved)
 
 Withdrawal rows persist: `provider_origin`, `provider_ref`, `idempotency_key`, `external_status`, `submitted_at`, `broadcasted_at`, `last_reconciled_at`, and optional sanitized `tx_metadata_json`. Unknown/malformed provider outcomes fail closed to `signer_retry`.
+
+
+- Startup preflight is fail-closed for route-integrity/collision/tampering failures across bot, watchers, and signer; these conditions abort startup.
+- Withdrawal idempotency keys are bound per withdrawal row (`wdrow:<id>:...`), allowing legitimate repeated identical business-field withdrawals.
+- Signer reconciliation uses status-aware backoff (`submitted` shorter, `broadcasted` moderate, `signer_retry` slower) gated by `last_reconciled_at`.
+- Withdrawal provider identity (`provider_origin`, `provider_ref`) is immutable once assigned and cannot be rebound across withdrawals.
+- External withdrawal provider deployment is still required for true go-live; repo hardening does not replace real custody infrastructure.

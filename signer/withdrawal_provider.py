@@ -26,6 +26,7 @@ class WithdrawalExecutionRequest:
 class WithdrawalExecutionResult:
     status: str
     txid: str | None = None
+    asset: str | None = None
     provider_ref: str | None = None
     external_status: str | None = None
     message: str | None = None
@@ -45,6 +46,7 @@ class WithdrawalReconciliationRequest:
 class WithdrawalReconciliationResult:
     status: str
     txid: str | None = None
+    asset: str | None = None
     provider_ref: str | None = None
     external_status: str | None = None
     message: str | None = None
@@ -144,11 +146,14 @@ class HttpWithdrawalProvider(WithdrawalProvider):
         asset = str(body.get("asset") or "").strip().upper()
         if asset and asset not in SUPPORTED_WITHDRAWAL_ASSETS:
             raise RetryableSignerError("withdrawal provider returned unsupported asset")
-        if not allow_missing_ref and status in {"submitted", "broadcasted", "confirmed"} and not provider_ref:
+        if status in {"submitted", "broadcasted", "confirmed"} and not provider_ref:
             raise RetryableSignerError("withdrawal provider response missing provider_ref")
+        if status in {"broadcasted", "confirmed"} and not txid:
+            raise RetryableSignerError("withdrawal provider response missing txid")
         return WithdrawalExecutionResult(
             status=status,
             txid=txid,
+            asset=asset or None,
             provider_ref=provider_ref,
             external_status=ext_status,
             message=str(body.get("message") or "").strip()[:500] or None,

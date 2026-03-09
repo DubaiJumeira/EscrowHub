@@ -5,7 +5,7 @@ import os
 import time
 
 from infra.db.database import get_connection, init_db
-from runtime_preflight import run_startup_preflight
+from runtime_preflight import PreflightIntegrityError, run_startup_preflight
 from wallet_service import WalletService
 from watcher_status_service import upsert_watcher_status
 from watchers.eth_watcher import run_once
@@ -33,7 +33,12 @@ def main() -> None:
         return
     interval = int(os.getenv("WATCHER_POLL_INTERVAL_SECONDS", "30"))
     LOGGER.info("starting ETH watcher loop with interval=%ss", interval)
-    run_startup_preflight("eth_watcher")
+    try:
+        run_startup_preflight("eth_watcher")
+    except PreflightIntegrityError as exc:
+        # WARNING: startup fails closed when route-integrity checks detect tampering/collision risk.
+        LOGGER.error("eth watcher startup aborted by fatal integrity preflight: %s", "; ".join(exc.status.reasons) or str(exc))
+        raise
     _validate_erc20_config()
 
     while True:
