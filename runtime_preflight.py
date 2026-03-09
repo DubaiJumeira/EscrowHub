@@ -19,6 +19,8 @@ class PreflightStatus:
     signer_ready: bool = False
     reasons: tuple[str, ...] = ()
     deposit_issuance_error: str | None = None
+    route_integrity_ready: bool = False
+    signer_loop_degraded: bool = False
 
 
 def run_startup_preflight(service_name: str) -> PreflightStatus:
@@ -28,8 +30,13 @@ def run_startup_preflight(service_name: str) -> PreflightStatus:
     try:
         init_db(conn)
         wallet = WalletService(conn)
-        wallet.ensure_wallet_route_integrity()
-        wallet.verify_address_derivation_consistency(sample_size=None)
+        route_integrity_ready = True
+        try:
+            wallet.ensure_wallet_route_integrity()
+            wallet.verify_address_derivation_consistency(sample_size=None)
+        except Exception as exc:
+            route_integrity_ready = False
+            reasons.append(f"route integrity failed: {exc}")
 
         deposit_ready = False
         deposit_error = None
@@ -52,6 +59,8 @@ def run_startup_preflight(service_name: str) -> PreflightStatus:
                 signer_ready=False,
                 reasons=tuple(reasons),
                 deposit_issuance_error=deposit_error,
+                route_integrity_ready=route_integrity_ready,
+                signer_loop_degraded=bool(reasons),
             )
 
         if service_name == "signer":
@@ -68,6 +77,8 @@ def run_startup_preflight(service_name: str) -> PreflightStatus:
                 withdrawal_provider_ready=withdrawal_ready,
                 signer_ready=signer_ready,
                 reasons=tuple(reasons),
+                route_integrity_ready=route_integrity_ready,
+                signer_loop_degraded=bool(reasons),
             )
 
         return PreflightStatus(
@@ -77,6 +88,8 @@ def run_startup_preflight(service_name: str) -> PreflightStatus:
             withdrawal_provider_ready=False,
             signer_ready=False,
             reasons=tuple(reasons),
+            route_integrity_ready=route_integrity_ready,
+            signer_loop_degraded=bool(reasons),
         )
     finally:
         conn.close()

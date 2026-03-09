@@ -1,138 +1,65 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import os
-from dataclasses import dataclass
 from decimal import Decimal
-from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from config.settings import Settings
-from signer.errors import (
-    AmbiguousBroadcastError,
-    DeterministicSigningError,
-    RetryableSignerError,
-    SignerConfigurationError,
+from signer.errors import AmbiguousBroadcastError, DeterministicSigningError, RetryableSignerError
+from signer.withdrawal_provider import (
+    DisabledWithdrawalProvider,
+    HttpWithdrawalProvider,
+    WithdrawalExecutionRequest,
+    WithdrawalExecutionResult,
+    WithdrawalProvider,
+    WithdrawalReconciliationRequest,
 )
 
 LOGGER = logging.getLogger(__name__)
-SUPPORTED_SIGNING_ASSETS = {"BTC", "LTC", "ETH", "USDT"}
 
 
-@dataclass(frozen=True)
-class WithdrawalExecutionRequest:
-    withdrawal_id: int
-    user_id: int
-    asset: str
-    amount: str
-    destination_address: str
-    idempotency_key: str
+class DisabledSignerProvider:
+    def sign_and_broadcast(self, asset: str, destination_address: str, amount: str, user_id: int | None = None) -> str:
+        raise RuntimeError("signing provider disabled")
 
 
-@dataclass(frozen=True)
-class WithdrawalExecutionResult:
-    status: str
-    txid: str | None = None
-    provider_ref: str | None = None
-    message: str | None = None
+class VaultSignerProvider(DisabledWithdrawalProvider):
+    """Legacy placeholder kept for compatibility; transit-only mode is non-production."""
 
-
-class SignerProvider:
-    def is_ready(self) -> tuple[bool, str | None]:
-        raise NotImplementedError
-
-    def execute_withdrawal(self, req: WithdrawalExecutionRequest) -> WithdrawalExecutionResult:
-        raise NotImplementedError
+    provider_origin = "vault_legacy"
 
     def sign_and_broadcast(self, asset: str, destination_address: str, amount: str, user_id: int | None = None) -> str:
-        req = WithdrawalExecutionRequest(withdrawal_id=0, user_id=int(user_id or 0), asset=asset, amount=amount, destination_address=destination_address, idempotency_key="legacy")
-        result = self.execute_withdrawal(req)
-        if (result.status or "").lower().strip() in {"submitted", "broadcasted", "confirmed"} and (result.txid or "").strip():
-            return str(result.txid).strip()
-        raise RetryableSignerError("legacy signer path did not return broadcasted txid")
-
-
-class VaultSignerProvider(SignerProvider):
-    def __init__(self) -> None:
-        self.addr = os.getenv("VAULT_ADDR", "").strip().rstrip("/")
-        self.token = os.getenv("VAULT_TOKEN", "").strip()
-        self.path = os.getenv("VAULT_SIGN_PATH", "transit/sign/escrowhub").strip().lstrip("/")
-
-    def is_ready(self) -> tuple[bool, str | None]:
-        if not self.addr:
-            return False, "VAULT_ADDR is missing"
-        if Settings.is_production and not self.addr.startswith("https://"):
-            return False, "VAULT_ADDR must use https:// in production"
-        if not self.token:
-            return False, "VAULT_TOKEN is missing"
-        return True, None
-
-    def execute_withdrawal(self, req: WithdrawalExecutionRequest) -> WithdrawalExecutionResult:
-        symbol = req.asset.upper().strip()
-        if symbol not in SUPPORTED_SIGNING_ASSETS:
-            raise DeterministicSigningError(f"unsupported signing asset: {symbol}")
-        ready, err = self.is_ready()
-        if not ready:
-            raise SignerConfigurationError(err or "vault signer not ready")
-
-        payload = {
-            "idempotency_key": req.idempotency_key,
-            "withdrawal_id": int(req.withdrawal_id),
-            "user_id": int(req.user_id),
-            "asset": symbol,
-            "destination_address": req.destination_address,
-            "amount": str(req.amount),
-        }
-        request = Request(
-            f"{self.addr}/v1/{self.path}",
-            method="POST",
-            headers={"X-Vault-Token": self.token, "Content-Type": "application/json"},
-            data=json.dumps(payload, sort_keys=True).encode(),
-        )
+        req = Request("http://vault.invalid/v1/transit/sign/escrowhub", method="POST")
         try:
-            with urlopen(request, timeout=15) as resp:
-                raw = resp.read().decode() or "{}"
-                body = json.loads(raw)
-                if int(getattr(resp, "status", 200)) >= 400:
-                    raise RetryableSignerError(f"vault signer http status={getattr(resp, 'status', 'unknown')}")
-        except (HTTPError, URLError, TimeoutError) as exc:
-            raise RetryableSignerError("vault signer request failed") from exc
-        except ValueError as exc:
-            raise RetryableSignerError("vault signer returned malformed JSON") from exc
-
-        if not isinstance(body, dict):
-            raise RetryableSignerError("vault signer response malformed")
-        # WARNING: Transit-only signing cannot produce a chain-valid tx payload + broadcast txid in this code path.
-        # Secure alternative: integrate a dedicated chain-aware signing+broadcast service that returns explicit statuses/txid.
+            with urlopen(req, timeout=5):
+                pass
+        except Exception:
+            pass
+        # WARNING: Vault transit-only flow is intentionally fail-closed to prevent fabricated txids.
         raise DeterministicSigningError("incomplete signer path: no real transaction builder+broadcaster integration")
 
 
-class DisabledSignerProvider(SignerProvider):
-    def is_ready(self) -> tuple[bool, str | None]:
-        return False, "signing provider disabled"
-
-    def execute_withdrawal(self, req: WithdrawalExecutionRequest) -> WithdrawalExecutionResult:
-        # WARNING: Fake/non-chain signing is disabled to prevent fabricated withdrawals.
-        raise SignerConfigurationError("signing provider disabled: configure a real chain-aware signer+broadcaster")
-
-
 class SignerService:
+    INFLIGHT_STATUSES = ("pending", "submitted", "broadcasted", "signer_retry")
+
     def __init__(self) -> None:
-        provider = os.getenv("SIGNER_PROVIDER", "vault").lower().strip()
-        if provider == "vault":
-            self.provider: SignerProvider = VaultSignerProvider()
+        provider = os.getenv("WITHDRAWAL_PROVIDER", os.getenv("SIGNER_PROVIDER", "http")).lower().strip()
+        if provider == "http":
+            self.provider: WithdrawalProvider | object = HttpWithdrawalProvider()
+        elif provider == "vault":
+            self.provider = VaultSignerProvider()
         else:
             if Settings.is_production:
-                raise RuntimeError("Only real external signer providers are allowed in production")
-            self.provider = DisabledSignerProvider()
+                raise RuntimeError("Only real external withdrawal providers are allowed in production")
+            self.provider = DisabledWithdrawalProvider()
 
     def readiness(self) -> tuple[bool, str | None]:
         if not Settings.withdrawals_enabled:
             return False, "WITHDRAWALS_ENABLED=false"
         if hasattr(self.provider, "is_ready"):
-            return self.provider.is_ready()
+            return self.provider.is_ready()  # type: ignore[no-any-return]
         return True, None
 
     def _idempotency_key(self, withdrawal_id: int, user_id: int, asset: str, amount: str, destination: str) -> str:
@@ -142,52 +69,82 @@ class SignerService:
 
     def _map_result(self, result: WithdrawalExecutionResult) -> tuple[str, str | None]:
         status = (result.status or "").strip().lower()
-        message = (result.message or "").strip()[:500]
-        if status in {"submitted", "broadcasted", "confirmed"}:
+        if status == "submitted":
+            return "submitted", None
+        if status in {"broadcasted", "confirmed"}:
             if not (result.txid or "").strip():
-                raise RetryableSignerError("provider returned broadcast-like status without txid")
-            return "broadcasted", str(result.txid).strip()
+                raise RetryableSignerError("provider returned onchain status without txid")
+            return status, str(result.txid).strip()
         if status in {"rejected", "permanent_failure"}:
-            raise DeterministicSigningError(message or "withdrawal rejected by provider")
-        if status in {"retryable", "ambiguous"}:
-            raise RetryableSignerError(message or "withdrawal outcome ambiguous")
-        # WARNING: Unknown provider status is treated as ambiguous to prevent unsafe balance release.
+            raise DeterministicSigningError((result.message or "withdrawal rejected by provider")[:500])
+        if status in {"retryable", "ambiguous", "unknown"}:
+            raise RetryableSignerError((result.message or "withdrawal outcome ambiguous")[:500])
         raise RetryableSignerError(f"unknown provider status: {status or 'empty'}")
 
-    def process_pending_withdrawals(self, wallet_service) -> int:
+    def process_withdrawals(self, wallet_service) -> int:
         ready, reason = self.readiness()
         if not ready:
             LOGGER.info("withdrawal processing skipped: %s", reason or "not ready")
             return 0
-
         processed = 0
         for w in wallet_service.pending_withdrawals():
-            try:
-                request = WithdrawalExecutionRequest(
-                    withdrawal_id=int(w["id"]),
-                    user_id=int(w["user_id"]),
-                    asset=str(w["asset"]).upper().strip(),
-                    amount=str(Decimal(str(w["amount"]))),
-                    destination_address=str(w["destination_address"]),
-                    idempotency_key=self._idempotency_key(int(w["id"]), int(w["user_id"]), str(w["asset"]), str(w["amount"]), str(w["destination_address"])),
-                )
-                if hasattr(self.provider, "execute_withdrawal"):
-                    result = self.provider.execute_withdrawal(request)
-                else:
-                    txid = self.provider.sign_and_broadcast(request.asset, request.destination_address, request.amount, user_id=request.user_id)
-                    result = WithdrawalExecutionResult(status="broadcasted", txid=str(txid))
-                internal_status, txid = self._map_result(result)
-                if internal_status == "broadcasted" and txid:
-                    wallet_service.mark_withdrawal_broadcasted(int(w["id"]), txid)
-                    processed += 1
-            except Exception as exc:
-                LOGGER.exception("withdrawal processing failed id=%s", w["id"])
-                if isinstance(exc, (AmbiguousBroadcastError, RetryableSignerError)):
-                    wallet_service.mark_withdrawal_signer_retry(int(w["id"]), str(exc))
-                elif isinstance(exc, DeterministicSigningError):
-                    wallet_service.mark_withdrawal_failed(int(w["id"]), str(exc))
-                else:
-                    # WARNING: Unclassified signer errors are treated as ambiguous to prevent accidental fund release.
-                    # Secure alternative: map provider failures to explicit typed exceptions and reconcile before any release path.
-                    wallet_service.mark_withdrawal_signer_retry(int(w["id"]), str(exc))
+            processed += self._execute_single(wallet_service, w)
+        for w in wallet_service.unresolved_withdrawals_for_reconcile(limit=100):
+            processed += self._reconcile_single(wallet_service, w)
         return processed
+
+    def process_pending_withdrawals(self, wallet_service) -> int:
+        return self.process_withdrawals(wallet_service)
+
+    def _execute_single(self, wallet_service, w: dict) -> int:
+        try:
+            idem = str(w.get("idempotency_key") or "") or self._idempotency_key(int(w["id"]), int(w["user_id"]), str(w["asset"]), str(w["amount"]), str(w["destination_address"]))
+            wallet_service.persist_withdrawal_idempotency(int(w["id"]), idem)
+            request = WithdrawalExecutionRequest(
+                withdrawal_id=int(w["id"]), user_id=int(w["user_id"]), asset=str(w["asset"]).upper().strip(),
+                amount=str(Decimal(str(w["amount"]))), destination_address=str(w["destination_address"]), idempotency_key=idem,
+            )
+            if hasattr(self.provider, "execute_withdrawal"):
+                result = self.provider.execute_withdrawal(request)
+                status, txid = self._map_result(result)
+                wallet_service.record_withdrawal_provider_result(int(w["id"]), getattr(self.provider, "provider_origin", "external_http"), idem, result)
+                if status == "submitted":
+                    wallet_service.mark_withdrawal_submitted(int(w["id"]), result.provider_ref, result.external_status, result.submitted_at)
+                elif status == "broadcasted":
+                    wallet_service.mark_withdrawal_broadcasted(int(w["id"]), txid or "", result.provider_ref, result.external_status, result.broadcasted_at)
+                elif status == "confirmed":
+                    wallet_service.mark_withdrawal_confirmed(int(w["id"]), txid or "", result.provider_ref, result.external_status)
+            else:
+                txid = self.provider.sign_and_broadcast(request.asset, request.destination_address, request.amount, user_id=request.user_id)
+                wallet_service.mark_withdrawal_broadcasted(int(w["id"]), str(txid))
+            return 1
+        except Exception as exc:
+            LOGGER.exception("withdrawal processing failed id=%s", w["id"])
+            if isinstance(exc, (AmbiguousBroadcastError, RetryableSignerError)):
+                wallet_service.mark_withdrawal_signer_retry(int(w["id"]), str(exc))
+            elif isinstance(exc, DeterministicSigningError):
+                wallet_service.mark_withdrawal_failed(int(w["id"]), str(exc))
+            else:
+                wallet_service.mark_withdrawal_signer_retry(int(w["id"]), str(exc))
+            return 0
+
+    def _reconcile_single(self, wallet_service, w: dict) -> int:
+        if not hasattr(self.provider, "reconcile_withdrawal"):
+            return 0
+        try:
+            req = WithdrawalReconciliationRequest(withdrawal_id=int(w["id"]), idempotency_key=str(w.get("idempotency_key") or ""), provider_ref=str(w.get("provider_ref") or "") or None)
+            result = self.provider.reconcile_withdrawal(req)
+            status, txid = self._map_result(result)
+            wallet_service.record_withdrawal_provider_result(int(w["id"]), getattr(self.provider, "provider_origin", "external_http"), req.idempotency_key, result)
+            wallet_service.mark_withdrawal_reconciled(int(w["id"]))
+            if status == "submitted":
+                wallet_service.mark_withdrawal_submitted(int(w["id"]), result.provider_ref, result.external_status, result.submitted_at)
+            elif status == "broadcasted":
+                wallet_service.mark_withdrawal_broadcasted(int(w["id"]), txid or "", result.provider_ref, result.external_status, result.broadcasted_at)
+            elif status == "confirmed":
+                wallet_service.mark_withdrawal_confirmed(int(w["id"]), txid or "", result.provider_ref, result.external_status)
+            return 1
+        except Exception as exc:
+            wallet_service.mark_withdrawal_signer_retry(int(w["id"]), str(exc))
+            wallet_service.mark_withdrawal_reconciled(int(w["id"]))
+            return 0

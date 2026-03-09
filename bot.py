@@ -2345,11 +2345,13 @@ async def watcher_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "SELECT asset, COALESCE(SUM(CAST(amount AS REAL)),0) AS total_amount, COUNT(*) AS count FROM withdrawals WHERE status='signer_retry' GROUP BY asset ORDER BY asset"
         ).fetchall()
         retry_total = conn.execute("SELECT COUNT(*) AS c FROM withdrawals WHERE status='signer_retry'").fetchone()["c"]
+        unresolved_rows = conn.execute("SELECT status, COUNT(*) AS c FROM withdrawals WHERE status IN ('pending','submitted','broadcasted','signer_retry') GROUP BY status ORDER BY status").fetchall()
         retry_lines = [f"- total in signer_retry: {retry_total}"]
         for row in retry_rows:
             retry_lines.append(f"- {row['asset']}: {Decimal(str(row['total_amount'] or 0))} ({row['count']} requests)")
 
-        signer_ready, signer_reason = SignerService().readiness()
+        signer_service = SignerService()
+        signer_ready, signer_reason = signer_service.readiness()
         wallet = WalletService(conn)
         dep_ready, dep_reason = wallet.address_provider.is_ready()
         degraded: list[str] = []
@@ -2370,6 +2372,8 @@ async def watcher_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"Withdrawal provider\n- ready: {'yes' if signer_ready else 'no'}\n"
             f"- detail: {signer_reason or 'ok'}\n\n"
             f"Signer retry backlog\n" + "\n".join(retry_lines) + "\n\n"
+            f"Unresolved withdrawals\n" + ("\n".join([f"- {r['status']}: {r['c']}" for r in unresolved_rows]) if unresolved_rows else "- none") + "\n\n"
+            f"Signer loop health\n- ready: {'yes' if signer_ready else 'no'}\n- detail: {signer_reason or 'ok'}\n\n"
             f"Degraded mode reasons\n- " + ("\n- ".join(degraded) if degraded else "none")
         )
         conn.execute(
@@ -2476,6 +2480,53 @@ async def signer_retry_action(update: Update, context: ContextTypes.DEFAULT_TYPE
     finally:
         conn.close()
 
+
+
+async def unresolved_withdrawals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.effective_message.reply_text("Admin only")
+        return
+    conn, wallet, _, _ = _services()
+    try:
+        rows = wallet.unresolved_withdrawals(limit=20)
+        if not rows:
+            await update.effective_message.reply_text("No unresolved withdrawals.")
+            return
+        lines = ["Unresolved withdrawals (max 20):"]
+        for row in rows:
+            lines.append(f"- id={row['id']} status={row['status']} asset={row['asset']} amount={row['amount']} ref={row.get('provider_ref') or '-'} reason={_sanitize_failure_summary(row.get('failure_reason'))}")
+        conn.execute("INSERT INTO admin_actions(admin_user_id,action_type,data_json) VALUES(?,?,?)", (update.effective_user.id, "list_unresolved_withdrawals", json.dumps({"count": len(rows)})))
+        conn.commit()
+        await update.effective_message.reply_text("\n".join(lines))
+    finally:
+        conn.close()
+
+
+async def withdrawal_reconcile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.effective_message.reply_text("Admin only")
+        return
+    if not update.message or not update.message.text:
+        await update.effective_message.reply_text("Usage: /withdrawal_reconcile <withdrawal_id> CONFIRM")
+        return
+    parts = update.message.text.split()
+    if len(parts) < 3 or not parts[1].isdigit() or parts[2].upper() != "CONFIRM":
+        await update.effective_message.reply_text("Usage: /withdrawal_reconcile <withdrawal_id> CONFIRM")
+        return
+    wid = int(parts[1])
+    conn, wallet, _, _ = _services()
+    try:
+        row = conn.execute("SELECT id,status FROM withdrawals WHERE id=?", (wid,)).fetchone()
+        if not row or row["status"] not in {"submitted", "broadcasted", "signer_retry"}:
+            await update.effective_message.reply_text("Withdrawal is not in a reconcilable state")
+            return
+        count = SignerService().process_withdrawals(wallet)
+        conn.execute("INSERT INTO admin_actions(admin_user_id,action_type,data_json) VALUES(?,?,?)", (update.effective_user.id, "withdrawal_reconcile", json.dumps({"withdrawal_id": wid, "processed": count})))
+        conn.commit()
+        await update.effective_message.reply_text(f"Reconciliation cycle complete (processed={count}).")
+    finally:
+        conn.close()
+
 async def revenue_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_IDS:
         await update.effective_message.reply_text("Admin only")
@@ -2502,7 +2553,7 @@ async def run_signer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     conn, wallet, _, _ = _services()
     try:
-        count = SignerService().process_pending_withdrawals(wallet)
+        count = SignerService().process_withdrawals(wallet)
         conn.commit()
         await update.effective_message.reply_text(f"Signer processed {count} withdrawals")
     finally:
@@ -3489,6 +3540,8 @@ def main() -> None:
     app.add_handler(CommandHandler("signer_retry_detail", signer_retry_detail))
     app.add_handler(CommandHandler("signer_retry_action", signer_retry_action))
     app.add_handler(CommandHandler("run_signer", run_signer))
+    app.add_handler(CommandHandler("unresolved_withdrawals", unresolved_withdrawals))
+    app.add_handler(CommandHandler("withdrawal_reconcile", withdrawal_reconcile))
     app.add_handler(CommandHandler("revenue", revenue_report))
     app.add_handler(CommandHandler("support", support_team))
     app.add_handler(CommandHandler("freeze", freeze_user))

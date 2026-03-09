@@ -54,9 +54,17 @@ CREATE TABLE IF NOT EXISTS withdrawals (
   asset TEXT NOT NULL CHECK(asset IN ('BTC','LTC','ETH','USDT')),
   amount TEXT NOT NULL,
   destination_address TEXT NOT NULL,
-  status TEXT NOT NULL CHECK(status IN ('pending','broadcasted','failed','signer_retry')),
+  status TEXT NOT NULL CHECK(status IN ('pending','submitted','broadcasted','confirmed','failed','signer_retry')),
   txid TEXT,
   failure_reason TEXT,
+  provider_origin TEXT,
+  provider_ref TEXT,
+  idempotency_key TEXT,
+  external_status TEXT,
+  submitted_at TEXT,
+  broadcasted_at TEXT,
+  last_reconciled_at TEXT,
+  tx_metadata_json TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY(user_id) REFERENCES users(id)
 );
@@ -156,6 +164,7 @@ CREATE TABLE IF NOT EXISTS reviews (
 
 CREATE INDEX IF NOT EXISTS idx_ledger_entries_account_owner_asset ON ledger_entries(account_type, account_owner_id, asset);
 CREATE INDEX IF NOT EXISTS idx_withdrawals_user_status_created ON withdrawals(user_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_withdrawals_unresolved_status_created ON withdrawals(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_escrow_locks_user_asset_status ON escrow_locks(user_id, asset, status);
 CREATE INDEX IF NOT EXISTS idx_wallet_addresses_asset_address ON wallet_addresses(asset, address);
 CREATE INDEX IF NOT EXISTS idx_wallet_addresses_chain_fingerprint ON wallet_addresses(chain_family, address_fingerprint);

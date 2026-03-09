@@ -150,10 +150,26 @@ def init_db(conn: sqlite3.Connection) -> None:
 
     if "failure_reason" not in withdrawal_cols:
         conn.execute("ALTER TABLE withdrawals ADD COLUMN failure_reason TEXT")
+    if "provider_origin" not in withdrawal_cols:
+        conn.execute("ALTER TABLE withdrawals ADD COLUMN provider_origin TEXT")
+    if "provider_ref" not in withdrawal_cols:
+        conn.execute("ALTER TABLE withdrawals ADD COLUMN provider_ref TEXT")
+    if "idempotency_key" not in withdrawal_cols:
+        conn.execute("ALTER TABLE withdrawals ADD COLUMN idempotency_key TEXT")
+    if "external_status" not in withdrawal_cols:
+        conn.execute("ALTER TABLE withdrawals ADD COLUMN external_status TEXT")
+    if "submitted_at" not in withdrawal_cols:
+        conn.execute("ALTER TABLE withdrawals ADD COLUMN submitted_at TEXT")
+    if "broadcasted_at" not in withdrawal_cols:
+        conn.execute("ALTER TABLE withdrawals ADD COLUMN broadcasted_at TEXT")
+    if "last_reconciled_at" not in withdrawal_cols:
+        conn.execute("ALTER TABLE withdrawals ADD COLUMN last_reconciled_at TEXT")
+    if "tx_metadata_json" not in withdrawal_cols:
+        conn.execute("ALTER TABLE withdrawals ADD COLUMN tx_metadata_json TEXT")
 
     table_sql_row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='withdrawals'").fetchone()
     table_sql = str(table_sql_row["sql"] or "") if table_sql_row else ""
-    if "signer_retry" not in table_sql:
+    if "submitted" not in table_sql or "confirmed" not in table_sql or "signer_retry" not in table_sql:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS withdrawals_new (
@@ -162,9 +178,17 @@ def init_db(conn: sqlite3.Connection) -> None:
               asset TEXT NOT NULL CHECK(asset IN ('BTC','LTC','ETH','USDT')),
               amount TEXT NOT NULL,
               destination_address TEXT NOT NULL,
-              status TEXT NOT NULL CHECK(status IN ('pending','broadcasted','failed','signer_retry')),
+              status TEXT NOT NULL CHECK(status IN ('pending','submitted','broadcasted','confirmed','failed','signer_retry')),
               txid TEXT,
               failure_reason TEXT,
+              provider_origin TEXT,
+              provider_ref TEXT,
+              idempotency_key TEXT,
+              external_status TEXT,
+              submitted_at TEXT,
+              broadcasted_at TEXT,
+              last_reconciled_at TEXT,
+              tx_metadata_json TEXT,
               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
               FOREIGN KEY(user_id) REFERENCES users(id)
             )
@@ -172,13 +196,23 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
         conn.execute(
             """
-            INSERT INTO withdrawals_new(id,user_id,asset,amount,destination_address,status,txid,failure_reason,created_at)
-            SELECT id,user_id,asset,amount,destination_address,status,txid,failure_reason,created_at FROM withdrawals
+            INSERT INTO withdrawals_new(id,user_id,asset,amount,destination_address,status,txid,failure_reason,provider_origin,provider_ref,idempotency_key,external_status,submitted_at,broadcasted_at,last_reconciled_at,tx_metadata_json,created_at)
+            SELECT id,user_id,asset,amount,destination_address,
+                   CASE WHEN status='pending' THEN 'pending'
+                        WHEN status='broadcasted' THEN 'broadcasted'
+                        WHEN status='failed' THEN 'failed'
+                        WHEN status='signer_retry' THEN 'signer_retry'
+                        ELSE 'signer_retry' END,
+                   txid,failure_reason,provider_origin,provider_ref,idempotency_key,external_status,submitted_at,broadcasted_at,last_reconciled_at,tx_metadata_json,created_at
+            FROM withdrawals
             """
         )
         conn.execute("DROP TABLE withdrawals")
         conn.execute("ALTER TABLE withdrawals_new RENAME TO withdrawals")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_withdrawals_user_status_created ON withdrawals(user_id, status, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_withdrawals_unresolved_status_created ON withdrawals(status, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_withdrawals_provider_ref ON withdrawals(provider_origin, provider_ref) WHERE COALESCE(provider_origin, '') != '' AND COALESCE(provider_ref, '') != ''")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_withdrawals_idempotency_key ON withdrawals(idempotency_key) WHERE COALESCE(idempotency_key, '') != ''")
 
     bot_cols = {row["name"] for row in conn.execute("PRAGMA table_info(bots)").fetchall()}
     if "telegram_username" not in bot_cols:
@@ -197,6 +231,9 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_bots_telegram_username ON bots(telegram_username)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_wallet_addresses_chain_fingerprint ON wallet_addresses(chain_family, address_fingerprint)")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_addresses_provider_ref ON wallet_addresses(provider_origin, provider_ref) WHERE COALESCE(provider_origin, '') != '' AND COALESCE(provider_ref, '') != ''")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_withdrawals_unresolved_status_created ON withdrawals(status, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_withdrawals_provider_ref ON withdrawals(provider_origin, provider_ref) WHERE COALESCE(provider_origin, '') != '' AND COALESCE(provider_ref, '') != ''")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_withdrawals_idempotency_key ON withdrawals(idempotency_key) WHERE COALESCE(idempotency_key, '') != ''")
 
     from wallet_service import WalletService
 

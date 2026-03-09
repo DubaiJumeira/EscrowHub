@@ -26,7 +26,7 @@ def main() -> None:
         try:
             start = time.time()
             wallet = WalletService(conn)
-            count = SignerService().process_pending_withdrawals(wallet)
+            count = SignerService().process_withdrawals(wallet)
             upsert_watcher_status(conn, "signer_loop", success=True)
             conn.commit()
             LOGGER.info("signer cycle success processed=%s duration=%.2fs", count, time.time() - start)
