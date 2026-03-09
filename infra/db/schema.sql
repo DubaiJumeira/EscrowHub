@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS deposits (
   unique_key TEXT UNIQUE NOT NULL,
   chain_family TEXT NOT NULL,
   confirmations INTEGER NOT NULL DEFAULT 0,
-  status TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('seen','credited','rejected')),
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY(user_id) REFERENCES users(id)
 );
@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS withdrawals (
   asset TEXT NOT NULL,
   amount TEXT NOT NULL,
   destination_address TEXT NOT NULL,
-  status TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending','broadcasted','failed')),
   txid TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY(user_id) REFERENCES users(id)
@@ -94,7 +94,7 @@ CREATE TABLE IF NOT EXISTS escrow_locks (
   user_id INTEGER NOT NULL,
   asset TEXT NOT NULL,
   amount TEXT NOT NULL,
-  status TEXT NOT NULL
+  status TEXT NOT NULL CHECK(status IN ('locked','released'))
 );
 
 CREATE TABLE IF NOT EXISTS ledger_entries (
@@ -133,7 +133,8 @@ CREATE TABLE IF NOT EXISTS watcher_status (
   last_success_at TEXT,
   last_error TEXT,
   consecutive_failures INTEGER NOT NULL DEFAULT 0,
-  updated_at TEXT
+  updated_at TEXT,
+  cursor INTEGER
 );
 
 
@@ -142,7 +143,7 @@ CREATE TABLE IF NOT EXISTS reviews (
   reviewer_id INTEGER NOT NULL,
   reviewed_id INTEGER NOT NULL,
   escrow_id INTEGER NOT NULL,
-  rating INTEGER NOT NULL,
+  rating INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 5),
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(reviewer_id, escrow_id)
 );

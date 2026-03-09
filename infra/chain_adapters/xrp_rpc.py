@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# WARNING: XRP adapter is quarantined and intentionally not part of active runtime asset support (BTC/LTC/ETH/USDT only).
+# Secure alternative: use a vetted chain adapter with strict confirmation/finality and tx validation if XRP support is reintroduced.
+
 import json
 import os
 from decimal import Decimal

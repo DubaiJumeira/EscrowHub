@@ -36,6 +36,11 @@ class Settings:
     withdrawal_min_interval_seconds = int(os.getenv("WITHDRAWAL_MIN_INTERVAL_SECONDS", "30"))
     allow_fallback_derivation = _as_bool("ALLOW_FALLBACK_DERIVATION", "false")
     allow_dev_bot_bootstrap = _as_bool("ALLOW_DEV_BOT_BOOTSTRAP", "false")
+    withdrawals_enabled = _as_bool("WITHDRAWALS_ENABLED", "false")
+    encryption_kdf_iterations = int(os.getenv("ENCRYPTION_KDF_ITERATIONS", "600000"))
+    btc_xpub = os.getenv("BTC_XPUB", "").strip()
+    ltc_xpub = os.getenv("LTC_XPUB", "").strip()
+    eth_xpub = os.getenv("ETH_XPUB", "").strip()
 
 
 if os.getenv("BOT_ID") and not os.getenv("ESCROWHUB_BOT_ID"):

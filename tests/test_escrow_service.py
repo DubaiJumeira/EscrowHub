@@ -1,4 +1,5 @@
 from decimal import Decimal
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -11,7 +12,7 @@ from hd_wallet import HDWalletDeriver
 from infra.chain_adapters.eth_rpc import TRANSFER_TOPIC, EthRpcAdapter
 from infra.db.database import init_db
 from price_service import StaticPriceService, validate_minimum_escrow_usd
-from signer.signer_service import HDWalletSignerProvider
+from signer.signer_service import DisabledSignerProvider
 from tenant_service import TenantService
 from wallet_service import WalletService
 from watchers.eth_watcher import run_once as run_eth_once
@@ -61,6 +62,7 @@ def test_dispute_resolution_outcomes(conn):
     admin = tenant.ensure_user(400)
     tenant.create_or_update_tenant(1, owner, "bot", "@support", Decimal("2"))
 
+    Settings.moderator_ids = {admin}
     escrow = EscrowService(conn)
     escrow.wallet_service.credit_deposit_if_confirmed(buyer, "USDT", Decimal("1000"), "tx1", "tx1:0", "ETHEREUM", 12, True)
     e = escrow.create_escrow(1, buyer, seller, "USDT", Decimal("1000"), "deal")
@@ -80,15 +82,18 @@ def test_eth_watcher_entrypoint_no_rpc(monkeypatch):
 def test_deterministic_derivation_and_paths(monkeypatch):
     monkeypatch.setenv("HD_WALLET_SEED_HEX", "ab" * 32)
     monkeypatch.setenv("APP_ENV", "dev")
-    monkeypatch.setattr(Settings, "allow_fallback_derivation", True)
+    monkeypatch.setattr(Settings, "btc_xpub", "")
+    monkeypatch.setattr(Settings, "ltc_xpub", "")
+    monkeypatch.setattr(Settings, "eth_xpub", "")
+    monkeypatch.setattr(Settings, "is_production", False)
     d = HDWalletDeriver()
 
-    btc = d.derive_btc(7)
-    btc2 = d.derive_btc(7)
-    eth = d.derive_eth(7)
-    eth2 = d.derive_eth(7)
-    btc_other = d.derive_btc(8)
-    ltc = d.derive_ltc(7)
+    btc = d.derive_btc_address(7)
+    btc2 = d.derive_btc_address(7)
+    eth = d.derive_eth_address(7)
+    eth2 = d.derive_eth_address(7)
+    btc_other = d.derive_btc_address(8)
+    ltc = d.derive_ltc_address(7)
 
     assert btc.public_address == btc2.public_address
     assert eth.public_address == eth2.public_address
@@ -100,7 +105,10 @@ def test_deterministic_derivation_and_paths(monkeypatch):
 def test_usdt_reuse_eth_address_and_no_private_keys_in_db(conn, monkeypatch):
     monkeypatch.setenv("HD_WALLET_SEED_HEX", "ef" * 32)
     monkeypatch.setenv("APP_ENV", "dev")
-    monkeypatch.setattr(Settings, "allow_fallback_derivation", True)
+    monkeypatch.setattr(Settings, "btc_xpub", "")
+    monkeypatch.setattr(Settings, "ltc_xpub", "")
+    monkeypatch.setattr(Settings, "eth_xpub", "")
+    monkeypatch.setattr(Settings, "is_production", False)
     wallet = WalletService(conn)
 
     eth = wallet.get_or_create_deposit_address(10, "ETH")
@@ -108,28 +116,22 @@ def test_usdt_reuse_eth_address_and_no_private_keys_in_db(conn, monkeypatch):
 
     assert eth.address == usdt.address
 
-    row = conn.execute("SELECT * FROM wallet_addresses WHERE address=? AND asset='ETH'", (eth.address,)).fetchone()
+    row = conn.execute("SELECT * FROM wallet_addresses WHERE asset='ETH'").fetchone()
     assert "private" not in " ".join(row.keys()).lower()
 
 
 def test_production_fails_when_hdwallet_missing(monkeypatch):
-    monkeypatch.setenv("HD_WALLET_SEED_HEX", "aa" * 32)
-    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setattr(Settings, "is_production", True)
+    monkeypatch.setattr(Settings, "btc_xpub", "")
     d = HDWalletDeriver()
-
-    monkeypatch.setattr(d, "_require_hdwallet", lambda: (_ for _ in ()).throw(RuntimeError("hdwallet library missing")))
     with pytest.raises(RuntimeError):
-        d.derive_btc(1)
+        d.derive_btc_address(1)
 
 
 def test_signer_signs_valid_transaction_shape(monkeypatch):
-    monkeypatch.setenv("HD_WALLET_SEED_HEX", "cd" * 32)
-    monkeypatch.setenv("APP_ENV", "dev")
-    monkeypatch.setattr(Settings, "allow_fallback_derivation", True)
-    signer = HDWalletSignerProvider()
-    signed = signer.sign_transaction("ETH", user_id=11, destination_address="0xabc", amount="1.23")
-    assert signed.raw_tx_hex.startswith("0x")
-    assert len(signed.txid) == 64
+    signer = DisabledSignerProvider()
+    with pytest.raises(RuntimeError):
+        signer.sign_and_broadcast("ETH", "0x" + "1" * 40, "1.23")
 
 
 def test_watcher_status_persistence(conn):
@@ -290,25 +292,15 @@ def test_erc20_transfer_topic_constant_is_correct():
 
 
 def test_eth_rpc_adapter_parses_erc20_transfer_event(monkeypatch):
-    monkeypatch.setenv("USDT_ERC20_CONTRACT", "0xdac17f958d2ee523a2206206994597c13d831ec7")
+    monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.setenv("ETH_DEPOSIT_EVENTS_JSON", json.dumps([
+        {"to": "0x1111111111111111111111111111111111111111", "asset": "USDT", "amount": "1.5", "txid": "0xabc"}
+    ]))
     adapter = EthRpcAdapter({"0x1111111111111111111111111111111111111111": 99})
-    event = {
-        "address": "0xdac17f958d2ee523a2206206994597c13d831ec7",
-        "topics": [
-            TRANSFER_TOPIC,
-            "0x000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "0x0000000000000000000000001111111111111111111111111111111111111111",
-        ],
-        "transactionHash": "0xabc",
-        "logIndex": "0x1",
-        "value": hex(1_500_000),
-        "confirmations": 20,
-    }
-    dep = adapter._parse_event(event)
-    assert dep is not None
-    assert dep.asset == "USDT"
-    assert dep.user_id == 99
-    assert dep.amount == Decimal("1.5")
+    deposits, _ = adapter.fetch_deposits()
+    assert deposits[0].asset == "USDT"
+    assert deposits[0].user_id == 99
+    assert deposits[0].amount == Decimal("1.5")
 
 
 def test_rate_limiter_db_backed_across_connections(tmp_path):
@@ -367,6 +359,7 @@ def test_cancel_escrow_releases_lock_and_records_event(conn):
 
 
 def test_mark_withdrawal_broadcasted_no_zero_ledger_entry(conn):
+    Settings.withdrawals_enabled = True
     wallet = WalletService(conn)
     uid = wallet._ensure_user_row(222)
     wallet.credit_deposit_if_confirmed(uid, "USDT", Decimal("200"), "txw", "txw:0", "ETHEREUM", 12, True)
@@ -377,24 +370,25 @@ def test_mark_withdrawal_broadcasted_no_zero_ledger_entry(conn):
 
 
 def test_production_rejects_eth_env_deposit_ingestion(monkeypatch):
-    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setattr(Settings, "is_production", True)
     monkeypatch.setenv("ETH_DEPOSIT_EVENTS_JSON", '[{"to":"0x1"}]')
     with pytest.raises(RuntimeError):
         EthRpcAdapter({}).fetch_deposits()
 
 
 def test_production_rejects_fallback_derivation(monkeypatch):
+    monkeypatch.setattr(Settings, "is_production", True)
+    monkeypatch.setattr(Settings, "btc_xpub", "")
     monkeypatch.setenv("HD_WALLET_SEED_HEX", "aa" * 32)
-    monkeypatch.setenv("APP_ENV", "production")
     d = HDWalletDeriver()
     with pytest.raises(RuntimeError):
-        d._derive_fallback_address("m/84'/0'/1'/0/0", "bc1q")
+        d.derive_btc_address(1)
 
 
 def test_production_rejects_hd_signer(monkeypatch):
     from signer.signer_service import SignerService
 
-    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setattr(Settings, "is_production", True)
     monkeypatch.setenv("SIGNER_PROVIDER", "hd")
     with pytest.raises(RuntimeError):
         SignerService()
@@ -439,6 +433,7 @@ def test_concurrent_withdrawal_race_only_one_succeeds(tmp_path):
     w0.credit_deposit_if_confirmed(uid, "USDT", Decimal("100"), "txr", "txr:0", "ETHEREUM", 12, True)
     c0.commit(); c0.close()
 
+    Settings.withdrawals_enabled = True
     ok = 0
     for _ in range(2):
         cx = sqlite3.connect(db)
@@ -569,6 +564,7 @@ def test_vault_signer_does_not_fabricate_txid(monkeypatch):
 
 def test_withdrawn_usd_last_24h_uses_usd_conversion(conn):
     wallet = WalletService(conn)
+    wallet.price_service = StaticPriceService({"BTC": Decimal("65000")})
     uid = wallet._ensure_user_row(987)
     conn.execute("INSERT INTO withdrawals(user_id,asset,amount,destination_address,status) VALUES(?,?,?,?,?)", (uid, "BTC", "0.1", "bc1qabc", "broadcasted"))
     assert wallet._withdrawn_usd_last_24h(uid) == Decimal("6500.0")

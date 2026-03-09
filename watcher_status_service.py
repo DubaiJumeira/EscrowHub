@@ -38,5 +38,26 @@ def read_watcher_status(conn, watcher_names: list[str]) -> dict[str, dict]:
             "last_error": None,
             "consecutive_failures": 0,
             "updated_at": None,
+            "cursor": None,
         }
     return out
+
+
+def read_watcher_cursor(conn, watcher_name: str) -> int | None:
+    row = conn.execute("SELECT cursor FROM watcher_status WHERE watcher_name=?", (watcher_name,)).fetchone()
+    if not row:
+        return None
+    value = row["cursor"]
+    return int(value) if value is not None else None
+
+
+def write_watcher_cursor(conn, watcher_name: str, cursor: int) -> None:
+    row = conn.execute("SELECT watcher_name FROM watcher_status WHERE watcher_name=?", (watcher_name,)).fetchone()
+    now = datetime.utcnow().isoformat()
+    if row:
+        conn.execute("UPDATE watcher_status SET cursor=?, updated_at=? WHERE watcher_name=?", (int(cursor), now, watcher_name))
+        return
+    conn.execute(
+        "INSERT INTO watcher_status(watcher_name,last_run_at,last_success_at,last_error,consecutive_failures,updated_at,cursor) VALUES(?,?,?,?,?,?,?)",
+        (watcher_name, None, None, None, 0, now, int(cursor)),
+    )

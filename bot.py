@@ -1085,6 +1085,14 @@ async def deposit_cancel_to_assets(update: Update, context: ContextTypes.DEFAULT
 
 
 async def withdraw_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not Settings.withdrawals_enabled:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(
+            _profile_section("<b>🏦 Withdraw</b>", ["Withdrawals are temporarily unavailable while secure chain signing is being finalized."]),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="profile_open")]]),
+            parse_mode=ParseMode.HTML,
+        )
+        return ConversationHandler.END
     query = update.callback_query
     await query.answer()
     conn, wallet, tenant, _ = _services()
@@ -3012,6 +3020,9 @@ async def mod_resolve_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     parts = query.data.split(":")
     escrow_id = int(parts[1])
     resolution = parts[2]  # release_seller or refund_buyer
+    if resolution not in {"release_seller", "refund_buyer", "split"}:
+        await query.answer("Invalid resolution", show_alert=True)
+        return
 
     conn, _, tenant, escrow_svc = _services()
     try:
@@ -3290,7 +3301,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(esc_active_dispute_handler, pattern=r"^esc_active_dispute:\d+$"))
     app.add_handler(CallbackQueryHandler(esc_dispute_submit_handler, pattern=r"^esc_dispute_submit:\d+$"))
     app.add_handler(CallbackQueryHandler(esc_view_dispute_handler, pattern=r"^esc_view_dispute:\d+(:.+)?$"))
-    app.add_handler(CallbackQueryHandler(mod_resolve_handler, pattern=r"^mod_resolve:\d+:(release_seller|refund_buyer)$"))
+    app.add_handler(CallbackQueryHandler(mod_resolve_handler, pattern=r"^mod_resolve:\d+:(release_seller|refund_buyer|split)$"))
     app.add_handler(CallbackQueryHandler(mod_group_handler, pattern=r"^mod_group:\d+$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, esc_dispute_reason_message))
     app.add_handler(CallbackQueryHandler(esc_cancel_pending_handler, pattern=r"^esc_cancel_pending:\d+$"))

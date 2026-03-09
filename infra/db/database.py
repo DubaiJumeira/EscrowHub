@@ -19,4 +19,7 @@ def get_connection() -> sqlite3.Connection:
 def init_db(conn: sqlite3.Connection) -> None:
     schema = Path("infra/db/schema.sql").read_text()
     conn.executescript(schema)
+    watcher_cols = {row["name"] for row in conn.execute("PRAGMA table_info(watcher_status)").fetchall()}
+    if "cursor" not in watcher_cols:
+        conn.execute("ALTER TABLE watcher_status ADD COLUMN cursor INTEGER")
     conn.commit()

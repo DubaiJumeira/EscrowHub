@@ -5,6 +5,7 @@ import os
 import time
 
 from infra.db.database import get_connection, init_db
+from wallet_service import WalletService
 from watcher_status_service import upsert_watcher_status
 from watchers.btc_watcher import run_once
 
@@ -13,8 +14,7 @@ LOGGER = logging.getLogger("run_btc_watcher")
 
 
 def _address_map(conn) -> dict[str, int]:
-    rows = conn.execute("SELECT address, user_id FROM wallet_addresses WHERE asset='BTC'").fetchall()
-    return {str(r["address"]): int(r["user_id"]) for r in rows}
+    return WalletService(conn).monitored_deposit_address_map(["BTC"])
 
 
 def main() -> None:
