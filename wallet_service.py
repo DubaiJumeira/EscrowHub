@@ -17,6 +17,7 @@ from address_provider import build_address_provider
 from hd_wallet import HDWalletDeriver
 from ledger_service import LedgerService
 from price_service import CoinGeckoPriceService, StaticPriceService
+from error_sanitizer import sanitize_runtime_error
 
 SUPPORTED_ASSETS = set(Settings.supported_assets)
 LOGGER = logging.getLogger(__name__)
@@ -665,7 +666,7 @@ class WalletService:
             return
         self.conn.execute(
             "UPDATE withdrawals SET status=?, txid=NULL, external_status='ambiguous', failure_reason=?, last_reconciled_at=CURRENT_TIMESTAMP WHERE id=?",
-            ("signer_retry", (reason or "unknown signer/provider error")[:500], withdrawal_id),
+            ("signer_retry", sanitize_runtime_error(reason, max_len=220), withdrawal_id),
         )
 
     def mark_withdrawal_failed(self, withdrawal_id: int, reason: str) -> None:
@@ -674,7 +675,7 @@ class WalletService:
             return
         self.conn.execute(
             "UPDATE withdrawals SET status=?, txid=NULL, external_status='failed', failure_reason=? WHERE id=?",
-            ("failed", (reason or "unknown failure")[:500], withdrawal_id),
+            ("failed", sanitize_runtime_error(reason, max_len=220), withdrawal_id),
         )
         self.ledger.add_entry("USER", row["user_id"], row["user_id"], row["asset"], Decimal(row["amount"]), "WITHDRAWAL_RELEASE", "withdrawal", withdrawal_id)
 
@@ -707,7 +708,16 @@ class WalletService:
         if result_asset and result_asset != str(row["asset"] or "").strip().upper():
             raise RuntimeError("provider asset mismatch")
         metadata = getattr(result, "metadata", None)
-        metadata_json = json.dumps(metadata, sort_keys=True)[:2000] if isinstance(metadata, dict) else None
+        metadata_json = None
+        if metadata is not None:
+            if not isinstance(metadata, dict):
+                # WARNING: malformed provider metadata is rejected to fail closed and avoid persisting untrusted payloads.
+                raise RuntimeError("provider metadata must be an object")
+            metadata_json_candidate = json.dumps(metadata, sort_keys=True)
+            if len(metadata_json_candidate) > 2000:
+                # WARNING: oversized provider metadata is rejected to avoid database/log payload abuse.
+                raise RuntimeError("provider metadata too large")
+            metadata_json = metadata_json_candidate
         status = str(getattr(result, "status", "") or "").strip().lower()
         txid = str(getattr(result, "txid", "") or "").strip() or None
         if status in {"broadcasted", "confirmed"} and not self._txid_sane_for_asset(str(row["asset"]), txid):
@@ -719,7 +729,7 @@ class WalletService:
                 provider_origin,
                 new_ref,
                 idempotency_key,
-                (str(getattr(result, "external_status", "") or getattr(result, "status", "") or "")[:64] or None),
+                sanitize_runtime_error(str(getattr(result, "external_status", "") or getattr(result, "status", "") or ""), max_len=64) or None,
                 getattr(result, "submitted_at", None),
                 getattr(result, "broadcasted_at", None),
                 metadata_json,

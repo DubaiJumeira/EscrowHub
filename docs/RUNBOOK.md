@@ -85,3 +85,9 @@ Withdrawals remain disabled by default. If enabled for controlled testing, ambig
 - Signer reconciliation uses status-aware backoff (`submitted` shorter, `broadcasted` moderate, `signer_retry` slower) gated by `last_reconciled_at`.
 - Withdrawal provider identity (`provider_origin`, `provider_ref`) is immutable once assigned and cannot be rebound across withdrawals.
 - External withdrawal provider deployment is still required for true go-live; repo hardening does not replace real custody infrastructure.
+
+## Production safety posture
+- Fatal startup integrity/configuration errors fail closed and stop the process; `run_bot.py` must not restart-loop on these failures.
+- Watcher/signer/operator status surfaces persist and display sanitized error summaries only (secrets/payloads redacted).
+- Single-node SQLite is a supported production posture for this repo; multi-node shared-database topology is not the target architecture.
+- External withdrawal/address providers remain the final go-live dependency and must be configured/operated securely.

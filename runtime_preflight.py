@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 
 from infra.db.database import get_connection, init_db
+from error_sanitizer import sanitize_runtime_error
 from signer.signer_service import SignerService
 from wallet_service import WalletService
 
@@ -43,14 +44,14 @@ def run_startup_preflight(service_name: str) -> PreflightStatus:
         except Exception as exc:
             route_integrity_ready = False
             fatal_integrity = True
-            reasons.append(f"route integrity failed: {exc}")
+            reasons.append(f"route integrity failed: {sanitize_runtime_error(exc)}")
         wallet = WalletService(conn)
         try:
             wallet.ensure_wallet_route_integrity()
             wallet.verify_address_derivation_consistency(sample_size=None)
         except Exception as exc:
             route_integrity_ready = False
-            reasons.append(f"route integrity failed: {exc}")
+            reasons.append(f"route integrity failed: {sanitize_runtime_error(exc)}")
             fatal_integrity = True
 
         deposit_ready = False
@@ -63,7 +64,7 @@ def run_startup_preflight(service_name: str) -> PreflightStatus:
                 wallet.assert_startup_deposit_issuance_ready()
                 deposit_ready = True
             except Exception as exc:
-                deposit_error = str(exc)
+                deposit_error = sanitize_runtime_error(exc)
                 reasons.append(f"deposit provider unavailable: {deposit_error}")
                 LOGGER.warning("startup preflight (%s): bot degraded mode: %s", service_name, deposit_error)
             status = PreflightStatus(

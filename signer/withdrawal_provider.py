@@ -7,6 +7,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from config.settings import Settings
+from error_sanitizer import sanitize_runtime_error
 from signer.errors import RetryableSignerError, SignerConfigurationError
 
 SUPPORTED_WITHDRAWAL_ASSETS = {"BTC", "LTC", "ETH", "USDT"}
@@ -89,7 +90,7 @@ class HttpWithdrawalProvider(WithdrawalProvider):
             if not SUPPORTED_WITHDRAWAL_ASSETS.issubset(assets):
                 return False, "healthcheck missing supported_assets coverage"
         except Exception as exc:
-            return False, f"healthcheck failed: {exc}"
+            return False, f"healthcheck failed: {sanitize_runtime_error(exc)}"
         return True, None
 
     def execute_withdrawal(self, req: WithdrawalExecutionRequest) -> WithdrawalExecutionResult:

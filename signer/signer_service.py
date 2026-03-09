@@ -6,6 +6,7 @@ from decimal import Decimal
 from urllib.request import Request, urlopen
 
 from config.settings import Settings
+from error_sanitizer import sanitize_runtime_error
 from signer.errors import AmbiguousBroadcastError, DeterministicSigningError, RetryableSignerError
 from signer.withdrawal_provider import (
     DisabledWithdrawalProvider,
@@ -127,11 +128,11 @@ class SignerService:
         except Exception as exc:
             LOGGER.exception("withdrawal processing failed id=%s", w["id"])
             if isinstance(exc, (AmbiguousBroadcastError, RetryableSignerError)):
-                wallet_service.mark_withdrawal_signer_retry(int(w["id"]), str(exc))
+                wallet_service.mark_withdrawal_signer_retry(int(w["id"]), sanitize_runtime_error(exc))
             elif isinstance(exc, DeterministicSigningError):
-                wallet_service.mark_withdrawal_failed(int(w["id"]), str(exc))
+                wallet_service.mark_withdrawal_failed(int(w["id"]), sanitize_runtime_error(exc))
             else:
-                wallet_service.mark_withdrawal_signer_retry(int(w["id"]), str(exc))
+                wallet_service.mark_withdrawal_signer_retry(int(w["id"]), sanitize_runtime_error(exc))
             return 0
 
     def _reconcile_single(self, wallet_service, w: dict) -> int:
@@ -160,6 +161,6 @@ class SignerService:
                 wallet_service.mark_withdrawal_confirmed(int(w["id"]), txid or "", result.provider_ref, result.external_status)
             return 1
         except Exception as exc:
-            wallet_service.mark_withdrawal_signer_retry(int(w["id"]), str(exc))
+            wallet_service.mark_withdrawal_signer_retry(int(w["id"]), sanitize_runtime_error(exc))
             wallet_service.mark_withdrawal_reconciled(int(w["id"]))
             return 0

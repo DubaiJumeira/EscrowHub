@@ -186,6 +186,8 @@ def init_db(conn: sqlite3.Connection) -> None:
     watcher_cols = {row["name"] for row in conn.execute("PRAGMA table_info(watcher_status)").fetchall()}
     if "cursor" not in watcher_cols:
         conn.execute("ALTER TABLE watcher_status ADD COLUMN cursor INTEGER")
+    if "health_state" not in watcher_cols:
+        conn.execute("ALTER TABLE watcher_status ADD COLUMN health_state TEXT NOT NULL DEFAULT 'ok'")
 
     withdrawal_cols = {row["name"] for row in conn.execute("PRAGMA table_info(withdrawals)").fetchall()}
     wallet_cols = {row["name"] for row in conn.execute("PRAGMA table_info(wallet_addresses)").fetchall()}
