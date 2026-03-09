@@ -41,3 +41,15 @@ Service preflight is role-aware: bot may run in degraded mode when new deposit i
 Withdrawals remain disabled by default (`WITHDRAWALS_ENABLED=false`).
 
 See `docs/RUNBOOK.md` for setup and operations.
+
+
+## Supported assets (strict)
+Runtime, DB constraints, and tests support only: **BTC, LTC, ETH, USDT**.
+
+## Withdrawal provider contract (production-safe)
+Withdrawals use a typed signer boundary with deterministic idempotency keys (`wd:<id>:<hash>`), validated request payloads, and explicit result statuses:
+- success-like: `submitted|broadcasted|confirmed` (must include txid)
+- deterministic failure: `rejected|permanent_failure` (safe to release reservation)
+- unresolved: `retryable|ambiguous|unknown` (forced to `signer_retry`, funds remain reserved)
+
+Unknown/malformed provider outcomes fail closed to `signer_retry`.

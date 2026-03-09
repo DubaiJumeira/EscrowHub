@@ -63,3 +63,19 @@ Only BTC, LTC, ETH, and USDT are supported in active runtime.
 
 ## Withdrawal failure semantics
 Withdrawals remain disabled by default. If enabled for controlled testing, ambiguous signer/provider failures are moved to `signer_retry` state (funds stay reserved) and are not auto-released until operator reconciliation.
+
+
+### Withdrawal signer provider contract
+- `SIGNER_PROVIDER=vault` is the only production provider mode.
+- Production requires `VAULT_ADDR` (HTTPS) and `VAULT_TOKEN`.
+- Requests are submitted with deterministic idempotency keys and asset/address/amount/user binding.
+- Provider responses are mapped to escrow-safe states:
+  - `submitted|broadcasted|confirmed` => internal `broadcasted` (txid required)
+  - `rejected|permanent_failure` => internal `failed` (reservation released)
+  - `retryable|ambiguous|unknown/malformed` => internal `signer_retry` (reservation retained)
+
+### Signer retry operator workflow
+- `/watcher_status` for provider + signer + backlog health.
+- `/signer_retry_list` for backlog summary.
+- `/signer_retry_detail <withdrawal_id>` for sanitized details.
+- `/signer_retry_action <withdrawal_id> <requeue|fail> CONFIRM` for explicit reconciliation.
