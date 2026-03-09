@@ -14,7 +14,9 @@ LOGGER = logging.getLogger("run_btc_watcher")
 
 
 def _address_map(conn) -> dict[str, int]:
-    return WalletService(conn).monitored_deposit_address_map(["BTC"])
+    wallet = WalletService(conn)
+    wallet.verify_address_derivation_consistency(sample_size=25)
+    return wallet.monitored_deposit_address_map(["BTC"])
 
 
 def main() -> None:

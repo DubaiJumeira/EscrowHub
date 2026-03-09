@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import sqlite3
 
-from bot import _clear_draft_flow, _is_rate_limited, _is_user_frozen, _notify_safe, _render_user_profile, _set_frozen_state, _user_profile
+from bot import _clear_draft_flow, _is_rate_limited, _is_user_frozen, _notify_safe, _render_user_profile, _set_frozen_state, _user_profile, revenue_report
 from escrow_service import EscrowService
 from fee_service import FeeService
 from hd_wallet import HDWalletDeriver
@@ -60,7 +60,7 @@ def test_dispute_resolution_outcomes(conn):
     seller = tenant.ensure_user(200)
     owner = tenant.ensure_user(300)
     admin = tenant.ensure_user(400)
-    tenant.create_or_update_tenant(1, owner, "bot", "@support", Decimal("2"))
+    tenant.create_or_update_tenant(1, owner, "bot", "bot", "@support", Decimal("2"))
 
     Settings.moderator_ids = {admin}
     escrow = EscrowService(conn)
@@ -147,7 +147,7 @@ def _seed_tenant(conn):
     buyer = tenant.ensure_user(100, "buyer")
     seller = tenant.ensure_user(200, "seller")
     owner = tenant.ensure_user(300, "owner")
-    tenant.create_or_update_tenant(1, owner, "bot", "@support", Decimal("2"))
+    tenant.create_or_update_tenant(1, owner, "bot", "bot", "@support", Decimal("2"))
     return tenant, buyer, seller, owner
 
 
@@ -581,3 +581,38 @@ def test_credit_deposit_duplicate_returns_false(conn):
     wallet = WalletService(conn)
     assert wallet.credit_deposit_if_confirmed(1, "USDT", Decimal("10"), "txd1", "dup:key", "ETHEREUM", 12, True) is True
     assert wallet.credit_deposit_if_confirmed(1, "USDT", Decimal("10"), "txd1", "dup:key", "ETHEREUM", 12, True) is False
+
+
+def test_admin_revenue_command_access_control(monkeypatch, conn):
+    import asyncio
+
+    wallet = WalletService(conn)
+    conn.execute("INSERT INTO ledger_entries(account_type,account_owner_id,user_id,asset,amount,entry_type,ref_type,ref_id) VALUES(?,?,?,?,?,?,?,?)", ("PLATFORM_REVENUE", None, None, "USDT", "2.50", "x", "x", 1))
+
+    monkeypatch.setattr("bot.ADMIN_IDS", {999})
+
+    class Msg:
+        def __init__(self):
+            self.replies = []
+        async def reply_text(self, txt, **kwargs):
+            self.replies.append(txt)
+
+    class U:
+        def __init__(self, uid):
+            self.id = uid
+
+    def _svc():
+        return (conn, wallet, None, None)
+
+    monkeypatch.setattr("bot._services", _svc)
+
+    denied_msg = Msg()
+    denied = SimpleNamespace(effective_user=U(1), effective_message=denied_msg)
+    asyncio.run(revenue_report(denied, None))
+    assert denied_msg.replies[-1] == "Admin only"
+
+    allowed_msg = Msg()
+    allowed = SimpleNamespace(effective_user=U(999), effective_message=allowed_msg)
+    asyncio.run(revenue_report(allowed, None))
+    assert "Platform revenue balances" in allowed_msg.replies[-1]
+    assert "USDT: 2.50" in allowed_msg.replies[-1]

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+
+from config.settings import Settings
 from decimal import Decimal
 from urllib.request import Request, urlopen
 
@@ -20,6 +22,7 @@ class EthRpcAdapter(ChainAdapter):
         self.usdt_contract = os.getenv("USDT_ERC20_CONTRACT", "").lower()
         self.network = os.getenv("ETH_NETWORK", "ethereum")
         self.app_env = os.getenv("APP_ENV", "dev").lower()
+        self.max_blocks_per_run = max(1, int(Settings.eth_max_blocks_per_run))
 
     def _rpc(self, method: str, params: list) -> dict:
         if not self.rpc_url:
@@ -88,11 +91,12 @@ class EthRpcAdapter(ChainAdapter):
         start = self._load_cursor()
         if finalized <= start:
             return [], finalized
+        end_block = min(finalized, start + self.max_blocks_per_run)
 
         watched_topics = ["0x" + "0" * 24 + a.lower().replace("0x", "") for a in self.address_user_map.keys()]
         deposits: list[ChainDeposit] = []
 
-        for block_num in range(start + 1, finalized + 1):
+        for block_num in range(start + 1, end_block + 1):
             block = self._rpc("eth_getBlockByNumber", [hex(block_num), True]).get("result") or {}
             for tx in block.get("transactions", []) or []:
                 to_addr = self._normalize_hex_address(tx.get("to"))
@@ -106,7 +110,7 @@ class EthRpcAdapter(ChainAdapter):
                     deposits.append(ChainDeposit(uid, "ETH", amount, txid, f"{self.network}:eth:{txid}:ETH:0:{to_addr}", self.confirmations_required, True))
 
         if self.usdt_contract:
-            erc20_logs = self._rpc("eth_getLogs", [{"fromBlock": hex(start + 1), "toBlock": hex(finalized), "address": self.usdt_contract, "topics": [TRANSFER_TOPIC, None, watched_topics]}]).get("result", [])
+            erc20_logs = self._rpc("eth_getLogs", [{"fromBlock": hex(start + 1), "toBlock": hex(end_block), "address": self.usdt_contract, "topics": [TRANSFER_TOPIC, None, watched_topics]}]).get("result", [])
             for ev in erc20_logs:
                 topics = ev.get("topics") or []
                 if len(topics) < 3:
@@ -120,7 +124,7 @@ class EthRpcAdapter(ChainAdapter):
                 if txid and amount > 0:
                     li = self._hex_to_int(ev.get("logIndex"))
                     deposits.append(ChainDeposit(uid, "USDT", amount, txid, f"{self.network}:eth:{txid}:USDT:{li}:{to_addr}", self.confirmations_required, True))
-        return deposits, finalized
+        return deposits, end_block
 
     def broadcast_raw_transaction(self, asset: str, raw_tx_hex: str) -> str:
         return self._rpc("eth_sendRawTransaction", [raw_tx_hex]).get("result", "")
