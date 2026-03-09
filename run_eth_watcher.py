@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import os
 import time
@@ -13,25 +12,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 LOGGER = logging.getLogger("run_eth_watcher")
 
 
-def _address_map() -> dict[str, int]:
-    raw = os.getenv("ETH_ADDRESS_USER_MAP", "{}")
-    try:
-        data = json.loads(raw)
-        return {str(k): int(v) for k, v in data.items()}
-    except Exception:
-        LOGGER.warning("invalid ETH_ADDRESS_USER_MAP, using empty map")
-        return {}
-
-
+def _address_map(conn) -> dict[str, int]:
+    rows = conn.execute("SELECT address, user_id FROM wallet_addresses WHERE asset IN ('ETH','USDT')").fetchall()
+    return {str(r["address"]).lower(): int(r["user_id"]) for r in rows}
 
 
 def _validate_erc20_config() -> None:
     usdt = os.getenv("USDT_ERC20_CONTRACT", "").strip()
-    usdc = os.getenv("USDC_ERC20_CONTRACT", "").strip()
     if not usdt:
         LOGGER.warning("USDT_ERC20_CONTRACT is not set; USDT deposit events will be ignored")
-    if not usdc:
-        LOGGER.warning("USDC_ERC20_CONTRACT is not set; USDC deposit events will be ignored")
+
 
 def main() -> None:
     enabled = os.getenv("ETH_WATCHER_ENABLED", "true").lower() == "true"
@@ -47,7 +37,7 @@ def main() -> None:
         init_db(conn)
         try:
             start = time.time()
-            credited = run_once(_address_map())
+            credited = run_once(_address_map(conn))
             upsert_watcher_status(conn, "eth_watcher", success=True)
             conn.commit()
             LOGGER.info("eth watcher cycle success credited=%s duration=%.2fs", credited, time.time() - start)

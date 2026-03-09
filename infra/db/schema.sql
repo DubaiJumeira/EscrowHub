@@ -138,3 +138,11 @@ CREATE TABLE IF NOT EXISTS reviews (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(reviewer_id, escrow_id)
 );
+
+
+CREATE INDEX IF NOT EXISTS idx_ledger_entries_account_owner_asset ON ledger_entries(account_type, account_owner_id, asset);
+CREATE INDEX IF NOT EXISTS idx_withdrawals_user_status_created ON withdrawals(user_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_escrow_locks_user_asset_status ON escrow_locks(user_id, asset, status);
+CREATE INDEX IF NOT EXISTS idx_wallet_addresses_asset_address ON wallet_addresses(asset, address);
+CREATE INDEX IF NOT EXISTS idx_escrows_status_buyer_seller_created ON escrows(status, buyer_id, seller_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_reviews_reviewed_created ON reviews(reviewed_id, created_at);

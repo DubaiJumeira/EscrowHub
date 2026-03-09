@@ -16,7 +16,6 @@ class EthRpcAdapter(ChainAdapter):
         self.address_user_map = {k.lower(): int(v) for k, v in address_user_map.items()}
         self.confirmations_required = int(os.getenv("ETH_CONFIRMATIONS_REQUIRED", "12"))
         self.usdt_contract = os.getenv("USDT_ERC20_CONTRACT", "").lower()
-        self.usdc_contract = os.getenv("USDC_ERC20_CONTRACT", "").lower()
         self.network = os.getenv("ETH_NETWORK", "ethereum")
 
     def _rpc(self, method: str, params: list) -> dict:
@@ -48,8 +47,6 @@ class EthRpcAdapter(ChainAdapter):
             return "ETH"
         if self.usdt_contract and contract == self.usdt_contract:
             return "USDT"
-        if self.usdc_contract and contract == self.usdc_contract:
-            return "USDC"
         return None
 
     def _event_amount(self, value_hex: str | None, asset: str) -> Decimal:
@@ -59,7 +56,6 @@ class EthRpcAdapter(ChainAdapter):
 
     def _parse_event(self, event: dict) -> ChainDeposit | None:
         to_addr = ""
-        asset = "ETH"
         if event.get("type") == "erc20":
             asset = self._asset_for_contract(event.get("contract_address")) or ""
             if not asset:
@@ -97,16 +93,20 @@ class EthRpcAdapter(ChainAdapter):
         finalized = bool(event.get("finalized", confirmations >= self.confirmations_required))
         return ChainDeposit(user_id=user_id, asset=asset, amount=amount, txid=txid, unique_key=unique_key, confirmations=confirmations, finalized=finalized)
 
-    def fetch_deposits(self) -> list[ChainDeposit]:
-        # External watcher pipelines should pass normalized events through ETH_DEPOSIT_EVENTS_JSON
-        # or call this adapter with already fetched transfer/log data.
+    def _fetch_env_events(self) -> list[dict]:
         raw_events = os.getenv("ETH_DEPOSIT_EVENTS_JSON", "[]")
+        if raw_events.strip() not in {"", "[]"} and os.getenv("APP_ENV", "dev").lower() == "production":
+            raise RuntimeError("ETH_DEPOSIT_EVENTS_JSON ingestion is disabled in production")
         try:
             events = json.loads(raw_events)
-            if not isinstance(events, list):
-                return []
+            return events if isinstance(events, list) else []
         except Exception:
             return []
+
+    def fetch_deposits(self) -> list[ChainDeposit]:
+        # TODO: add full RPC log polling implementation.
+        # For now, only dev/test can feed normalized events via env variable.
+        events = self._fetch_env_events()
         deposits: list[ChainDeposit] = []
         for ev in events:
             if not isinstance(ev, dict):

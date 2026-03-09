@@ -2,14 +2,25 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import logging
 import os
 from dataclasses import dataclass
+
+from config.settings import Settings
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class DerivedKey:
     path: str
     private_key_hex: str
+    public_address: str
+
+
+@dataclass(frozen=True)
+class DerivedAddress:
+    path: str
     public_address: str
 
 
@@ -25,6 +36,14 @@ class HDWalletDeriver:
             raise RuntimeError("HD_WALLET_SEED_HEX is missing")
         return self.seed_hex
 
+    def _allow_fallback(self) -> bool:
+        if self.app_env == "production":
+            raise RuntimeError("fallback derivation is disabled in production")
+        if not Settings.allow_fallback_derivation:
+            raise RuntimeError("fallback derivation disabled; set ALLOW_FALLBACK_DERIVATION=true for non-production")
+        LOGGER.warning("Using fallback HD derivation path in non-production")
+        return True
+
     def _require_hdwallet(self):
         try:
             return importlib.import_module("hdwallet")
@@ -34,7 +53,7 @@ class HDWalletDeriver:
             return None
 
     def _derive_fallback(self, path: str, prefix: str) -> DerivedKey:
-        # Non-production deterministic fallback only.
+        self._allow_fallback()
         seed = self._require_seed()
         digest = hashlib.sha256(f"{seed}:{path}".encode()).hexdigest()
         priv = hashlib.sha256(f"priv:{digest}".encode()).hexdigest()
@@ -66,7 +85,6 @@ class HDWalletDeriver:
                 coin_cls = getattr(cryptocurrencies, "EthereumMainnet")
 
             wallet = HDWallet(cryptocurrency=coin_cls)
-            # common API pattern
             if hasattr(wallet, "from_seed"):
                 wallet.from_seed(seed=seed_hex)
             elif hasattr(wallet, "from_seed_hex"):
@@ -87,9 +105,7 @@ class HDWalletDeriver:
             elif hasattr(wallet, "wif"):
                 priv = str(wallet.wif())
 
-            if symbol == "BTC":
-                addr = str(wallet.p2wpkh_address()) if hasattr(wallet, "p2wpkh_address") else str(wallet.address())
-            elif symbol == "LTC":
+            if symbol in {"BTC", "LTC"}:
                 addr = str(wallet.p2wpkh_address()) if hasattr(wallet, "p2wpkh_address") else str(wallet.address())
             else:
                 addr = str(wallet.address())
@@ -112,24 +128,17 @@ class HDWalletDeriver:
         path = f"m/44'/60'/{user_id}'/0/0"
         return self._derive_hdwallet_address("ETH", path)
 
+    def derive_btc_address(self, user_id: int) -> DerivedAddress:
+        d = self.derive_btc(user_id)
+        return DerivedAddress(path=d.path, public_address=d.public_address)
+
+    def derive_ltc_address(self, user_id: int) -> DerivedAddress:
+        d = self.derive_ltc(user_id)
+        return DerivedAddress(path=d.path, public_address=d.public_address)
+
+    def derive_eth_address(self, user_id: int) -> DerivedAddress:
+        d = self.derive_eth(user_id)
+        return DerivedAddress(path=d.path, public_address=d.public_address)
+
     def derive_sol(self, user_id: int) -> DerivedKey:
-        path = f"m/44'/501'/{user_id}'/0'"
-        try:
-            from solders.keypair import Keypair  # type: ignore
-
-            seed = hashlib.sha256(f"{self._require_seed()}:{path}".encode()).digest()
-            kp = Keypair.from_seed(seed[:32])
-            return DerivedKey(path=path, private_key_hex=seed.hex(), public_address=str(kp.pubkey()))
-        except Exception:
-            pass
-
-        try:
-            from solana.keypair import Keypair  # type: ignore
-
-            seed = hashlib.sha256(f"{self._require_seed()}:{path}".encode()).digest()
-            kp = Keypair.from_seed(seed[:32])
-            return DerivedKey(path=path, private_key_hex=seed.hex(), public_address=str(kp.public_key))
-        except Exception as exc:
-            if self.app_env == "production":
-                raise RuntimeError("SOL derivation requires solders or solana-py") from exc
-            return self._derive_fallback(path, "sol")
+        raise RuntimeError("SOL derivation disabled")

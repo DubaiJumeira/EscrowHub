@@ -13,6 +13,7 @@ def _as_bool(name: str, default: str = "false") -> bool:
 
 class Settings:
     environment = os.getenv("APP_ENV", "dev")
+    is_production = environment.lower() == "production"
     database_url = os.getenv("DATABASE_URL", "postgresql://escrow:escrow@localhost:5432/escrow")
     encryption_key = os.getenv("ENCRYPTION_KEY", "")
     telegram_main_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -24,17 +25,25 @@ class Settings:
     bot_id = int(os.getenv("ESCROWHUB_BOT_ID", os.getenv("BOT_ID", "1")))
 
     moderator_username = os.getenv("MODERATOR_USERNAME", os.getenv("ESCROWHUB_MODERATOR_USERNAME", "")).lstrip("@")
+    moderator_ids = {
+        int(v.strip())
+        for v in os.getenv("MODERATOR_TELEGRAM_IDS", "").split(",")
+        if v.strip().isdigit()
+    }
     # Backward compatibility alias; prefer `moderator_username`.
     MODERATOR_USERNAME = moderator_username
 
-    sol_enabled = _as_bool("SOL_ENABLED", "true" if environment != "production" else "false")
+    sol_enabled = _as_bool("SOL_ENABLED", "false")
+    supported_assets = ("BTC", "LTC", "ETH", "USDT")
+    withdrawal_daily_limit_usd = os.getenv("WITHDRAWAL_DAILY_LIMIT_USD", "5000").strip()
+    withdrawal_min_interval_seconds = int(os.getenv("WITHDRAWAL_MIN_INTERVAL_SECONDS", "30"))
+    allow_fallback_derivation = _as_bool("ALLOW_FALLBACK_DERIVATION", "false")
+    allow_dev_bot_bootstrap = _as_bool("ALLOW_DEV_BOT_BOOTSTRAP", "false")
 
 
 if os.getenv("BOT_ID") and not os.getenv("ESCROWHUB_BOT_ID"):
     LOGGER.warning("BOT_ID is deprecated; use ESCROWHUB_BOT_ID")
 if os.getenv("ESCROWHUB_MODERATOR_USERNAME") and not os.getenv("MODERATOR_USERNAME"):
     LOGGER.warning("ESCROWHUB_MODERATOR_USERNAME is deprecated; use MODERATOR_USERNAME")
-if not Settings.moderator_username:
-    LOGGER.warning("MODERATOR_USERNAME is not set; cancellation guidance will use fallback text")
-if Settings.environment.lower() == "production" and Settings.sol_enabled:
-    LOGGER.warning("SOL is enabled in production. Ensure SOL watcher/signing pipeline is fully validated before use")
+if not Settings.moderator_ids and not Settings.moderator_username:
+    LOGGER.warning("No moderator IDs configured; dispute moderation controls are disabled")
