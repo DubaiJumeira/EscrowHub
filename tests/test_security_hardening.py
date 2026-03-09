@@ -1,6 +1,7 @@
 from decimal import Decimal
 import json
 import os
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -593,3 +594,185 @@ def test_production_deposit_issuance_fails_closed_without_provider(conn, monkeyp
     wallet = WalletService(conn)
     with pytest.raises(RuntimeError):
         wallet.get_or_create_deposit_address(9999, "BTC")
+
+
+def test_provider_issued_invalid_addresses_rejected(conn, monkeypatch):
+    from address_provider import IssuedAddress
+
+    monkeypatch.setattr(Settings, "is_production", True)
+
+    invalid_by_asset = {
+        "BTC": "not-btc",
+        "LTC": "not-ltc",
+        "ETH": "0x1234",
+        "USDT": "0x1234",
+    }
+
+    class Provider:
+        def is_ready(self):
+            return True, None
+
+        def get_or_create_address(self, user_id, asset):
+            return IssuedAddress(address=invalid_by_asset[asset], provider_origin="external_http", provider_ref=f"route:{user_id}:{asset}")
+
+    wallet = WalletService(conn)
+    wallet.address_provider = Provider()
+    for asset in ("BTC", "LTC", "ETH", "USDT"):
+        with pytest.raises(RuntimeError, match="invalid"):
+            wallet.get_or_create_deposit_address(42000 + len(asset), asset)
+
+
+def test_wallet_address_guards_allow_same_user_evm_reuse(conn):
+    conn.execute(
+        "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,provider_origin,provider_ref) VALUES(?,?,?,?,?,?)",
+        (1, "ETH", "ETHEREUM", "0xabc", "external_http", "route:1:ETH"),
+    )
+    conn.execute(
+        "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,provider_origin,provider_ref) VALUES(?,?,?,?,?,?)",
+        (1, "USDT", "ETHEREUM", "0xabc", "external_http", "route:1:USDT"),
+    )
+
+
+def test_wallet_address_guards_reject_cross_user_chain_address_reuse(conn):
+    conn.execute(
+        "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,provider_origin,provider_ref) VALUES(?,?,?,?,?,?)",
+        (1, "ETH", "ETHEREUM", "0xdef", "external_http", "route:1:ETH"),
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="chain/address"):
+        conn.execute(
+            "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,provider_origin,provider_ref) VALUES(?,?,?,?,?,?)",
+            (2, "USDT", "ETHEREUM", "0xdef", "external_http", "route:2:USDT"),
+        )
+
+
+def test_wallet_address_guards_reject_provider_ref_rebinding(conn):
+    conn.execute(
+        "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,provider_origin,provider_ref) VALUES(?,?,?,?,?,?)",
+        (1, "BTC", "BTC", "bc1qa", "external_http", "route:shared"),
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="provider_ref"):
+        conn.execute(
+            "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,provider_origin,provider_ref) VALUES(?,?,?,?,?,?)",
+            (1, "LTC", "LTC", "ltc1qa", "external_http", "route:shared"),
+        )
+
+
+def test_deposit_issuance_is_idempotent_for_racing_first_requests(tmp_path, monkeypatch):
+    from address_provider import IssuedAddress
+
+    monkeypatch.setattr(Settings, "is_production", True)
+    monkeypatch.setattr(Settings, "encryption_key", "k" * 32)
+    db = tmp_path / "race.db"
+    bootstrap = sqlite3.connect(db)
+    bootstrap.row_factory = sqlite3.Row
+    init_db(bootstrap)
+    bootstrap.execute("INSERT INTO users(telegram_id, username, frozen) VALUES(?,?,0)", (9090, None))
+    bootstrap.commit()
+    bootstrap.close()
+
+    class Provider:
+        def is_ready(self):
+            return True, None
+
+        def get_or_create_address(self, user_id, asset):
+            return IssuedAddress(address="0x" + "4" * 40, provider_origin="external_http", provider_ref=f"route:{user_id}:{asset}")
+
+    routes = []
+
+    def _run():
+        conn = sqlite3.connect(db, timeout=10)
+        conn.row_factory = sqlite3.Row
+        wallet = WalletService(conn)
+        wallet.address_provider = Provider()
+        routes.append(wallet.get_or_create_deposit_address(9090, "USDT").address)
+        conn.close()
+
+    t1 = threading.Thread(target=_run)
+    t2 = threading.Thread(target=_run)
+    t1.start(); t2.start(); t1.join(); t2.join()
+
+    assert routes == ["0x" + "4" * 40, "0x" + "4" * 40]
+    verify = sqlite3.connect(db)
+    verify.row_factory = sqlite3.Row
+    rows = verify.execute("SELECT COUNT(*) AS c FROM wallet_addresses WHERE user_id=(SELECT id FROM users WHERE telegram_id=9090) AND asset='USDT'").fetchone()
+    assert rows["c"] == 1
+    verify.close()
+
+
+def test_http_provider_production_requires_https_and_token(monkeypatch):
+    from address_provider import HttpAddressProvider
+
+    monkeypatch.setattr(Settings, "is_production", True)
+    monkeypatch.setenv("ADDRESS_PROVIDER_URL", "http://insecure.example")
+    monkeypatch.setenv("ADDRESS_PROVIDER_TOKEN", "")
+    provider = HttpAddressProvider()
+    ready, err = provider.is_ready()
+    assert ready is False
+    assert "https" in (err or "")
+
+
+def test_http_provider_health_requires_explicit_ready_true(monkeypatch):
+    import io
+    from address_provider import HttpAddressProvider
+    import address_provider
+
+    monkeypatch.setattr(Settings, "is_production", True)
+    monkeypatch.setenv("ADDRESS_PROVIDER_URL", "https://provider.example")
+    monkeypatch.setenv("ADDRESS_PROVIDER_TOKEN", "token")
+
+    class Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def read(self):
+            return io.BytesIO(b'{"ok": true}').read()
+
+    monkeypatch.setattr(address_provider, "urlopen", lambda *_a, **_k: Resp())
+    provider = HttpAddressProvider()
+    ready, err = provider.is_ready()
+    assert ready is False
+    assert "not ready" in (err or "")
+
+
+def test_http_provider_production_requires_token(monkeypatch):
+    from address_provider import HttpAddressProvider
+
+    monkeypatch.setattr(Settings, "is_production", True)
+    monkeypatch.setenv("ADDRESS_PROVIDER_URL", "https://secure.example")
+    monkeypatch.setenv("ADDRESS_PROVIDER_TOKEN", "")
+    provider = HttpAddressProvider()
+    ready, err = provider.is_ready()
+    assert ready is False
+    assert "TOKEN" in (err or "")
+
+
+def test_http_provider_health_malformed_response_rejected(monkeypatch):
+    from address_provider import HttpAddressProvider
+    import address_provider
+
+    monkeypatch.setattr(Settings, "is_production", True)
+    monkeypatch.setenv("ADDRESS_PROVIDER_URL", "https://provider.example")
+    monkeypatch.setenv("ADDRESS_PROVIDER_TOKEN", "token")
+
+    class Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def read(self):
+            return b"not-json"
+
+    monkeypatch.setattr(address_provider, "urlopen", lambda *_a, **_k: Resp())
+    provider = HttpAddressProvider()
+    ready, err = provider.is_ready()
+    assert ready is False
+    assert "healthcheck failed" in (err or "")

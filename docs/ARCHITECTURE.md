@@ -28,7 +28,7 @@ Each escrow is bound to `bot_id`. Tenant config includes:
 - Withdrawals call `SignerService` boundary so private keys are outside Telegram process
 
 ### Deposit issuance provider
-Production deposit addresses are issued by a dedicated external `AddressProvider` boundary (separate from withdrawal signing).
+Production deposit addresses are issued by a dedicated external `AddressProvider` boundary (separate from withdrawal signing). Production requires HTTPS provider URLs and non-empty provider bearer tokens.
 Wallet rows persist immutable provider metadata (`provider_origin`, `provider_ref`) for audit and migration safety.
 
 Non-production can still use legacy seed derivation for existing tests/dev flows. Production never derives new deposit addresses from local seed paths.
