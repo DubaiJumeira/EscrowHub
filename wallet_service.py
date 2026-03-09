@@ -125,6 +125,29 @@ class WalletService:
         if row and int(row["frozen"]):
             raise ValueError("account is frozen")
 
+    def verify_address_derivation_consistency(self, sample_size: int = 25) -> None:
+        rows = self.conn.execute(
+            "SELECT user_id, asset, address FROM wallet_addresses WHERE asset IN ('BTC','LTC','ETH','USDT') ORDER BY id DESC LIMIT ?",
+            (int(sample_size),),
+        ).fetchall()
+        mismatches: list[str] = []
+        for row in rows:
+            asset = str(row["asset"])
+            user_id = int(row["user_id"])
+            stored = self._decrypt_field(row["address"])
+            if asset == "BTC":
+                derived = self.hd.derive_btc_address(user_id).public_address
+            elif asset == "LTC":
+                derived = self.hd.derive_ltc_address(user_id).public_address
+            else:
+                derived = self.hd.derive_eth_address(user_id).public_address
+            if stored and stored != derived:
+                mismatches.append(f"asset={asset} user_id={user_id}")
+        if mismatches:
+            # WARNING: Derivation mismatch means watcher routing may miss deposits after seed/xpub migration.
+            # Secure alternative: migrate addresses with explicit per-row derivation metadata and verified replay before production startup.
+            raise RuntimeError("wallet derivation mismatch detected; abort startup and run migration: " + ", ".join(mismatches[:5]))
+
     def get_or_create_deposit_address(self, user_id: int, asset: str) -> DepositRoute:
         symbol = self._asset(asset)
         resolved_user_id = self._ensure_user_row(user_id)
@@ -324,6 +347,12 @@ class WalletService:
             return
         self.conn.execute("UPDATE withdrawals SET status=?, txid=? WHERE id=?", ("failed", f"ERROR: {reason}"[:255], withdrawal_id))
         self.ledger.add_entry("USER", row["user_id"], row["user_id"], row["asset"], Decimal(row["amount"]), "WITHDRAWAL_RELEASE", "withdrawal", withdrawal_id)
+
+    def platform_revenue_balances(self) -> dict[str, Decimal]:
+        balances: dict[str, Decimal] = {}
+        for asset in Settings.supported_assets:
+            balances[asset] = self.account_revenue_balance("PLATFORM_REVENUE", None, asset)
+        return balances
 
     def account_revenue_balance(self, account_type: str, owner_id: int | None, asset: str) -> Decimal:
         symbol = self._asset(asset)

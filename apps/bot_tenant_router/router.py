@@ -30,7 +30,7 @@ class TenantRouter:
         if cached and (now - cached[0]) <= timedelta(seconds=self.ttl_seconds):
             return cached[1]
         row = self.conn.execute(
-            "SELECT id, owner_user_id, bot_extra_fee_percent FROM bots WHERE lower(display_name)=?",
+            "SELECT id, owner_user_id, bot_extra_fee_percent FROM bots WHERE lower(telegram_username)=?",
             (username,),
         ).fetchone()
         if not row:

@@ -71,7 +71,7 @@ class HDWalletDeriver:
         path = f"m/84'/0'/{int(user_id)}'/0/0"
         xpub = self._require_xpub("BTC")
         if xpub:
-            ctx = b.Bip84.FromExtendedKey(xpub, b.Bip84Coins.BITCOIN).Change(b.Bip44Changes.CHAIN_EXT).AddressIndex(int(user_id))
+            ctx = b.Bip84.FromExtendedKey(xpub, b.Bip84Coins.BITCOIN).Purpose().Coin().Account(int(user_id)).Change(b.Bip44Changes.CHAIN_EXT).AddressIndex(0)
         else:
             seed = bytes.fromhex(self._require_seed())
             ctx = b.Bip84.FromSeed(seed, b.Bip84Coins.BITCOIN).Purpose().Coin().Account(int(user_id)).Change(b.Bip44Changes.CHAIN_EXT).AddressIndex(0)
@@ -82,7 +82,7 @@ class HDWalletDeriver:
         path = f"m/84'/2'/{int(user_id)}'/0/0"
         xpub = self._require_xpub("LTC")
         if xpub:
-            ctx = b.Bip84.FromExtendedKey(xpub, b.Bip84Coins.LITECOIN).Change(b.Bip44Changes.CHAIN_EXT).AddressIndex(int(user_id))
+            ctx = b.Bip84.FromExtendedKey(xpub, b.Bip84Coins.LITECOIN).Purpose().Coin().Account(int(user_id)).Change(b.Bip44Changes.CHAIN_EXT).AddressIndex(0)
         else:
             seed = bytes.fromhex(self._require_seed())
             ctx = b.Bip84.FromSeed(seed, b.Bip84Coins.LITECOIN).Purpose().Coin().Account(int(user_id)).Change(b.Bip44Changes.CHAIN_EXT).AddressIndex(0)
@@ -93,7 +93,7 @@ class HDWalletDeriver:
         path = f"m/44'/60'/{int(user_id)}'/0/0"
         xpub = self._require_xpub("ETH")
         if xpub:
-            ctx = b.Bip44.FromExtendedKey(xpub, b.Bip44Coins.ETHEREUM).Change(b.Bip44Changes.CHAIN_EXT).AddressIndex(int(user_id))
+            ctx = b.Bip44.FromExtendedKey(xpub, b.Bip44Coins.ETHEREUM).Purpose().Coin().Account(int(user_id)).Change(b.Bip44Changes.CHAIN_EXT).AddressIndex(0)
         else:
             seed = bytes.fromhex(self._require_seed())
             ctx = b.Bip44.FromSeed(seed, b.Bip44Coins.ETHEREUM).Purpose().Coin().Account(int(user_id)).Change(b.Bip44Changes.CHAIN_EXT).AddressIndex(0)

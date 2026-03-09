@@ -133,7 +133,7 @@ def _runtime_bot_id(conn, tenant: TenantService) -> int:
     if not owner_row:
         raise RuntimeError("Cannot bootstrap bot tenant without an existing owner user")
     conn.execute(
-        "INSERT OR IGNORE INTO bots(id, owner_user_id, bot_extra_fee_percent, display_name) VALUES(?,?,'0','EscrowHub')",
+        "INSERT OR IGNORE INTO bots(id, owner_user_id, bot_extra_fee_percent, display_name, telegram_username) VALUES(?,?,'0','EscrowHub','escrowhub')",
         (bot_id, int(owner_row["id"])),
     )
     conn.commit()
@@ -2294,6 +2294,27 @@ async def watcher_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         conn.close()
 
 
+
+async def revenue_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.effective_message.reply_text("Admin only")
+        return
+    conn, wallet, _, _ = _services()
+    try:
+        balances = wallet.platform_revenue_balances()
+        lines = ["Platform revenue balances:"]
+        for asset in Settings.supported_assets:
+            lines.append(f"- {asset}: {balances.get(asset, Decimal('0'))}")
+        conn.execute(
+            "INSERT INTO admin_actions(admin_user_id,action_type,data_json) VALUES(?,?,?)",
+            (update.effective_user.id, "view_revenue", json.dumps({"assets": list(Settings.supported_assets)})),
+        )
+        conn.commit()
+        await update.effective_message.reply_text("\n".join(lines))
+    finally:
+        conn.close()
+
+
 async def run_signer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_IDS:
         await update.effective_message.reply_text("Admin only")
@@ -3281,6 +3302,7 @@ def main() -> None:
     app.add_handler(CommandHandler("cancel", cancel_flow))
     app.add_handler(CommandHandler("watcher_status", watcher_status))
     app.add_handler(CommandHandler("run_signer", run_signer))
+    app.add_handler(CommandHandler("revenue", revenue_report))
     app.add_handler(CommandHandler("support", support_team))
     app.add_handler(CommandHandler("freeze", freeze_user))
     app.add_handler(CommandHandler("unfreeze", unfreeze_user))

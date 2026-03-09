@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS bots (
   bot_extra_fee_percent TEXT NOT NULL DEFAULT '0',
   support_contact TEXT,
   display_name TEXT NOT NULL,
+  telegram_username TEXT UNIQUE,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY(owner_user_id) REFERENCES users(id)
 );

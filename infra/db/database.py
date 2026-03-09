@@ -22,4 +22,8 @@ def init_db(conn: sqlite3.Connection) -> None:
     watcher_cols = {row["name"] for row in conn.execute("PRAGMA table_info(watcher_status)").fetchall()}
     if "cursor" not in watcher_cols:
         conn.execute("ALTER TABLE watcher_status ADD COLUMN cursor INTEGER")
+    bot_cols = {row["name"] for row in conn.execute("PRAGMA table_info(bots)").fetchall()}
+    if "telegram_username" not in bot_cols:
+        conn.execute("ALTER TABLE bots ADD COLUMN telegram_username TEXT")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_bots_telegram_username ON bots(telegram_username)")
     conn.commit()

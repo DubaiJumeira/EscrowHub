@@ -37,6 +37,7 @@ class Settings:
     allow_fallback_derivation = _as_bool("ALLOW_FALLBACK_DERIVATION", "false")
     allow_dev_bot_bootstrap = _as_bool("ALLOW_DEV_BOT_BOOTSTRAP", "false")
     withdrawals_enabled = _as_bool("WITHDRAWALS_ENABLED", "false")
+    eth_max_blocks_per_run = int(os.getenv("ETH_MAX_BLOCKS_PER_RUN", "500"))
     encryption_kdf_iterations = int(os.getenv("ENCRYPTION_KDF_ITERATIONS", "600000"))
     btc_xpub = os.getenv("BTC_XPUB", "").strip()
     ltc_xpub = os.getenv("LTC_XPUB", "").strip()

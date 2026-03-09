@@ -34,7 +34,7 @@ def _seed(conn):
     buyer = tenant.ensure_user(111, "b")
     seller = tenant.ensure_user(222, "s")
     owner = tenant.ensure_user(333, "o")
-    tenant.create_or_update_tenant(1, owner, "bot", "@support", Decimal("2"))
+    tenant.create_or_update_tenant(1, owner, "bot", "bot", "@support", Decimal("2"))
     return buyer, seller
 
 
@@ -149,9 +149,101 @@ def test_eth_cursor_floor_from_db(conn):
 def test_tenant_router_resolves_and_unknown(conn):
     tenant = TenantService(conn)
     owner = tenant.ensure_user(1, "owner")
-    tenant.create_or_update_tenant(77, owner, "mybot", "@support", Decimal("1"))
+    tenant.create_or_update_tenant(77, owner, "mybot", "mybot", "@support", Decimal("1"))
     router = TenantRouter(conn)
     ctx = router.resolve_tenant("@mybot")
     assert ctx.tenant_bot_id == 77
     with pytest.raises(TenantNotFoundError):
         router.resolve_tenant("@missing")
+
+
+def test_signer_service_skips_pending_when_withdrawals_disabled(conn, monkeypatch):
+    monkeypatch.setattr(Settings, "withdrawals_enabled", False)
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(55)
+    wallet.ledger.add_entry("USER", uid, uid, "USDT", Decimal("10"), "DEPOSIT", "deposit", 1)
+    conn.execute("INSERT INTO withdrawals(user_id,asset,amount,destination_address,status) VALUES(?,?,?,?,?)", (uid, "USDT", "1", wallet._encrypt_field("0x1111111111111111111111111111111111111111"), "pending"))
+    assert SignerService().process_pending_withdrawals(wallet) == 0
+    row = conn.execute("SELECT status FROM withdrawals WHERE user_id=?", (uid,)).fetchone()
+    assert row["status"] == "pending"
+
+
+def test_seed_xpub_mode_path_alignment(monkeypatch):
+    d = HDWalletDeriver()
+
+    class MockPub:
+        def ToAddress(self):
+            return "same-address"
+
+    class MockCtx:
+        def Purpose(self): return self
+        def Coin(self): return self
+        def Account(self, i): return self
+        def Change(self, c): return self
+        def AddressIndex(self, i): return self
+        def PublicKey(self): return MockPub()
+
+    class MockBip84:
+        def FromExtendedKey(self, *a, **k): return MockCtx()
+        def FromSeed(self, *a, **k): return MockCtx()
+
+    class MockBip44(MockBip84):
+        pass
+
+    class MockB:
+        Bip84 = MockBip84()
+        Bip44 = MockBip44()
+        Bip84Coins = type("x", (), {"BITCOIN": 1, "LITECOIN": 2})
+        Bip44Coins = type("y", (), {"ETHEREUM": 1})
+        Bip44Changes = type("z", (), {"CHAIN_EXT": 0})
+
+    monkeypatch.setattr(d, "_bip_utils", lambda: MockB())
+    monkeypatch.setattr(Settings, "btc_xpub", "xpub-test")
+    monkeypatch.setattr(Settings, "ltc_xpub", "xpub-test")
+    monkeypatch.setattr(Settings, "eth_xpub", "xpub-test")
+    assert d.derive_btc_address(7).path == "m/84'/0'/7'/0/0"
+    assert d.derive_ltc_address(7).path == "m/84'/2'/7'/0/0"
+    assert d.derive_eth_address(7).path == "m/44'/60'/7'/0/0"
+
+
+def test_derivation_mismatch_detection_fails_closed(conn, monkeypatch):
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(99)
+    conn.execute(
+        "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,derivation_index,destination_tag,derivation_path) VALUES(?,?,?,?,?,?,?)",
+        (uid, "BTC", "BTC", wallet._encrypt_field("bc1qwrong"), uid, None, wallet._encrypt_field("m/84'/0'/99'/0/0")),
+    )
+
+    class A:
+        public_address = "bc1qexpected"
+
+    monkeypatch.setattr(wallet.hd, "derive_btc_address", lambda _uid: A())
+    with pytest.raises(RuntimeError):
+        wallet.verify_address_derivation_consistency()
+
+
+def test_eth_chunk_limit_advances_cursor_gradually(conn, monkeypatch):
+    write_watcher_cursor(conn, "eth_watcher", 100)
+    monkeypatch.setattr(Settings, "eth_max_blocks_per_run", 2)
+
+    def fake_rpc(method, params):
+        if method == "eth_blockNumber":
+            return {"result": hex(120)}
+        if method == "eth_getBlockByNumber":
+            bn = int(params[0], 16)
+            return {"result": {"transactions": [{"to": "0x1111111111111111111111111111111111111111", "value": hex(10**18), "hash": f"0x{bn:064x}"}]}}
+        if method == "eth_getLogs":
+            return {"result": []}
+        return {"result": None}
+
+    monkeypatch.setenv("ETH_RPC_URL", "http://example.invalid")
+    adapter = EthRpcAdapter({"0x1111111111111111111111111111111111111111": 1}, conn=conn)
+    monkeypatch.setattr(adapter, "_rpc", fake_rpc)
+    _, finalized = adapter.fetch_deposits()
+    assert finalized == 102
+
+
+def test_agents_line_exactly_once():
+    text = open("AGENTS.md", "r", encoding="utf-8").read()
+    line = "When you find a security vunerabilty, flag it immediately with a WARNING comment and suggest a secure alternative. Never implement insecure patters even if asked."
+    assert text.count(line) == 1

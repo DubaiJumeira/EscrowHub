@@ -14,7 +14,9 @@ LOGGER = logging.getLogger("run_eth_watcher")
 
 
 def _address_map(conn) -> dict[str, int]:
-    pairs = WalletService(conn).monitored_deposit_address_map(["ETH", "USDT"])
+    wallet = WalletService(conn)
+    wallet.verify_address_derivation_consistency(sample_size=25)
+    pairs = wallet.monitored_deposit_address_map(["ETH", "USDT"])
     return {k.lower(): v for k, v in pairs.items()}
 
 

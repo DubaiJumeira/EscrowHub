@@ -68,6 +68,9 @@ class SignerService:
             self.provider = DisabledSignerProvider()
 
     def process_pending_withdrawals(self, wallet_service) -> int:
+        if not Settings.withdrawals_enabled:
+            LOGGER.info("withdrawal processing skipped: WITHDRAWALS_ENABLED=false")
+            return 0
         processed = 0
         for w in wallet_service.pending_withdrawals():
             try:
