@@ -20,7 +20,7 @@ import bot
 import run_signer
 import run_btc_watcher
 import run_eth_watcher
-from runtime_preflight import PreflightStatus, run_startup_preflight
+from runtime_preflight import PreflightIntegrityError, PreflightStatus, run_startup_preflight
 from watchers.sweep_job import run_once as run_sweep_once
 
 
@@ -296,6 +296,25 @@ def test_preflight_initializes_db_and_runs_consistency(monkeypatch, tmp_path):
     assert calls == [None]
 
 
+
+
+def test_preflight_route_integrity_failure_is_fatal(monkeypatch, tmp_path):
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "fatal.sqlite3"))
+    original = WalletService.ensure_wallet_route_integrity
+
+    def _boom(self):
+        raise RuntimeError("tampered routes")
+
+    monkeypatch.setattr(WalletService, "ensure_wallet_route_integrity", _boom)
+    with pytest.raises(PreflightIntegrityError):
+        run_startup_preflight("bot")
+    with pytest.raises(PreflightIntegrityError):
+        run_startup_preflight("btc_watcher")
+    with pytest.raises(PreflightIntegrityError):
+        run_startup_preflight("eth_watcher")
+    with pytest.raises(PreflightIntegrityError):
+        run_startup_preflight("signer")
+    monkeypatch.setattr(WalletService, "ensure_wallet_route_integrity", original)
 def test_docs_remove_unsupported_assets_and_legacy_entrypoint_clean():
     banned = [("US"+"DC"), ("SO"+"L"), ("XR"+"P")]
     for path in ("README.md", "docs/RUNBOOK.md", "docs/ARCHITECTURE.md", "apps/bot_main/main.py"):
@@ -817,9 +836,9 @@ def test_wallet_address_guards_use_fingerprint_not_ciphertext(conn):
 def test_provider_rebinding_blocked_by_fingerprint(conn):
     fp1 = _fp("ETHEREUM", "0x3333333333333333333333333333333333333333")
     fp2 = _fp("ETHEREUM", "0x4444444444444444444444444444444444444444")
-    conn.execute("INSERT INTO wallet_addresses(user_id,asset,chain_family,address,address_fingerprint,provider_origin,provider_ref) VALUES(?,?,?,?,?,?,?)", (1, "ETH", "ETHEREUM", "enc:a", fp1, "external_http", "shared"))
+    conn.execute("INSERT INTO wallet_addresses(user_id,asset,chain_family,address,address_fingerprint,provider_origin,provider_ref) VALUES(?,?,?,?,?,?,?)", (1, "ETH", "ETHEREUM", "a", fp1, "external_http", "shared"))
     with pytest.raises(sqlite3.IntegrityError, match="provider_ref"):
-        conn.execute("INSERT INTO wallet_addresses(user_id,asset,chain_family,address,address_fingerprint,provider_origin,provider_ref) VALUES(?,?,?,?,?,?,?)", (1, "USDT", "ETHEREUM", "enc:b", fp2, "external_http", "shared"))
+        conn.execute("INSERT INTO wallet_addresses(user_id,asset,chain_family,address,address_fingerprint,provider_origin,provider_ref) VALUES(?,?,?,?,?,?,?)", (1, "USDT", "ETHEREUM", "b", fp2, "external_http", "shared"))
 
 
 def test_http_provider_health_requires_supported_coverage(monkeypatch):
@@ -891,6 +910,7 @@ def test_withdrawal_provider_requires_https_and_token_in_production(monkeypatch)
 
 def test_withdrawal_provider_malformed_response_fails_closed(conn, monkeypatch):
     monkeypatch.setattr(Settings, "withdrawals_enabled", True)
+    monkeypatch.setattr(Settings, "withdrawal_min_interval_seconds", 0)
     wallet = WalletService(conn)
     uid = wallet._ensure_user_row(91001)
     wallet.ledger.add_entry("USER", uid, uid, "USDT", Decimal("10"), "DEPOSIT", "deposit", 1)
@@ -930,3 +950,93 @@ def test_withdrawal_rebuild_migration_preserves_new_columns_and_indexes(tmp_path
     idx = c.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_withdrawals_idempotency_key'").fetchone()
     assert idx is not None
     c.close()
+
+
+def test_withdrawal_provider_ref_rebinding_blocked(conn):
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(93001)
+    conn.execute("INSERT INTO withdrawals(user_id,asset,amount,destination_address,status,provider_origin,provider_ref,idempotency_key) VALUES(?,?,?,?,?,?,?,?)", (uid, "USDT", "1", "a", "submitted", "external_http", "pref:1", "k1"))
+    conn.execute("INSERT INTO withdrawals(user_id,asset,amount,destination_address,status,idempotency_key) VALUES(?,?,?,?,?,?)", (uid, "USDT", "1", "b", "pending", "k2"))
+    with pytest.raises(sqlite3.IntegrityError, match="provider_ref"):
+        conn.execute("UPDATE withdrawals SET provider_origin='external_http', provider_ref='pref:1' WHERE id=2")
+
+
+def test_withdrawal_idempotency_rebinding_blocked(conn):
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(93002)
+    conn.execute("INSERT INTO withdrawals(user_id,asset,amount,destination_address,status,idempotency_key) VALUES(?,?,?,?,?,?)", (uid, "USDT", "1", "a", "pending", "idem:1"))
+    with pytest.raises(sqlite3.IntegrityError, match="idempotency_key"):
+        conn.execute("UPDATE withdrawals SET idempotency_key='idem:2' WHERE id=1")
+
+
+def test_signer_reconcile_provider_ref_drift_fails_closed(conn, monkeypatch):
+    monkeypatch.setattr(Settings, "withdrawals_enabled", True)
+    monkeypatch.setattr(Settings, "withdrawal_min_interval_seconds", 0)
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(93003)
+    wallet.ledger.add_entry("USER", uid, uid, "USDT", Decimal("10"), "DEPOSIT", "deposit", 1)
+    req = wallet.request_withdrawal(uid, "USDT", Decimal("1"), "0x1111111111111111111111111111111111111111")
+    idem = conn.execute("SELECT idempotency_key FROM withdrawals WHERE id=?", (req["id"],)).fetchone()["idempotency_key"]
+    conn.execute("UPDATE withdrawals SET status='submitted', provider_origin='external_http', provider_ref='r1', idempotency_key=?, submitted_at=datetime('now','-120 seconds') WHERE id=?", (idem, req["id"]))
+
+    class Provider:
+        provider_origin = "external_http"
+        def is_ready(self): return True, None
+        def execute_withdrawal(self, _req): raise RuntimeError("no")
+        def reconcile_withdrawal(self, _req):
+            from signer.withdrawal_provider import WithdrawalReconciliationResult
+            return WithdrawalReconciliationResult(status="submitted", provider_ref="r2", asset="USDT")
+
+    svc = SignerService(); svc.provider = Provider(); svc.process_withdrawals(wallet)
+    row = conn.execute("SELECT status,failure_reason FROM withdrawals WHERE id=?", (req["id"],)).fetchone()
+    assert row["status"] == "signer_retry"
+    assert "provider_ref mismatch" in str(row["failure_reason"] or "")
+
+
+def test_signer_execute_asset_mismatch_and_malformed_txid_fail_closed(conn, monkeypatch):
+    monkeypatch.setattr(Settings, "withdrawals_enabled", True)
+    monkeypatch.setattr(Settings, "withdrawal_min_interval_seconds", 0)
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(93004)
+    wallet.ledger.add_entry("USER", uid, uid, "USDT", Decimal("10"), "DEPOSIT", "deposit", 1)
+    req1 = wallet.request_withdrawal(uid, "USDT", Decimal("1"), "0x1111111111111111111111111111111111111111")
+
+    class Provider1:
+        provider_origin = "external_http"
+        def is_ready(self): return True, None
+        def execute_withdrawal(self, _req):
+            from signer.withdrawal_provider import WithdrawalExecutionResult
+            return WithdrawalExecutionResult(status="submitted", provider_ref="r1", asset="ETH")
+        def reconcile_withdrawal(self, _req): raise RuntimeError("no")
+
+    svc = SignerService(); svc.provider = Provider1(); svc.process_withdrawals(wallet)
+    assert conn.execute("SELECT status FROM withdrawals WHERE id=?", (req1["id"],)).fetchone()["status"] == "signer_retry"
+
+    req2 = wallet.request_withdrawal(uid, "USDT", Decimal("1"), "0x1111111111111111111111111111111111111111")
+
+    class Provider2:
+        provider_origin = "external_http"
+        def is_ready(self): return True, None
+        def execute_withdrawal(self, _req):
+            from signer.withdrawal_provider import WithdrawalExecutionResult
+            return WithdrawalExecutionResult(status="broadcasted", provider_ref="r2", txid="bad", asset="USDT")
+        def reconcile_withdrawal(self, _req): raise RuntimeError("no")
+
+    svc.provider = Provider2(); svc.process_withdrawals(wallet)
+    assert conn.execute("SELECT status FROM withdrawals WHERE id=?", (req2["id"],)).fetchone()["status"] == "signer_retry"
+
+
+def test_reconcile_backoff_uses_last_reconciled_at(conn):
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(93005)
+    conn.execute("INSERT INTO withdrawals(user_id,asset,amount,destination_address,status,idempotency_key,submitted_at) VALUES(?,?,?,?,?,?,datetime('now'))", (uid, "USDT", "1", "a", "submitted", "k-sub-now"))
+    conn.execute("INSERT INTO withdrawals(user_id,asset,amount,destination_address,status,idempotency_key,submitted_at) VALUES(?,?,?,?,?,?,datetime('now','-600 seconds'))", (uid, "USDT", "1", "b", "submitted", "k-sub-old"))
+    conn.execute("INSERT INTO withdrawals(user_id,asset,amount,destination_address,status,idempotency_key,broadcasted_at) VALUES(?,?,?,?,?,?,datetime('now'))", (uid, "USDT", "1", "c", "broadcasted", "k-br-now"))
+    conn.execute("INSERT INTO withdrawals(user_id,asset,amount,destination_address,status,idempotency_key,broadcasted_at) VALUES(?,?,?,?,?,?,datetime('now','-600 seconds'))", (uid, "USDT", "1", "d", "broadcasted", "k-br-old"))
+    conn.execute("INSERT INTO withdrawals(user_id,asset,amount,destination_address,status,idempotency_key,last_reconciled_at) VALUES(?,?,?,?,?,?,datetime('now'))", (uid, "USDT", "1", "e", "signer_retry", "k-retry-now"))
+    conn.execute("INSERT INTO withdrawals(user_id,asset,amount,destination_address,status,idempotency_key,last_reconciled_at) VALUES(?,?,?,?,?,?,datetime('now','-600 seconds'))", (uid, "USDT", "1", "f", "signer_retry", "k-retry-old"))
+    rows = wallet.unresolved_withdrawals_for_reconcile(limit=20, submitted_after_s=45, broadcasted_after_s=120, signer_retry_after_s=300)
+    keys = {str(r["idempotency_key"]) for r in rows}
+    assert "k-sub-old" in keys and "k-sub-now" not in keys
+    assert "k-br-old" in keys and "k-br-now" not in keys
+    assert "k-retry-old" in keys and "k-retry-now" not in keys

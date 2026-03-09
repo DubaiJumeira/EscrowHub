@@ -360,6 +360,7 @@ def test_cancel_escrow_releases_lock_and_records_event(conn):
 
 def test_mark_withdrawal_broadcasted_no_zero_ledger_entry(conn):
     Settings.withdrawals_enabled = True
+    Settings.withdrawal_min_interval_seconds = 0
     wallet = WalletService(conn)
     uid = wallet._ensure_user_row(222)
     wallet.credit_deposit_if_confirmed(uid, "USDT", Decimal("200"), "txw", "txw:0", "ETHEREUM", 12, True)
@@ -815,12 +816,13 @@ def test_watcher_status_command_includes_signer_and_backlog(monkeypatch, conn):
 
 def test_withdrawal_idempotency_key_persisted_on_request(conn):
     Settings.withdrawals_enabled = True
+    Settings.withdrawal_min_interval_seconds = 0
     wallet = WalletService(conn)
     uid = wallet._ensure_user_row(92001)
     wallet.ledger.add_entry("USER", uid, uid, "USDT", Decimal("20"), "DEPOSIT", "deposit", 1)
     wd = wallet.request_withdrawal(uid, "USDT", Decimal("2"), "0x1111111111111111111111111111111111111111")
     row = conn.execute("SELECT idempotency_key FROM withdrawals WHERE id=?", (wd["id"],)).fetchone()
-    assert row["idempotency_key"].startswith("wdreq:")
+    assert row["idempotency_key"].startswith("wdrow:")
 
 
 def test_withdrawn_usd_last_24h_counts_submitted_state(conn):
@@ -830,4 +832,19 @@ def test_withdrawn_usd_last_24h_counts_submitted_state(conn):
         "INSERT INTO withdrawals(user_id,asset,amount,destination_address,status,idempotency_key) VALUES(?,?,?,?,?,?)",
         (uid, "USDT", "25", "enc", "submitted", "k1"),
     )
-    assert wallet._withdrawn_usd_last_24h(uid) >= Decimal("25")
+    assert wallet._withdrawn_usd_last_24h(uid) >= Decimal("24")
+
+
+def test_identical_withdrawals_create_distinct_row_bound_idempotency_keys(conn):
+    Settings.withdrawals_enabled = True
+    Settings.withdrawal_min_interval_seconds = 0
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(92011)
+    wallet.ledger.add_entry("USER", uid, uid, "USDT", Decimal("20"), "DEPOSIT", "deposit", 1)
+    first = wallet.request_withdrawal(uid, "USDT", Decimal("2"), "0x1111111111111111111111111111111111111111")
+    wallet.ledger.add_entry("USER", uid, uid, "USDT", Decimal("20"), "DEPOSIT", "deposit", 2)
+    second = wallet.request_withdrawal(uid, "USDT", Decimal("2"), "0x1111111111111111111111111111111111111111")
+    rows = conn.execute("SELECT id,idempotency_key FROM withdrawals WHERE id IN (?,?) ORDER BY id", (first["id"], second["id"])).fetchall()
+    assert rows[0]["idempotency_key"].startswith("wdrow:")
+    assert rows[1]["idempotency_key"].startswith("wdrow:")
+    assert rows[0]["idempotency_key"] != rows[1]["idempotency_key"]

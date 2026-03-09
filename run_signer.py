@@ -6,7 +6,7 @@ import time
 
 from infra.db.database import get_connection, init_db
 from signer.signer_service import SignerService
-from runtime_preflight import run_startup_preflight
+from runtime_preflight import PreflightIntegrityError, run_startup_preflight
 from wallet_service import WalletService
 from watcher_status_service import upsert_watcher_status
 
@@ -16,7 +16,12 @@ LOGGER = logging.getLogger("run_signer")
 
 def main() -> None:
     interval = int(os.getenv("WATCHER_POLL_INTERVAL_SECONDS", "30"))
-    preflight = run_startup_preflight("signer")
+    try:
+        preflight = run_startup_preflight("signer")
+    except PreflightIntegrityError as exc:
+        # WARNING: startup fails closed when route-integrity checks detect tampering/collision risk.
+        LOGGER.error("signer startup aborted by fatal integrity preflight: %s", "; ".join(exc.status.reasons) or str(exc))
+        raise
     if preflight is not None and not preflight.signer_ready:
         LOGGER.warning("signer preflight degraded: %s", "; ".join(preflight.reasons) or "not ready")
     LOGGER.info("starting signer loop interval=%ss", interval)

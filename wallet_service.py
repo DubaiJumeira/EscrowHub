@@ -476,6 +476,26 @@ class WalletService:
                 total += self._fallback_price_service.get_usd_value(str(row["asset"]), amount)
         return total
 
+
+    def _build_withdrawal_idempotency_key(self, withdrawal_id: int, user_id: int, asset: str, amount: Decimal, destination_address: str) -> str:
+        payload = f"{int(withdrawal_id)}|{int(user_id)}|{asset.upper().strip()}|{str(Decimal(amount))}|{destination_address.strip()}".encode()
+        digest = hashlib.sha256(payload).hexdigest()
+        return f"wdrow:{int(withdrawal_id)}:{digest[:24]}"
+
+    @staticmethod
+    def _txid_sane_for_asset(asset: str, txid: str | None) -> bool:
+        value = (txid or "").strip()
+        if not value or len(value) < 16 or len(value) > 160:
+            return False
+        sym = asset.upper().strip()
+        if sym in {"BTC", "LTC"}:
+            low = value.lower()
+            return len(low) == 64 and all(c in "0123456789abcdef" for c in low)
+        if sym in {"ETH", "USDT"}:
+            low = value.lower()
+            return low.startswith("0x") and len(low) == 66 and all(c in "0123456789abcdef" for c in low[2:])
+        return False
+
     def request_withdrawal(self, user_id: int, asset: str, amount: Decimal, destination_address: str):
         if not Settings.withdrawals_enabled:
             raise ValueError("withdrawals are temporarily unavailable")
@@ -515,13 +535,13 @@ class WalletService:
             if self.ledger.available_balance(resolved_user_id, symbol) < amt:
                 raise ValueError("insufficient available balance")
             encrypted_destination = self._encrypt_field(destination_address)
-            idempotency_seed = f"{resolved_user_id}|{symbol}|{amt}|{destination_address}"
-            idempotency_key = f"wdreq:{hashlib.sha256(idempotency_seed.encode()).hexdigest()[:40]}"
             cur = self.conn.execute(
-                "INSERT INTO withdrawals(user_id,asset,amount,destination_address,status,idempotency_key) VALUES(?,?,?,?,?,?)",
-                (resolved_user_id, symbol, str(amt), encrypted_destination, "pending", idempotency_key),
+                "INSERT INTO withdrawals(user_id,asset,amount,destination_address,status,idempotency_key) VALUES(?,?,?,?,?,NULL)",
+                (resolved_user_id, symbol, str(amt), encrypted_destination, "pending"),
             )
             wid = int(cur.lastrowid)
+            idempotency_key = self._build_withdrawal_idempotency_key(wid, resolved_user_id, symbol, amt, destination_address)
+            self.conn.execute("UPDATE withdrawals SET idempotency_key=? WHERE id=?", (idempotency_key, wid))
             self.ledger.add_entry("USER", resolved_user_id, resolved_user_id, symbol, -amt, "WITHDRAWAL_RESERVE", "withdrawal", wid)
             if managed_tx:
                 self.conn.commit()
@@ -569,10 +589,22 @@ class WalletService:
             out.append(item)
         return out
 
-    def unresolved_withdrawals_for_reconcile(self, limit: int = 100):
+    def unresolved_withdrawals_for_reconcile(self, limit: int = 100, submitted_after_s: int = 45, broadcasted_after_s: int = 120, signer_retry_after_s: int = 300):
         rows = self.conn.execute(
-            "SELECT * FROM withdrawals WHERE status IN ('submitted','broadcasted','signer_retry') ORDER BY created_at ASC, id ASC LIMIT ?",
-            (int(limit),),
+            """
+            SELECT *
+            FROM withdrawals
+            WHERE (
+                status='submitted' AND COALESCE(submitted_at, created_at) <= datetime('now', '-' || ? || ' seconds')
+            ) OR (
+                status='broadcasted' AND COALESCE(broadcasted_at, submitted_at, created_at) <= datetime('now', '-' || ? || ' seconds')
+            ) OR (
+                status='signer_retry' AND COALESCE(last_reconciled_at, created_at) <= datetime('now', '-' || ? || ' seconds')
+            )
+            ORDER BY created_at ASC, id ASC
+            LIMIT ?
+            """,
+            (int(submitted_after_s), int(broadcasted_after_s), int(signer_retry_after_s), int(limit)),
         ).fetchall()
         out = []
         for row in rows:
@@ -608,13 +640,13 @@ class WalletService:
 
     def mark_withdrawal_broadcasted(self, withdrawal_id: int, txid: str, provider_ref: str | None = None, external_status: str | None = None, broadcasted_at: str | None = None) -> None:
         self.conn.execute(
-            "UPDATE withdrawals SET status='broadcasted', txid=?, provider_ref=COALESCE(provider_ref,?), external_status=COALESCE(?, external_status), broadcasted_at=COALESCE(?,broadcasted_at,CURRENT_TIMESTAMP) WHERE id=?",
+            "UPDATE withdrawals SET status='broadcasted', txid=?, provider_ref=COALESCE(provider_ref,?), external_status=COALESCE(?, external_status), broadcasted_at=COALESCE(?,broadcasted_at,CURRENT_TIMESTAMP), last_reconciled_at=NULL WHERE id=?",
             (txid, provider_ref, (external_status or 'broadcasted')[:64], broadcasted_at, withdrawal_id),
         )
 
     def mark_withdrawal_submitted(self, withdrawal_id: int, provider_ref: str | None, external_status: str | None, submitted_at: str | None) -> None:
         self.conn.execute(
-            "UPDATE withdrawals SET status='submitted', external_status=?, submitted_at=COALESCE(?,submitted_at,CURRENT_TIMESTAMP), provider_ref=COALESCE(provider_ref,?) WHERE id=?",
+            "UPDATE withdrawals SET status='submitted', external_status=?, submitted_at=COALESCE(?,submitted_at,CURRENT_TIMESTAMP), provider_ref=COALESCE(provider_ref,?), last_reconciled_at=NULL WHERE id=?",
             ((external_status or "submitted")[:64], submitted_at, provider_ref, int(withdrawal_id)),
         )
 
@@ -647,21 +679,40 @@ class WalletService:
         self.ledger.add_entry("USER", row["user_id"], row["user_id"], row["asset"], Decimal(row["amount"]), "WITHDRAWAL_RELEASE", "withdrawal", withdrawal_id)
 
     def persist_withdrawal_idempotency(self, withdrawal_id: int, idempotency_key: str) -> None:
-        self.conn.execute("UPDATE withdrawals SET idempotency_key=COALESCE(NULLIF(idempotency_key,''), ?) WHERE id=?", (idempotency_key, int(withdrawal_id)))
+        row = self.conn.execute("SELECT idempotency_key FROM withdrawals WHERE id=?", (int(withdrawal_id),)).fetchone()
+        if not row:
+            raise RuntimeError("withdrawal not found")
+        existing = str(row["idempotency_key"] or "").strip()
+        incoming = str(idempotency_key or "").strip()
+        if existing and incoming and existing != incoming:
+            raise RuntimeError("idempotency_key mismatch")
+        self.conn.execute("UPDATE withdrawals SET idempotency_key=COALESCE(NULLIF(idempotency_key,''), ?) WHERE id=?", (incoming, int(withdrawal_id)))
 
     def record_withdrawal_provider_result(self, withdrawal_id: int, provider_origin: str, idempotency_key: str, result) -> None:
-        row = self.conn.execute("SELECT provider_origin, provider_ref FROM withdrawals WHERE id=?", (int(withdrawal_id),)).fetchone()
+        row = self.conn.execute("SELECT provider_origin, provider_ref, idempotency_key, asset FROM withdrawals WHERE id=?", (int(withdrawal_id),)).fetchone()
         if not row:
             return
         existing_origin = str(row["provider_origin"] or "").strip()
         if existing_origin and existing_origin != provider_origin:
             raise RuntimeError("provider_origin mismatch")
+        existing_idem = str(row["idempotency_key"] or "").strip()
+        incoming_idem = str(idempotency_key or "").strip()
+        if existing_idem and incoming_idem and existing_idem != incoming_idem:
+            raise RuntimeError("idempotency_key mismatch")
         existing_ref = str(row["provider_ref"] or "").strip()
         new_ref = str(getattr(result, "provider_ref", "") or "").strip()
         if existing_ref and new_ref and existing_ref != new_ref:
             raise RuntimeError("provider_ref mismatch")
+        result_asset = str(getattr(result, "asset", "") or "").strip().upper()
+        if result_asset and result_asset != str(row["asset"] or "").strip().upper():
+            raise RuntimeError("provider asset mismatch")
         metadata = getattr(result, "metadata", None)
         metadata_json = json.dumps(metadata, sort_keys=True)[:2000] if isinstance(metadata, dict) else None
+        status = str(getattr(result, "status", "") or "").strip().lower()
+        txid = str(getattr(result, "txid", "") or "").strip() or None
+        if status in {"broadcasted", "confirmed"} and not self._txid_sane_for_asset(str(row["asset"]), txid):
+            # WARNING: malformed txid is rejected and retried to avoid persisting forged or unusable on-chain references.
+            raise RuntimeError("malformed txid for on-chain status")
         self.conn.execute(
             "UPDATE withdrawals SET provider_origin=COALESCE(provider_origin, ?), provider_ref=COALESCE(provider_ref, NULLIF(?,'')), idempotency_key=COALESCE(NULLIF(idempotency_key,''), ?), external_status=?, submitted_at=COALESCE(submitted_at, ?), broadcasted_at=COALESCE(broadcasted_at, ?), tx_metadata_json=COALESCE(?, tx_metadata_json) WHERE id=?",
             (

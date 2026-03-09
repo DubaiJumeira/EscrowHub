@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from pathlib import Path
 
@@ -81,6 +82,53 @@ def _apply_security_constraints(conn: sqlite3.Connection) -> None:
         "BEGIN SELECT RAISE(ABORT, 'provider_ref cannot be rebound to another route'); END;"
     )
 
+
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS trg_withdrawals_provider_ref_guard_ins BEFORE INSERT ON withdrawals "
+        "WHEN COALESCE(NEW.provider_origin,'') != '' AND COALESCE(NEW.provider_ref,'') != '' AND "
+        "EXISTS (SELECT 1 FROM withdrawals w WHERE w.provider_origin=NEW.provider_origin AND w.provider_ref=NEW.provider_ref AND w.id != NEW.id) "
+        "BEGIN SELECT RAISE(ABORT, 'provider_ref cannot be rebound across withdrawals'); END;"
+    )
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS trg_withdrawals_provider_ref_guard_upd BEFORE UPDATE OF provider_origin, provider_ref ON withdrawals "
+        "WHEN COALESCE(NEW.provider_origin,'') != '' AND COALESCE(NEW.provider_ref,'') != '' AND "
+        "EXISTS (SELECT 1 FROM withdrawals w WHERE w.provider_origin=NEW.provider_origin AND w.provider_ref=NEW.provider_ref AND w.id != NEW.id) "
+        "BEGIN SELECT RAISE(ABORT, 'provider_ref cannot be rebound across withdrawals'); END;"
+    )
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS trg_withdrawals_provider_identity_immutable_upd BEFORE UPDATE OF provider_origin, provider_ref ON withdrawals "
+        "WHEN (COALESCE(OLD.provider_origin,'') != '' AND COALESCE(NEW.provider_origin,'') != '' AND OLD.provider_origin != NEW.provider_origin) "
+        "OR (COALESCE(OLD.provider_ref,'') != '' AND COALESCE(NEW.provider_ref,'') != '' AND OLD.provider_ref != NEW.provider_ref) "
+        "BEGIN SELECT RAISE(ABORT, 'withdrawal provider identity is immutable once assigned'); END;"
+    )
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS trg_withdrawals_idempotency_immutable_upd BEFORE UPDATE OF idempotency_key ON withdrawals "
+        "WHEN COALESCE(OLD.idempotency_key,'') != '' AND COALESCE(NEW.idempotency_key,'') != '' AND OLD.idempotency_key != NEW.idempotency_key "
+        "BEGIN SELECT RAISE(ABORT, 'idempotency_key cannot be rebound'); END;"
+    )
+
+
+
+
+def _backfill_withdrawal_idempotency_keys(conn: sqlite3.Connection) -> None:
+    rows = conn.execute("SELECT id, user_id, asset, amount, destination_address, idempotency_key FROM withdrawals ORDER BY id ASC").fetchall()
+    seen: dict[str, int] = {}
+    for row in rows:
+        wid = int(row["id"])
+        uid = int(row["user_id"] or 0)
+        asset = str(row["asset"] or "").upper().strip()
+        amount = str(row["amount"] or "")
+        destination = str(row["destination_address"] or "")
+        digest = hashlib.sha256(f"{wid}|{uid}|{asset}|{amount}|{destination}".encode()).hexdigest()[:24]
+        expected = f"wdrow:{wid}:{digest}"
+        key = str(row["idempotency_key"] or "").strip()
+        if key and key in seen and seen[key] != wid:
+            # WARNING: impossible idempotency collision across withdrawal rows is fatal; secure alternative is manual operator remediation.
+            raise RuntimeError(f"withdrawal idempotency_key collision requires manual remediation: key={key} rows={seen[key]},{wid}")
+        if not key or key.startswith("wdreq:"):
+            key = expected
+            conn.execute("UPDATE withdrawals SET idempotency_key=? WHERE id=?", (key, wid))
+        seen[key] = wid
 
 def _normalized_username_collisions(conn: sqlite3.Connection) -> list[str]:
     rows = conn.execute(
@@ -211,7 +259,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE withdrawals_new RENAME TO withdrawals")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_withdrawals_user_status_created ON withdrawals(user_id, status, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_withdrawals_unresolved_status_created ON withdrawals(status, created_at)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_withdrawals_provider_ref ON withdrawals(provider_origin, provider_ref) WHERE COALESCE(provider_origin, '') != '' AND COALESCE(provider_ref, '') != ''")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_withdrawals_provider_ref ON withdrawals(provider_origin, provider_ref) WHERE COALESCE(provider_origin, '') != '' AND COALESCE(provider_ref, '') != ''")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_withdrawals_idempotency_key ON withdrawals(idempotency_key) WHERE COALESCE(idempotency_key, '') != ''")
 
     bot_cols = {row["name"] for row in conn.execute("PRAGMA table_info(bots)").fetchall()}
@@ -232,12 +280,14 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_wallet_addresses_chain_fingerprint ON wallet_addresses(chain_family, address_fingerprint)")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_addresses_provider_ref ON wallet_addresses(provider_origin, provider_ref) WHERE COALESCE(provider_origin, '') != '' AND COALESCE(provider_ref, '') != ''")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_withdrawals_unresolved_status_created ON withdrawals(status, created_at)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_withdrawals_provider_ref ON withdrawals(provider_origin, provider_ref) WHERE COALESCE(provider_origin, '') != '' AND COALESCE(provider_ref, '') != ''")
+    conn.execute("DROP INDEX IF EXISTS idx_withdrawals_provider_ref")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_withdrawals_provider_ref ON withdrawals(provider_origin, provider_ref) WHERE COALESCE(provider_origin, '') != '' AND COALESCE(provider_ref, '') != ''")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_withdrawals_idempotency_key ON withdrawals(idempotency_key) WHERE COALESCE(idempotency_key, '') != ''")
 
     from wallet_service import WalletService
 
     WalletService(conn).ensure_wallet_route_integrity()
+    _backfill_withdrawal_idempotency_keys(conn)
 
     wallet_collisions = _wallet_route_collisions(conn)
     if wallet_collisions:

@@ -24,7 +24,7 @@ from config.settings import Settings
 from escrow_service import EscrowService
 from infra.db.database import get_connection, init_db
 from signer.signer_service import SignerService
-from runtime_preflight import run_startup_preflight
+from runtime_preflight import PreflightIntegrityError, run_startup_preflight
 from tenant_service import TenantService
 from wallet_service import NETWORK_LABELS, WalletService
 from watcher_status_service import read_watcher_status
@@ -3457,7 +3457,12 @@ def main() -> None:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
 
     global DEPOSIT_ISSUANCE_READY, DEPOSIT_ISSUANCE_ERROR
-    preflight = run_startup_preflight("bot")
+    try:
+        preflight = run_startup_preflight("bot")
+    except PreflightIntegrityError as exc:
+        # WARNING: bot startup fails closed on route-integrity failures to prevent operating with tampered routes.
+        LOGGER.error("bot startup aborted by fatal integrity preflight: %s", "; ".join(exc.status.reasons) or str(exc))
+        raise
     DEPOSIT_ISSUANCE_READY = bool(preflight.deposit_issuance_ready)
     DEPOSIT_ISSUANCE_ERROR = preflight.deposit_issuance_error
     if not DEPOSIT_ISSUANCE_READY:
