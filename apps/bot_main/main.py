@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# WARNING: Legacy entrypoint only; production runtime uses run_bot.py + bot.py.
 import os
 from decimal import Decimal
 
@@ -22,9 +23,6 @@ def build_handlers() -> MainBotHandlers:
             "ETH": Decimal("3500"),
             "LTC": Decimal("80"),
             "USDT": Decimal("1"),
-            "USDC": Decimal("1"),
-            "SOL": Decimal("150"),
-            "XRP": Decimal("0.55"),
         }
     )
     escrow = EscrowService(wallet_service=wallet, fee_service=fee, price_service=price)

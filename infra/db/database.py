@@ -16,6 +16,31 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 
+
+
+def _apply_security_constraints(conn: sqlite3.Connection) -> None:
+    asset_check = "NEW.asset NOT IN ('BTC','LTC','ETH','USDT')"
+    for table in ("wallet_addresses", "deposits", "withdrawals", "escrows", "escrow_locks", "ledger_entries"):
+        conn.execute(
+            f"CREATE TRIGGER IF NOT EXISTS trg_{table}_asset_check_ins BEFORE INSERT ON {table} "
+            f"WHEN {asset_check} BEGIN SELECT RAISE(ABORT, 'invalid asset'); END;"
+        )
+        conn.execute(
+            f"CREATE TRIGGER IF NOT EXISTS trg_{table}_asset_check_upd BEFORE UPDATE OF asset ON {table} "
+            f"WHEN {asset_check} BEGIN SELECT RAISE(ABORT, 'invalid asset'); END;"
+        )
+
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS trg_bots_username_check_ins BEFORE INSERT ON bots "
+        "WHEN NEW.telegram_username IS NOT NULL AND (NEW.telegram_username != lower(NEW.telegram_username) OR instr(NEW.telegram_username, '@') > 0) "
+        "BEGIN SELECT RAISE(ABORT, 'telegram_username must be lowercase and must not include @'); END;"
+    )
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS trg_bots_username_check_upd BEFORE UPDATE OF telegram_username ON bots "
+        "WHEN NEW.telegram_username IS NOT NULL AND (NEW.telegram_username != lower(NEW.telegram_username) OR instr(NEW.telegram_username, '@') > 0) "
+        "BEGIN SELECT RAISE(ABORT, 'telegram_username must be lowercase and must not include @'); END;"
+    )
+
 def init_db(conn: sqlite3.Connection) -> None:
     schema = Path("infra/db/schema.sql").read_text()
     conn.executescript(schema)
@@ -25,5 +50,8 @@ def init_db(conn: sqlite3.Connection) -> None:
     bot_cols = {row["name"] for row in conn.execute("PRAGMA table_info(bots)").fetchall()}
     if "telegram_username" not in bot_cols:
         conn.execute("ALTER TABLE bots ADD COLUMN telegram_username TEXT")
+    conn.execute("UPDATE bots SET telegram_username=lower(ltrim(trim(telegram_username),'@')) WHERE telegram_username IS NOT NULL")
+    conn.execute("UPDATE bots SET telegram_username=NULL WHERE telegram_username=''")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_bots_telegram_username ON bots(telegram_username)")
+    _apply_security_constraints(conn)
     conn.commit()

@@ -2,22 +2,29 @@
 
 ## Required environment variables
 - `TELEGRAM_BOT_TOKEN`
-- `ADMIN_USER_IDS` (comma-separated Telegram IDs)
 - `APP_ENV` (`dev` or `production`)
 - `SQLITE_DB_PATH` (or external DB wiring)
-- `HD_WALLET_SEED_HEX` (**required for HD derivation/signing**)
-- `XRP_HOT_WALLET_ADDRESS` (**required in production for XRP deposits**)
 - `ETH_RPC_URL` (Alchemy/Infura RPC)
-- `BLOCKSTREAM_BASE_URL` (optional override)
-- `BTC_CONFIRMATIONS` / `LTC_CONFIRMATIONS` (default 3)
-- `ETH_CONFIRMATIONS` (default 12)
-- `SOL_RPC_URL`
-- `XRP_RPC_URL`
-- `SIGNER_PROVIDER` (`hd`, `mock`, or `vault`)
-- `VAULT_ADDR`, `VAULT_TOKEN`, `VAULT_SIGN_PATH` (when `SIGNER_PROVIDER=vault`)
+
+## Runtime controls / limits
 - `BTC_WATCHER_ENABLED` (`true`/`false`)
 - `ETH_WATCHER_ENABLED` (`true`/`false`)
 - `WATCHER_POLL_INTERVAL_SECONDS` (default `30`)
+- `ETH_MAX_BLOCKS_PER_RUN` (default `500`)
+- `WITHDRAWALS_ENABLED` (`false` by default; keep disabled unless a full secure signer/broadcaster is deployed)
+
+## Wallet and derivation variables
+- `HD_WALLET_SEED_HEX` (seed derivation in non-production/dev flows)
+- `BTC_XPUB`
+- `LTC_XPUB`
+- `ETH_XPUB`
+
+### xpub safety note
+With the current path contract (`m/.../{user_id}'/...`), xpubs are **not derivation-compatible** because hardened user nodes cannot be derived from public keys. Startup preflight fails closed when xpub mode is configured.
+
+Secure alternatives:
+- external address service / HSM-backed derivation service, or
+- explicit migration to a non-hardened xpub-compatible path scheme.
 
 ## Service entrypoints (separate processes)
 - `python run_bot.py`
@@ -38,23 +45,13 @@ These run as independent long-running loops. Watchers and signer are **not** sta
 
 Use bot admin command `/watcher_status` to read BTC/ETH watcher health.
 
-## Derivation paths
-- BTC: `m/84'/0'/{user_id}'/0/0`
-- LTC: `m/84'/2'/{user_id}'/0/0`
-- ETH/USDT/USDC: `m/44'/60'/{user_id}'/0/0`
-- XRP: shared hot wallet + destination tag = user_id
-- SOL: `m/44'/501'/{user_id}'/0'` (TODO for full audited production support)
+## Active assets
+Only BTC, LTC, ETH, and USDT are supported in active runtime.
 
-Only address metadata (`address`, `derivation_index`, `derivation_path`, `destination_tag`) is stored in DB. No private keys are stored.
+## Signer provider behavior
+`SignerService` is fail-closed by default. Pending withdrawals are skipped unless `WITHDRAWALS_ENABLED=true`, and no fake txids or partial broadcaster behavior is allowed.
 
 ## Seed backup policy (critical)
 - Never commit or store `HD_WALLET_SEED_HEX` in code or DB.
 - Store seed backup in offline encrypted secret manager/HSM process.
 - Rotating/changing `HD_WALLET_SEED_HEX` changes all derived addresses.
-
-## systemd deployment examples
-Service unit examples are provided in `deploy/systemd/`:
-- `escrowhub-bot.service`
-- `escrowhub-btc-watcher.service`
-- `escrowhub-eth-watcher.service`
-- `escrowhub-signer.service`

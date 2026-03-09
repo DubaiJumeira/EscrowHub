@@ -45,8 +45,20 @@ class HDWalletDeriver:
         if Settings.is_production:
             # WARNING: Production deposit routing must use xpub/address-service only; seed-based derivation in bot runtime expands key compromise blast radius.
             # Secure alternative: inject per-asset xpubs or a hardened external address-service.
-            raise RuntimeError(f"{asset.upper()}_XPUB is required in production for deposit address derivation")
+            raise RuntimeError(f"No valid production derivation mode configured for {asset.upper()}; configure an external derivation service/HSM-backed address service.")
         return ""
+
+    def validate_xpub_configuration(self) -> None:
+        configured = {"BTC": Settings.btc_xpub, "LTC": Settings.ltc_xpub, "ETH": Settings.eth_xpub}
+        if any((v or "").strip() for v in configured.values()):
+            # WARNING: Current stored derivation contract uses hardened user account nodes (m/.../{user_id}'/...),
+            # which cannot be derived from public extended keys. Fail closed to avoid misrouting deposits.
+            # Secure alternative: use an external HSM/address-derivation service, or migrate explicitly to an xpub-compatible non-hardened user index path.
+            raise RuntimeError(
+                "xpub configuration is incompatible with current derivation path contract "
+                "(m/.../{user_id}'/... requires hardened derivation). "
+                "Disable xpub mode and use approved external derivation service or perform a planned migration."
+            )
 
     def _bip_utils(self):
         try:
@@ -67,6 +79,7 @@ class HDWalletDeriver:
         raise RuntimeError("private-key derivation is disabled; use external signer")
 
     def derive_btc_address(self, user_id: int) -> DerivedAddress:
+        self.validate_xpub_configuration()
         b = self._bip_utils()
         path = f"m/84'/0'/{int(user_id)}'/0/0"
         xpub = self._require_xpub("BTC")
@@ -78,6 +91,7 @@ class HDWalletDeriver:
         return DerivedAddress(path=path, public_address=ctx.PublicKey().ToAddress())
 
     def derive_ltc_address(self, user_id: int) -> DerivedAddress:
+        self.validate_xpub_configuration()
         b = self._bip_utils()
         path = f"m/84'/2'/{int(user_id)}'/0/0"
         xpub = self._require_xpub("LTC")
@@ -89,6 +103,7 @@ class HDWalletDeriver:
         return DerivedAddress(path=path, public_address=ctx.PublicKey().ToAddress())
 
     def derive_eth_address(self, user_id: int) -> DerivedAddress:
+        self.validate_xpub_configuration()
         b = self._bip_utils()
         path = f"m/44'/60'/{int(user_id)}'/0/0"
         xpub = self._require_xpub("ETH")

@@ -410,9 +410,11 @@ def test_moderator_auth_uses_telegram_id(monkeypatch):
     assert asyncio.run(_is_moderator(777)) is True
 
 
-def test_db_address_map_loader_reads_wallet_addresses(conn):
+def test_db_address_map_loader_reads_wallet_addresses(conn, monkeypatch):
+    monkeypatch.setenv("HD_WALLET_SEED_HEX", "ab" * 32)
     from run_btc_watcher import _address_map as btc_map
     from run_eth_watcher import _address_map as eth_map
+    monkeypatch.setattr("wallet_service.WalletService.verify_address_derivation_consistency", lambda self, sample_size=25: None)
 
     conn.execute("INSERT INTO users(id, telegram_id, username, frozen) VALUES(?,?,?,0)", (1, 1001, "u1"))
     conn.execute("INSERT INTO users(id, telegram_id, username, frozen) VALUES(?,?,?,0)", (2, 1002, "u2"))

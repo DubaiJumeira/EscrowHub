@@ -16,14 +16,19 @@ Run each service separately:
 
 `bot.py` remains Telegram-only and does not start watcher threads.
 
-## HD derivation paths
+## HD derivation paths (active assets only)
 - BTC: `m/84'/0'/{user_id}'/0/0` (BIP84 mainnet)
 - LTC: `m/84'/2'/{user_id}'/0/0` (BIP84 coin type 2)
-- ETH / USDT(ERC-20) / USDC(ERC-20): `m/44'/60'/{user_id}'/0/0`
-- XRP: shared hot wallet + destination tag = `user_id`
-- SOL: `m/44'/501'/{user_id}'/0'` (flagged for audited production hardening)
+- ETH / USDT(ERC-20): `m/44'/60'/{user_id}'/0/0`
 
 ## Security note
 Changing `HD_WALLET_SEED_HEX` changes all derived addresses. Only address/path metadata is stored in DB; private keys remain offline and are never persisted.
+
+## xpub reality check (fail-closed)
+Current stored derivation contract uses hardened user nodes (`m/.../{user_id}'/...`). Public extended keys cannot derive hardened child paths, so `BTC_XPUB`, `LTC_XPUB`, and `ETH_XPUB` are intentionally rejected at runtime in this architecture.
+
+Secure alternatives:
+- external address derivation service / HSM-backed derivation service, or
+- planned explicit migration to an xpub-compatible non-hardened user index path.
 
 See `docs/RUNBOOK.md` for setup and operations.
