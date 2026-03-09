@@ -848,3 +848,65 @@ def test_identical_withdrawals_create_distinct_row_bound_idempotency_keys(conn):
     assert rows[0]["idempotency_key"].startswith("wdrow:")
     assert rows[1]["idempotency_key"].startswith("wdrow:")
     assert rows[0]["idempotency_key"] != rows[1]["idempotency_key"]
+
+
+def test_withdrawal_reconcile_targets_only_requested_id(monkeypatch, conn):
+    import asyncio
+    import bot
+
+    conn.execute("INSERT INTO users(id,telegram_id,username,frozen) VALUES(?,?,?,0)", (1, 1001, "u1"))
+    conn.execute("INSERT INTO withdrawals(id,user_id,asset,amount,destination_address,status,idempotency_key,submitted_at) VALUES(?,?,?,?,?,?,?,datetime('now','-700 seconds'))", (11, 1, "USDT", "1", "enc", "submitted", "k11"))
+    conn.execute("INSERT INTO withdrawals(id,user_id,asset,amount,destination_address,status,idempotency_key,submitted_at) VALUES(?,?,?,?,?,?,?,datetime('now','-700 seconds'))", (12, 1, "USDT", "1", "enc", "submitted", "k12"))
+
+    monkeypatch.setattr(bot, "ADMIN_IDS", {999})
+    monkeypatch.setattr(bot, "_services", lambda: (conn, WalletService(conn), TenantService(conn), None))
+
+    calls = []
+    class FakeSigner:
+        def reconcile_withdrawal_by_id(self, _wallet, wid):
+            calls.append(wid)
+            return 1
+
+    monkeypatch.setattr(bot, "SignerService", lambda: FakeSigner())
+
+    class Msg:
+        text = "/withdrawal_reconcile 11 CONFIRM"
+        def __init__(self):
+            self.replies = []
+        async def reply_text(self, txt, **kwargs):
+            self.replies.append(txt)
+
+    msg = Msg()
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=999), effective_message=msg, message=msg)
+    asyncio.run(bot.withdrawal_reconcile(upd, None))
+    assert calls == [11]
+    assert "processed=1" in msg.replies[-1]
+
+
+def test_withdrawal_reconcile_fails_closed_when_not_eligible(monkeypatch, conn):
+    import asyncio
+    import bot
+
+    conn.execute("INSERT INTO users(id,telegram_id,username,frozen) VALUES(?,?,?,0)", (1, 1001, "u1"))
+    conn.execute("INSERT INTO withdrawals(id,user_id,asset,amount,destination_address,status,idempotency_key,submitted_at) VALUES(?,?,?,?,?,?,?,datetime('now'))", (21, 1, "USDT", "1", "enc", "submitted", "k21"))
+
+    monkeypatch.setattr(bot, "ADMIN_IDS", {999})
+    monkeypatch.setattr(bot, "_services", lambda: (conn, WalletService(conn), TenantService(conn), None))
+
+    class FakeSigner:
+        def reconcile_withdrawal_by_id(self, _wallet, _wid):
+            return 0
+
+    monkeypatch.setattr(bot, "SignerService", lambda: FakeSigner())
+
+    class Msg:
+        text = "/withdrawal_reconcile 21 CONFIRM"
+        def __init__(self):
+            self.replies = []
+        async def reply_text(self, txt, **kwargs):
+            self.replies.append(txt)
+
+    msg = Msg()
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=999), effective_message=msg, message=msg)
+    asyncio.run(bot.withdrawal_reconcile(upd, None))
+    assert msg.replies[-1] == "Withdrawal is not in a reconcilable state"

@@ -1055,7 +1055,8 @@ def test_error_sanitizer_redacts_secrets_and_payloads():
 def test_run_bot_fatal_startup_error_classification():
     status = PreflightStatus(service_name="bot", reasons=("route integrity failed",), route_integrity_ready=False)
     assert run_bot._is_fatal_startup_error(PreflightIntegrityError(status)) is True
-    assert run_bot._is_fatal_startup_error(RuntimeError("TELEGRAM_BOT_TOKEN is required")) is True
+    from runtime_preflight import FatalStartupError
+    assert run_bot._is_fatal_startup_error(FatalStartupError("TELEGRAM_BOT_TOKEN is required")) is True
     assert run_bot._is_fatal_startup_error(RuntimeError("worker crashed after startup")) is False
 
 
@@ -1118,3 +1119,62 @@ def test_withdrawal_lifecycle_execute_and_reconcile_to_confirmed(conn, monkeypat
     assert row["status"] == "confirmed"
     assert row["provider_ref"] == "r-lc"
     assert str(row["txid"]).startswith("0x")
+
+
+def test_reconcile_backoff_uses_last_reconciled_at_submitted_broadcasted_and_signer_retry(conn):
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(97002)
+    conn.execute("INSERT INTO withdrawals(user_id,asset,amount,destination_address,status,idempotency_key,submitted_at,last_reconciled_at) VALUES(?,?,?,?,?,?,datetime('now','-600 seconds'),datetime('now'))", (uid, "USDT", "1", "a", "submitted", "k-sub-recent"))
+    conn.execute("INSERT INTO withdrawals(user_id,asset,amount,destination_address,status,idempotency_key,submitted_at,last_reconciled_at) VALUES(?,?,?,?,?,?,datetime('now','-600 seconds'),datetime('now','-600 seconds'))", (uid, "USDT", "1", "b", "submitted", "k-sub-old"))
+    conn.execute("INSERT INTO withdrawals(user_id,asset,amount,destination_address,status,idempotency_key,broadcasted_at,last_reconciled_at) VALUES(?,?,?,?,?,?,datetime('now','-600 seconds'),datetime('now'))", (uid, "USDT", "1", "c", "broadcasted", "k-br-recent"))
+    conn.execute("INSERT INTO withdrawals(user_id,asset,amount,destination_address,status,idempotency_key,broadcasted_at,last_reconciled_at) VALUES(?,?,?,?,?,?,datetime('now','-600 seconds'),datetime('now','-600 seconds'))", (uid, "USDT", "1", "d", "broadcasted", "k-br-old"))
+    conn.execute("INSERT INTO withdrawals(user_id,asset,amount,destination_address,status,idempotency_key,last_reconciled_at) VALUES(?,?,?,?,?,?,datetime('now'))", (uid, "USDT", "1", "e", "signer_retry", "k-retry-recent"))
+    conn.execute("INSERT INTO withdrawals(user_id,asset,amount,destination_address,status,idempotency_key,last_reconciled_at) VALUES(?,?,?,?,?,?,datetime('now','-600 seconds'))", (uid, "USDT", "1", "f", "signer_retry", "k-retry-old"))
+    rows = wallet.unresolved_withdrawals_for_reconcile(limit=20, submitted_after_s=45, broadcasted_after_s=120, signer_retry_after_s=300)
+    keys = {str(r["idempotency_key"]) for r in rows}
+    assert "k-sub-old" in keys and "k-sub-recent" not in keys
+    assert "k-br-old" in keys and "k-br-recent" not in keys
+    assert "k-retry-old" in keys and "k-retry-recent" not in keys
+
+
+def test_signer_process_withdrawals_does_not_reconcile_just_submitted_in_same_cycle(conn, monkeypatch):
+    monkeypatch.setattr(Settings, "withdrawals_enabled", True)
+    monkeypatch.setattr(Settings, "withdrawal_min_interval_seconds", 0)
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(97003)
+    wallet.ledger.add_entry("USER", uid, uid, "USDT", Decimal("10"), "DEPOSIT", "deposit", 1)
+    req = wallet.request_withdrawal(uid, "USDT", Decimal("1"), "0x1111111111111111111111111111111111111111")
+
+    class Provider:
+        provider_origin = "external_http"
+
+        def is_ready(self):
+            return True, None
+
+        def execute_withdrawal(self, _req):
+            from signer.withdrawal_provider import WithdrawalExecutionResult
+            return WithdrawalExecutionResult(status="submitted", provider_ref="ref-just", asset="USDT", external_status="submitted")
+
+        def reconcile_withdrawal(self, _req):
+            raise RuntimeError("should not reconcile in same cycle")
+
+    svc = SignerService()
+    svc.provider = Provider()
+    processed = svc.process_withdrawals(wallet)
+    row = conn.execute("SELECT status,last_reconciled_at FROM withdrawals WHERE id=?", (req["id"],)).fetchone()
+    assert processed == 1
+    assert row["status"] == "submitted"
+    assert row["last_reconciled_at"] is None
+
+
+def test_run_bot_main_does_not_restart_on_fatal_startup(monkeypatch):
+    from runtime_preflight import FatalStartupError
+
+    monkeypatch.setattr(run_bot, "bot_main", lambda: (_ for _ in ()).throw(FatalStartupError("TELEGRAM_BOT_TOKEN is required")))
+
+    slept = []
+    monkeypatch.setattr(run_bot.time, "sleep", lambda n: slept.append(n))
+
+    with pytest.raises(FatalStartupError):
+        run_bot.main()
+    assert slept == []

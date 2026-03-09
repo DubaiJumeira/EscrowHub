@@ -596,16 +596,33 @@ class WalletService:
             SELECT *
             FROM withdrawals
             WHERE (
-                status='submitted' AND COALESCE(submitted_at, created_at) <= datetime('now', '-' || ? || ' seconds')
+                status='submitted' AND (
+                    (last_reconciled_at IS NULL AND COALESCE(submitted_at, created_at) <= datetime('now', '-' || ? || ' seconds'))
+                    OR
+                    (last_reconciled_at IS NOT NULL AND last_reconciled_at <= datetime('now', '-' || ? || ' seconds'))
+                )
             ) OR (
-                status='broadcasted' AND COALESCE(broadcasted_at, submitted_at, created_at) <= datetime('now', '-' || ? || ' seconds')
+                status='broadcasted' AND (
+                    (last_reconciled_at IS NULL AND COALESCE(broadcasted_at, submitted_at, created_at) <= datetime('now', '-' || ? || ' seconds'))
+                    OR
+                    (last_reconciled_at IS NOT NULL AND last_reconciled_at <= datetime('now', '-' || ? || ' seconds'))
+                )
             ) OR (
-                status='signer_retry' AND COALESCE(last_reconciled_at, created_at) <= datetime('now', '-' || ? || ' seconds')
+                status='signer_retry' AND (
+                    (last_reconciled_at IS NULL AND COALESCE(created_at, submitted_at) <= datetime('now', '-' || ? || ' seconds'))
+                    OR
+                    (last_reconciled_at IS NOT NULL AND last_reconciled_at <= datetime('now', '-' || ? || ' seconds'))
+                )
             )
             ORDER BY created_at ASC, id ASC
             LIMIT ?
             """,
-            (int(submitted_after_s), int(broadcasted_after_s), int(signer_retry_after_s), int(limit)),
+            (
+                int(submitted_after_s), int(submitted_after_s),
+                int(broadcasted_after_s), int(broadcasted_after_s),
+                int(signer_retry_after_s), int(signer_retry_after_s),
+                int(limit),
+            ),
         ).fetchall()
         out = []
         for row in rows:
@@ -613,6 +630,44 @@ class WalletService:
             item["destination_address"] = self._decrypt_field(item.get("destination_address"))
             out.append(item)
         return out
+
+    def unresolved_withdrawal_for_reconcile_by_id(self, withdrawal_id: int, submitted_after_s: int = 45, broadcasted_after_s: int = 120, signer_retry_after_s: int = 300):
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM withdrawals
+            WHERE id=?
+              AND (
+                    (status='submitted' AND (
+                        (last_reconciled_at IS NULL AND COALESCE(submitted_at, created_at) <= datetime('now', '-' || ? || ' seconds'))
+                        OR
+                        (last_reconciled_at IS NOT NULL AND last_reconciled_at <= datetime('now', '-' || ? || ' seconds'))
+                    ))
+                 OR (status='broadcasted' AND (
+                        (last_reconciled_at IS NULL AND COALESCE(broadcasted_at, submitted_at, created_at) <= datetime('now', '-' || ? || ' seconds'))
+                        OR
+                        (last_reconciled_at IS NOT NULL AND last_reconciled_at <= datetime('now', '-' || ? || ' seconds'))
+                    ))
+                 OR (status='signer_retry' AND (
+                        (last_reconciled_at IS NULL AND COALESCE(created_at, submitted_at) <= datetime('now', '-' || ? || ' seconds'))
+                        OR
+                        (last_reconciled_at IS NOT NULL AND last_reconciled_at <= datetime('now', '-' || ? || ' seconds'))
+                    ))
+              )
+            LIMIT 1
+            """,
+            (
+                int(withdrawal_id),
+                int(submitted_after_s), int(submitted_after_s),
+                int(broadcasted_after_s), int(broadcasted_after_s),
+                int(signer_retry_after_s), int(signer_retry_after_s),
+            ),
+        ).fetchone()
+        if not rows:
+            return None
+        item = dict(rows)
+        item["destination_address"] = self._decrypt_field(item.get("destination_address"))
+        return item
 
     def signer_retry_withdrawal(self, withdrawal_id: int):
         row = self.conn.execute(
