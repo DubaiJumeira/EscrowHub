@@ -15,9 +15,6 @@ ASSET_TO_COINGECKO_ID = {
     "ETH": "ethereum",
     "LTC": "litecoin",
     "USDT": "tether",
-    "USDC": "usd-coin",
-    "SOL": "solana",
-    "XRP": "ripple",
 }
 
 

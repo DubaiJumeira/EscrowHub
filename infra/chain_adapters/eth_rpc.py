@@ -17,6 +17,7 @@ class EthRpcAdapter(ChainAdapter):
         self.confirmations_required = int(os.getenv("ETH_CONFIRMATIONS_REQUIRED", "12"))
         self.usdt_contract = os.getenv("USDT_ERC20_CONTRACT", "").lower()
         self.network = os.getenv("ETH_NETWORK", "ethereum")
+        self.app_env = os.getenv("APP_ENV", "dev").lower()
 
     def _rpc(self, method: str, params: list) -> dict:
         if not self.rpc_url:
@@ -28,100 +29,92 @@ class EthRpcAdapter(ChainAdapter):
 
     @staticmethod
     def _hex_to_int(value: str | None) -> int:
-        if not value:
-            return 0
-        return int(value, 16)
+        return int(value, 16) if value else 0
 
     @staticmethod
     def _normalize_hex_address(raw: str | None) -> str:
         if not raw:
             return ""
         h = raw.lower().replace("0x", "")
-        if len(h) < 40:
-            return ""
-        return "0x" + h[-40:]
+        return "0x" + h[-40:] if len(h) >= 40 else ""
 
-    def _asset_for_contract(self, contract_address: str | None) -> str | None:
-        contract = (contract_address or "").lower()
-        if not contract:
-            return "ETH"
-        if self.usdt_contract and contract == self.usdt_contract:
-            return "USDT"
-        return None
+    def _finalized_head(self) -> int:
+        head = self._rpc("eth_blockNumber", []).get("result")
+        return max(0, self._hex_to_int(head) - self.confirmations_required)
 
-    def _event_amount(self, value_hex: str | None, asset: str) -> Decimal:
-        units = Decimal(self._hex_to_int(value_hex))
-        decimals = Decimal("18") if asset == "ETH" else Decimal("6")
-        return units / (Decimal("10") ** decimals)
+    def _load_cursor(self) -> int:
+        return int(os.getenv("ETH_START_BLOCK", "0"))
 
-    def _parse_event(self, event: dict) -> ChainDeposit | None:
-        to_addr = ""
-        if event.get("type") == "erc20":
-            asset = self._asset_for_contract(event.get("contract_address")) or ""
-            if not asset:
-                return None
-            to_addr = self._normalize_hex_address(event.get("to"))
-        elif event.get("topics"):
-            topics = event.get("topics") or []
-            if not topics or topics[0].lower() != TRANSFER_TOPIC:
-                return None
-            asset = self._asset_for_contract(event.get("address")) or ""
-            if not asset:
-                return None
-            to_addr = self._normalize_hex_address(topics[2] if len(topics) > 2 else "")
-        else:
-            asset = "ETH"
-            to_addr = self._normalize_hex_address(event.get("to"))
-
-        user_id = self.address_user_map.get(to_addr.lower())
-        if not user_id:
-            return None
-
-        amount = self._event_amount(event.get("value"), asset)
-        if amount <= Decimal("0"):
-            return None
-
-        txid = (event.get("txid") or event.get("transactionHash") or "").lower()
-        if not txid:
-            return None
-        log_index = event.get("log_index")
-        if log_index is None:
-            log_index = self._hex_to_int(event.get("logIndex")) if event.get("logIndex") else 0
-        unique_key = event.get("unique_key") or f"{self.network}:eth:{txid}:{asset}:{log_index}:{to_addr.lower()}"
-
-        confirmations = int(event.get("confirmations", 0))
-        finalized = bool(event.get("finalized", confirmations >= self.confirmations_required))
-        return ChainDeposit(user_id=user_id, asset=asset, amount=amount, txid=txid, unique_key=unique_key, confirmations=confirmations, finalized=finalized)
+    def _event_amount(self, units_hex: str, asset: str) -> Decimal:
+        units = Decimal(self._hex_to_int(units_hex))
+        return units / (Decimal("10") ** (Decimal("18") if asset == "ETH" else Decimal("6")))
 
     def _fetch_env_events(self) -> list[dict]:
         raw_events = os.getenv("ETH_DEPOSIT_EVENTS_JSON", "[]")
-        app_env = os.getenv("APP_ENV", "dev").lower()
-        if raw_events.strip() not in {"", "[]"} and app_env != "test":
+        if raw_events.strip() not in {"", "[]"} and self.app_env != "test":
             # WARNING: Environment-fed deposit events are insecure outside tests.
             raise RuntimeError("ETH_DEPOSIT_EVENTS_JSON ingestion is allowed only in APP_ENV=test")
-        try:
-            events = json.loads(raw_events)
-            return events if isinstance(events, list) else []
-        except Exception:
-            return []
+        return json.loads(raw_events) if raw_events.strip() else []
 
     def fetch_deposits(self) -> list[ChainDeposit]:
-        # TODO: add full RPC log polling implementation.
-        # WARNING: Environment-fed deposits are test-only. Use real eth_getLogs polling for non-test deployments.
-        app_env = os.getenv("APP_ENV", "dev").lower()
-        if app_env != "test":
-            raise RuntimeError("ETH deposit polling is not implemented for non-test environments; refusing unsafe ingestion")
-        # For now, only tests can feed normalized events via env variable.
-        events = self._fetch_env_events()
+        if self.app_env == "test":
+            deposits: list[ChainDeposit] = []
+            for ev in self._fetch_env_events():
+                to_addr = self._normalize_hex_address(ev.get("to"))
+                uid = self.address_user_map.get(to_addr.lower())
+                if not uid:
+                    continue
+                asset = (ev.get("asset") or "ETH").upper()
+                amount = Decimal(str(ev.get("amount") or "0"))
+                if amount <= 0:
+                    continue
+                txid = str(ev.get("txid") or "").lower()
+                if not txid:
+                    continue
+                deposits.append(ChainDeposit(uid, asset, amount, txid, ev.get("unique_key") or f"test:{txid}:{asset}:{to_addr}", int(ev.get("confirmations", self.confirmations_required)), True))
+            return deposits
+
+        if not self.rpc_url:
+            raise RuntimeError("ETH_RPC_URL is required for production ETH/USDT polling")
+        finalized = self._finalized_head()
+        start = self._load_cursor()
+        if finalized <= start:
+            return []
+
+        watched_topics = ["0x" + "0" * 24 + a.lower().replace("0x", "") for a in self.address_user_map.keys()]
         deposits: list[ChainDeposit] = []
-        for ev in events:
-            if not isinstance(ev, dict):
+
+        # ETH transfers (to watched address)
+        logs = self._rpc("eth_getLogs", [{"fromBlock": hex(start + 1), "toBlock": hex(finalized), "topics": [], "address": None}]).get("result", [])
+        for log in logs:
+            if log.get("topics"):
                 continue
-            dep = self._parse_event(ev)
-            if dep:
-                deposits.append(dep)
+            to_addr = self._normalize_hex_address(log.get("to") or "")
+            uid = self.address_user_map.get(to_addr.lower())
+            if not uid:
+                continue
+            txid = str(log.get("transactionHash") or "").lower()
+            amount = self._event_amount(log.get("value", "0x0"), "ETH")
+            if txid and amount > 0:
+                li = self._hex_to_int(log.get("logIndex"))
+                deposits.append(ChainDeposit(uid, "ETH", amount, txid, f"{self.network}:eth:{txid}:ETH:{li}:{to_addr}", self.confirmations_required, True))
+
+        if self.usdt_contract:
+            erc20_logs = self._rpc("eth_getLogs", [{"fromBlock": hex(start + 1), "toBlock": hex(finalized), "address": self.usdt_contract, "topics": [TRANSFER_TOPIC, None, watched_topics]}]).get("result", [])
+            for ev in erc20_logs:
+                topics = ev.get("topics") or []
+                if len(topics) < 3:
+                    continue
+                to_addr = self._normalize_hex_address(topics[2])
+                uid = self.address_user_map.get(to_addr.lower())
+                if not uid:
+                    continue
+                txid = str(ev.get("transactionHash") or "").lower()
+                amount = self._event_amount(ev.get("data", "0x0"), "USDT")
+                if txid and amount > 0:
+                    li = self._hex_to_int(ev.get("logIndex"))
+                    deposits.append(ChainDeposit(uid, "USDT", amount, txid, f"{self.network}:eth:{txid}:USDT:{li}:{to_addr}", self.confirmations_required, True))
         return deposits
 
     def broadcast_raw_transaction(self, asset: str, raw_tx_hex: str) -> str:
-        resp = self._rpc("eth_sendRawTransaction", [raw_tx_hex])
-        return resp.get("result", "")
+        return self._rpc("eth_sendRawTransaction", [raw_tx_hex]).get("result", "")
