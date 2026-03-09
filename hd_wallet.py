@@ -4,6 +4,8 @@ import importlib
 import os
 from dataclasses import dataclass
 
+from config.settings import Settings
+
 
 @dataclass(frozen=True)
 class DerivedKey:
@@ -30,6 +32,22 @@ class HDWalletDeriver:
             raise RuntimeError("HD_WALLET_SEED_HEX is missing")
         return self.seed_hex
 
+    def _require_xpub(self, asset: str) -> str:
+        key_map = {
+            "BTC": Settings.btc_xpub,
+            "LTC": Settings.ltc_xpub,
+            "ETH": Settings.eth_xpub,
+            "USDT": Settings.eth_xpub,
+        }
+        xpub = (key_map.get(asset.upper()) or "").strip()
+        if xpub:
+            return xpub
+        if Settings.is_production:
+            # WARNING: Production deposit routing must use xpub/address-service only; seed-based derivation in bot runtime expands key compromise blast radius.
+            # Secure alternative: inject per-asset xpubs or a hardened external address-service.
+            raise RuntimeError(f"{asset.upper()}_XPUB is required in production for deposit address derivation")
+        return ""
+
     def _bip_utils(self):
         try:
             return importlib.import_module("bip_utils")
@@ -50,21 +68,33 @@ class HDWalletDeriver:
 
     def derive_btc_address(self, user_id: int) -> DerivedAddress:
         b = self._bip_utils()
-        seed = bytes.fromhex(self._require_seed())
         path = f"m/84'/0'/{int(user_id)}'/0/0"
-        ctx = b.Bip84.FromSeed(seed, b.Bip84Coins.BITCOIN).Purpose().Coin().Account(int(user_id)).Change(b.Bip44Changes.CHAIN_EXT).AddressIndex(0)
+        xpub = self._require_xpub("BTC")
+        if xpub:
+            ctx = b.Bip84.FromExtendedKey(xpub, b.Bip84Coins.BITCOIN).Change(b.Bip44Changes.CHAIN_EXT).AddressIndex(int(user_id))
+        else:
+            seed = bytes.fromhex(self._require_seed())
+            ctx = b.Bip84.FromSeed(seed, b.Bip84Coins.BITCOIN).Purpose().Coin().Account(int(user_id)).Change(b.Bip44Changes.CHAIN_EXT).AddressIndex(0)
         return DerivedAddress(path=path, public_address=ctx.PublicKey().ToAddress())
 
     def derive_ltc_address(self, user_id: int) -> DerivedAddress:
         b = self._bip_utils()
-        seed = bytes.fromhex(self._require_seed())
         path = f"m/84'/2'/{int(user_id)}'/0/0"
-        ctx = b.Bip84.FromSeed(seed, b.Bip84Coins.LITECOIN).Purpose().Coin().Account(int(user_id)).Change(b.Bip44Changes.CHAIN_EXT).AddressIndex(0)
+        xpub = self._require_xpub("LTC")
+        if xpub:
+            ctx = b.Bip84.FromExtendedKey(xpub, b.Bip84Coins.LITECOIN).Change(b.Bip44Changes.CHAIN_EXT).AddressIndex(int(user_id))
+        else:
+            seed = bytes.fromhex(self._require_seed())
+            ctx = b.Bip84.FromSeed(seed, b.Bip84Coins.LITECOIN).Purpose().Coin().Account(int(user_id)).Change(b.Bip44Changes.CHAIN_EXT).AddressIndex(0)
         return DerivedAddress(path=path, public_address=ctx.PublicKey().ToAddress())
 
     def derive_eth_address(self, user_id: int) -> DerivedAddress:
         b = self._bip_utils()
-        seed = bytes.fromhex(self._require_seed())
         path = f"m/44'/60'/{int(user_id)}'/0/0"
-        ctx = b.Bip44.FromSeed(seed, b.Bip44Coins.ETHEREUM).Purpose().Coin().Account(int(user_id)).Change(b.Bip44Changes.CHAIN_EXT).AddressIndex(0)
+        xpub = self._require_xpub("ETH")
+        if xpub:
+            ctx = b.Bip44.FromExtendedKey(xpub, b.Bip44Coins.ETHEREUM).Change(b.Bip44Changes.CHAIN_EXT).AddressIndex(int(user_id))
+        else:
+            seed = bytes.fromhex(self._require_seed())
+            ctx = b.Bip44.FromSeed(seed, b.Bip44Coins.ETHEREUM).Purpose().Coin().Account(int(user_id)).Change(b.Bip44Changes.CHAIN_EXT).AddressIndex(0)
         return DerivedAddress(path=path, public_address=ctx.PublicKey().ToAddress())

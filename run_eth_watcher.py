@@ -5,6 +5,7 @@ import os
 import time
 
 from infra.db.database import get_connection, init_db
+from wallet_service import WalletService
 from watcher_status_service import upsert_watcher_status
 from watchers.eth_watcher import run_once
 
@@ -13,8 +14,8 @@ LOGGER = logging.getLogger("run_eth_watcher")
 
 
 def _address_map(conn) -> dict[str, int]:
-    rows = conn.execute("SELECT address, user_id FROM wallet_addresses WHERE asset IN ('ETH','USDT')").fetchall()
-    return {str(r["address"]).lower(): int(r["user_id"]) for r in rows}
+    pairs = WalletService(conn).monitored_deposit_address_map(["ETH", "USDT"])
+    return {k.lower(): v for k, v in pairs.items()}
 
 
 def _validate_erc20_config() -> None:

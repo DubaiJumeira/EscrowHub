@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# WARNING: XRP watcher is quarantined and must not be wired into runtime while active asset scope is BTC/LTC/ETH/USDT only.
+# Secure alternative: keep this module isolated behind explicit feature flags and full security review before any re-enable.
+
 import logging
 
 from infra.chain_adapters.xrp_rpc import XrpRpcAdapter

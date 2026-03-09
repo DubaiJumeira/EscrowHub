@@ -69,8 +69,20 @@ class WalletService:
             if Settings.is_production:
                 raise RuntimeError("ENCRYPTION_KEY is required in production")
             return None
-        raw = hashlib.sha256(key.encode()).digest()
+        raw = hashlib.pbkdf2_hmac(
+            "sha256",
+            key.encode(),
+            b"EscrowHub::field-encryption::v2",
+            max(600000, int(Settings.encryption_kdf_iterations)),
+            dklen=32,
+        )
         return AESGCM(raw)
+
+    def _legacy_aead(self):
+        key = (Settings.encryption_key or "").strip()
+        if not key:
+            return None
+        return AESGCM(hashlib.sha256(key.encode()).digest())
 
     def _encrypt_field(self, value: str) -> str:
         aead = self._aead()
@@ -79,19 +91,34 @@ class WalletService:
         nonce = os.urandom(12)
         ct = aead.encrypt(nonce, value.encode(), None)
         payload = base64.b64encode(nonce + ct).decode()
-        return f"enc:{payload}"
+        return f"encv2:{payload}"
 
     def _decrypt_field(self, value: str | None) -> str | None:
         if value is None:
             return None
-        if not str(value).startswith("enc:"):
+        if not str(value).startswith(("enc:", "encv2:")):
             return value
-        aead = self._aead()
+        marker = "encv2:" if str(value).startswith("encv2:") else "enc:"
+        aead = self._aead() if marker == "encv2:" else self._legacy_aead()
         if aead is None:
             raise RuntimeError("encrypted data present but ENCRYPTION_KEY is not configured")
-        raw = base64.b64decode(str(value)[4:].encode())
+        raw = base64.b64decode(str(value)[len(marker):].encode())
         nonce, ct = raw[:12], raw[12:]
         return aead.decrypt(nonce, ct, None).decode()
+
+    def monitored_deposit_address_map(self, assets: list[str]) -> dict[str, int]:
+        normalized = [self._asset(a) for a in assets]
+        placeholders = ",".join("?" for _ in normalized)
+        rows = self.conn.execute(
+            f"SELECT address, user_id FROM wallet_addresses WHERE asset IN ({placeholders})",
+            tuple(normalized),
+        ).fetchall()
+        out: dict[str, int] = {}
+        for row in rows:
+            addr = self._decrypt_field(row["address"])
+            if addr:
+                out[str(addr)] = int(row["user_id"])
+        return out
 
     def _assert_not_frozen(self, resolved_user_id: int) -> None:
         row = self.conn.execute("SELECT frozen FROM users WHERE id=?", (resolved_user_id,)).fetchone()
@@ -223,6 +250,8 @@ class WalletService:
         return total
 
     def request_withdrawal(self, user_id: int, asset: str, amount: Decimal, destination_address: str):
+        if not Settings.withdrawals_enabled:
+            raise ValueError("withdrawals are temporarily unavailable")
         symbol = self._asset(asset)
         amt = Decimal(amount)
         if amt <= Decimal("0"):

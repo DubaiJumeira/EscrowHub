@@ -7,7 +7,7 @@ from decimal import Decimal
 from config.settings import Settings
 
 from fee_service import FeeBreakdown, FeeService
-from price_service import PriceService, StaticPriceService, validate_minimum_escrow_usd
+from price_service import CoinGeckoPriceService, PriceService, StaticPriceService, validate_minimum_escrow_usd
 from tenant_service import TenantService
 from wallet_service import WalletService
 
@@ -31,8 +31,9 @@ class EscrowService:
         self.wallet_service = WalletService(conn)
         self.tenant_service = TenantService(conn)
         self.fee_service = FeeService()
-        self.price_service = price_service or StaticPriceService(
-            {"BTC": Decimal("65000"), "ETH": Decimal("3500"), "LTC": Decimal("80"), "USDT": Decimal("1")}
+        self.price_service = price_service or CoinGeckoPriceService(ttl_seconds=60)
+        self._fallback_price_service = StaticPriceService(
+            {"BTC": Decimal("30000"), "ETH": Decimal("1500"), "LTC": Decimal("50"), "USDT": Decimal("1")}
         )
 
     def create_escrow(self, bot_id: int, buyer_id: int, seller_id: int, asset: str, amount: Decimal, description: str) -> EscrowView:
@@ -41,7 +42,10 @@ class EscrowService:
             raise ValueError("tenant bot not found")
         if buyer_id == seller_id:
             raise ValueError("buyer cannot create deal with self")
-        validate_minimum_escrow_usd(self.price_service, asset, Decimal(amount))
+        try:
+            validate_minimum_escrow_usd(self.price_service, asset, Decimal(amount))
+        except Exception:
+            validate_minimum_escrow_usd(self._fallback_price_service, asset, Decimal(amount))
         amount = Decimal(amount)
         description = (description or "").strip()
         if not description:
