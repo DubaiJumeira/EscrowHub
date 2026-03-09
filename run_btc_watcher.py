@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import os
 import time
@@ -13,14 +12,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 LOGGER = logging.getLogger("run_btc_watcher")
 
 
-def _address_map() -> dict[str, int]:
-    raw = os.getenv("BTC_ADDRESS_USER_MAP", "{}")
-    try:
-        data = json.loads(raw)
-        return {str(k): int(v) for k, v in data.items()}
-    except Exception:
-        LOGGER.warning("invalid BTC_ADDRESS_USER_MAP, using empty map")
-        return {}
+def _address_map(conn) -> dict[str, int]:
+    rows = conn.execute("SELECT address, user_id FROM wallet_addresses WHERE asset='BTC'").fetchall()
+    return {str(r["address"]): int(r["user_id"]) for r in rows}
 
 
 def main() -> None:
@@ -36,7 +30,7 @@ def main() -> None:
         init_db(conn)
         try:
             start = time.time()
-            credited = run_once("BTC", _address_map())
+            credited = run_once("BTC", _address_map(conn))
             upsert_watcher_status(conn, "btc_watcher", success=True)
             conn.commit()
             LOGGER.info("btc watcher cycle success credited=%s duration=%.2fs", credited, time.time() - start)

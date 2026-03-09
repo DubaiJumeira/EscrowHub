@@ -112,14 +112,20 @@ async def _enforce_text_rate_limit(update: Update, action: str, limit: int = 4, 
 
 def _runtime_bot_id(conn, tenant: TenantService) -> int:
     bot_id = int(Settings.bot_id)
-    if not tenant.get_tenant(bot_id):
-        owner_row = conn.execute("SELECT id FROM users ORDER BY id LIMIT 1").fetchone()
-        owner_id = int(owner_row["id"]) if owner_row else 1
-        conn.execute(
-            "INSERT OR IGNORE INTO bots(id, owner_user_id, bot_extra_fee_percent, display_name) VALUES(?,?,'0','EscrowHub')",
-            (bot_id, owner_id)
-        )
-        conn.commit()
+    if tenant.get_tenant(bot_id):
+        return bot_id
+    if Settings.is_production:
+        raise RuntimeError("Configured bot tenant missing in production")
+    if not Settings.allow_dev_bot_bootstrap:
+        raise RuntimeError("Bot tenant missing; set ALLOW_DEV_BOT_BOOTSTRAP=true in non-production to bootstrap")
+    owner_row = conn.execute("SELECT id FROM users ORDER BY id LIMIT 1").fetchone()
+    if not owner_row:
+        raise RuntimeError("Cannot bootstrap bot tenant without an existing owner user")
+    conn.execute(
+        "INSERT OR IGNORE INTO bots(id, owner_user_id, bot_extra_fee_percent, display_name) VALUES(?,?,'0','EscrowHub')",
+        (bot_id, int(owner_row["id"])),
+    )
+    conn.commit()
     return bot_id
 
 (
@@ -782,7 +788,7 @@ async def profile_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     data = query.data
 
     if data not in {"profile_back", "profile_open"}:
-        conn, _, _, _ = _services()
+        conn, _, _, escrow_svc = _services()
         try:
             if _is_user_frozen(conn, query.from_user.id):
                 await _show_frozen_callback(query)
@@ -1928,26 +1934,19 @@ async def deal_pending_actions(update: Update, context: ContextTypes.DEFAULT_TYP
         if not escrow_id:
             await query.edit_message_text("Deal context expired.", reply_markup=_start_menu())
             return ConversationHandler.END
-        conn2, _, _, _ = _services()
+        conn, _, _, escrow_service = _services()
         try:
-            row = conn2.execute("SELECT status FROM escrows WHERE id=?", (int(escrow_id),)).fetchone()
+            row = conn.execute("SELECT status FROM escrows WHERE id=?", (int(escrow_id),)).fetchone()
             if not row:
                 await query.answer("Deal not found.", show_alert=True)
                 return DEAL_PENDING_VIEW
             if row["status"] != "pending":
                 await query.answer("Cannot cancel — seller already accepted this deal.", show_alert=True)
                 return DEAL_PENDING_VIEW
-            # Unlock buyer funds and cancel
-            conn2.execute("UPDATE escrows SET status='cancelled', updated_at=CURRENT_TIMESTAMP WHERE id=?", (int(escrow_id),))
-            conn2.execute(
-                "INSERT INTO ledger_entries(account_type,account_owner_id,user_id,asset,amount,entry_type,ref_type,ref_id) "
-                "SELECT account_type,account_owner_id,user_id,asset,-amount,'ESCROW_UNLOCK','escrow',ref_id "
-                "FROM ledger_entries WHERE ref_type='escrow' AND ref_id=? AND entry_type='ESCROW_LOCK'",
-                (int(escrow_id),)
-            )
-            conn2.commit()
+            actor_user_id = _resolve_user_id(conn, query.from_user.id)
+            escrow_service.cancel_escrow(int(escrow_id), actor_user_id)
         finally:
-            conn2.close()
+            conn.close()
         _clear_draft_flow(context)
         await query.edit_message_text(
             "✅ <b>Deal request cancelled.</b>\n\nYour funds have been unlocked.",
@@ -1968,7 +1967,7 @@ async def deal_pending_actions(update: Update, context: ContextTypes.DEFAULT_TYP
         if not seller_id:
             await query.edit_message_text("Deal context expired. Run /check_user again.", reply_markup=_start_menu())
             return ConversationHandler.END
-        conn, _, _, _ = _services()
+        conn, _, _, escrow_svc = _services()
         try:
             row = conn.execute("SELECT * FROM users WHERE id=?", (int(seller_id),)).fetchone()
             if not row:
@@ -2391,15 +2390,7 @@ async def escrow_accept_decline(update: Update, context: ContextTypes.DEFAULT_TY
                     parse_mode=ParseMode.HTML,
                 )
         else:  # escrow_decline
-            conn.execute("UPDATE escrows SET status='cancelled', updated_at=CURRENT_TIMESTAMP WHERE id=?", (escrow_id,))
-            # Unlock buyer funds
-            conn.execute(
-                "INSERT INTO ledger_entries(account_type,account_owner_id,user_id,asset,amount,entry_type,ref_type,ref_id) "
-                "SELECT account_type,account_owner_id,user_id,asset,-amount,'ESCROW_UNLOCK','escrow',ref_id "
-                "FROM ledger_entries WHERE ref_type='escrow' AND ref_id=? AND entry_type='ESCROW_LOCK'",
-                (escrow_id,)
-            )
-            conn.commit()
+            EscrowService(conn).cancel_escrow(escrow_id, int(row["buyer_id"]))
             await query.edit_message_text(
                 f"❌ <b>Deal #{escrow_id} declined.</b>",
                 reply_markup=_start_menu(),
@@ -2425,7 +2416,7 @@ async def esc_cancel_pending_handler(update: Update, context: ContextTypes.DEFAU
     query = update.callback_query
     await query.answer()
     escrow_id = int(query.data.split(":")[1])
-    conn, _, _, _ = _services()
+    conn, _, _, escrow_svc = _services()
     try:
         # Resolve internal user_id from Telegram ID
         tg_id = update.effective_user.id
@@ -2442,14 +2433,7 @@ async def esc_cancel_pending_handler(update: Update, context: ContextTypes.DEFAU
         if row["status"] != "pending":
             await query.answer(f"Cannot cancel — deal is already {row['status']}.", show_alert=True)
             return
-        conn.execute("UPDATE escrows SET status='cancelled', updated_at=CURRENT_TIMESTAMP WHERE id=?", (escrow_id,))
-        conn.execute(
-            "INSERT INTO ledger_entries(account_type,account_owner_id,user_id,asset,amount,entry_type,ref_type,ref_id) "
-            "SELECT account_type,account_owner_id,user_id,asset,-amount,'ESCROW_UNLOCK','escrow',ref_id "
-            "FROM ledger_entries WHERE ref_type='escrow' AND ref_id=? AND entry_type='ESCROW_LOCK'",
-            (escrow_id,)
-        )
-        conn.commit()
+        escrow_svc.cancel_escrow(escrow_id, internal_user_id)
     finally:
         conn.close()
     await query.edit_message_text(
@@ -2546,16 +2530,13 @@ async def esc_active_release_handler(update: Update, context: ContextTypes.DEFAU
             await query.answer("Only the buyer can release funds.", show_alert=True)
             return
         icon = _asset_icon(row["asset"])
+        try:
+            usd_val = escrow_svc.price_service.get_usd_value(row["asset"], Decimal(str(row["amount"])))
+            usd_str = f"≈ ${_usd_text(usd_val)} USD"
+        except Exception:
+            usd_str = ""
     finally:
         conn.close()
-    conn2, _, _, esc2 = _services()
-    try:
-        usd_val = esc2.price_service.get_usd_value(row["asset"], Decimal(str(row["amount"])))
-        usd_str = f"≈ ${_usd_text(usd_val)} USD"
-    except Exception:
-        usd_str = ""
-    finally:
-        conn2.close()
     await query.edit_message_text(
         f"<b>💰 Release Funds — Deal #{escrow_id}</b>\n\n"
         f"<code>{html.escape(str(row['amount']))} {html.escape(str(row['asset']))}</code> {icon}\n"
@@ -2719,15 +2700,8 @@ async def esc_cancel_response_handler(update: Update, context: ContextTypes.DEFA
         icon = _asset_icon(row["asset"])
 
         if action == "esc_cancel_accept":
-            # Cancel the escrow and unlock buyer funds
-            conn.execute("UPDATE escrows SET status='cancelled', updated_at=CURRENT_TIMESTAMP WHERE id=?", (escrow_id,))
-            conn.execute(
-                "INSERT INTO ledger_entries(account_type,account_owner_id,user_id,asset,amount,entry_type,ref_type,ref_id) "
-                "SELECT account_type,account_owner_id,user_id,asset,-amount,'ESCROW_UNLOCK','escrow',ref_id "
-                "FROM ledger_entries WHERE ref_type='escrow' AND ref_id=? AND entry_type='ESCROW_LOCK'",
-                (escrow_id,)
-            )
-            conn.commit()
+            escrow_svc = EscrowService(conn)
+            escrow_svc.cancel_escrow(escrow_id, requester_internal_id)
             await query.edit_message_text(
                 f"✅ <b>Cancellation accepted.</b>\nDeal #{escrow_id} has been cancelled.",
                 reply_markup=_start_menu(),
@@ -2851,8 +2825,8 @@ async def esc_dispute_submit_handler(update: Update, context: ContextTypes.DEFAU
                 LOGGER.exception("Failed to notify counterparty of dispute")
 
         # Notify moderator
-        moderator = (Settings.moderator_username or "").strip()
-        if moderator:
+        moderator_id = next(iter(Settings.moderator_ids), None)
+        if moderator_id:
             buyer = conn.execute("SELECT username FROM users WHERE id=?", (int(row["buyer_id"]),)).fetchone()
             seller = conn.execute("SELECT username FROM users WHERE id=?", (int(row["seller_id"]),)).fetchone()
             buyer_name = buyer["username"] if buyer else "unknown"
@@ -2866,7 +2840,7 @@ async def esc_dispute_submit_handler(update: Update, context: ContextTypes.DEFAU
                 f"<b>Reason:</b>\n{html.escape(str(reason))}"
             )
             try:
-                mod_row = conn.execute("SELECT telegram_id FROM users WHERE username=?", (moderator.lstrip('@'),)).fetchone()
+                mod_row = {"telegram_id": moderator_id}
                 if mod_row:
                     mod_kb = InlineKeyboardMarkup([
                         [InlineKeyboardButton("✅ Release to Seller", callback_data=f"mod_resolve:{escrow_id}:release_seller")],
@@ -2959,7 +2933,10 @@ async def esc_view_active_handler(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def _is_moderator(telegram_id: int) -> bool:
-    """Check if the telegram user is the configured moderator."""
+    if telegram_id in Settings.moderator_ids:
+        return True
+    if Settings.is_production:
+        return False
     moderator = (Settings.moderator_username or "").strip().lstrip("@")
     if not moderator:
         return False

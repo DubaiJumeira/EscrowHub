@@ -5,14 +5,16 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from decimal import Decimal
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from config.settings import Settings
 from hd_wallet import HDWalletDeriver
 from infra.chain_adapters.btc_blockstream import BlockstreamUtxoAdapter
 from infra.chain_adapters.eth_rpc import EthRpcAdapter
 
 LOGGER = logging.getLogger(__name__)
+SUPPORTED_SIGNING_ASSETS = {"BTC", "LTC", "ETH", "USDT"}
 
 
 @dataclass(frozen=True)
@@ -34,23 +36,43 @@ class VaultSignerProvider(SignerProvider):
         self.path = os.getenv("VAULT_SIGN_PATH", "transit/sign/escrowhub")
 
     def sign_and_broadcast(self, asset: str, destination_address: str, amount: str, user_id: int | None = None) -> str:
+        symbol = asset.upper()
+        if symbol not in SUPPORTED_SIGNING_ASSETS:
+            raise ValueError(f"unsupported signing asset: {symbol}")
         if not self.addr or not self.token:
             raise RuntimeError("Vault signer configuration missing")
-        payload = {"input": f"{asset}:{destination_address}:{amount}"}
+        payload = {"input": f"{symbol}:{destination_address}:{amount}"}
         req = Request(
             f"{self.addr}/v1/{self.path}",
             method="POST",
             headers={"X-Vault-Token": self.token, "Content-Type": "application/json"},
             data=json.dumps(payload).encode(),
         )
-        with urlopen(req, timeout=15) as resp:
-            body = json.loads(resp.read().decode())
-        signature = body["data"]["signature"]
-        return f"vault_tx_{abs(hash(signature))}"
+        try:
+            with urlopen(req, timeout=15) as resp:
+                if resp.status and int(resp.status) >= 400:
+                    raise RuntimeError(f"vault signer http status={resp.status}")
+                body = json.loads(resp.read().decode() or "{}")
+        except (HTTPError, URLError, TimeoutError) as exc:
+            raise RuntimeError("vault signer request failed") from exc
+
+        if body.get("errors"):
+            raise RuntimeError("vault signer returned errors")
+        data = body.get("data")
+        if not isinstance(data, dict):
+            raise RuntimeError("vault signer response missing data")
+        signature = data.get("signature")
+        if not isinstance(signature, str) or not signature:
+            raise RuntimeError("vault signer response missing signature")
+
+        txid = f"vault_tx_{abs(hash(signature))}"
+        if not txid:
+            raise RuntimeError("vault signer produced invalid txid")
+        return txid
 
 
 class HDWalletSignerProvider(SignerProvider):
-    """Derives keys from HD_WALLET_SEED_HEX and signs tx payloads for BTC/ETH/LTC."""
+    """Non-production helper signer. Not safe for production broadcasting."""
 
     def __init__(self) -> None:
         self.deriver = HDWalletDeriver()
@@ -86,29 +108,38 @@ class HDWalletSignerProvider(SignerProvider):
         return SignedTransaction(asset=symbol, raw_tx_hex=signed.raw_tx_hex, txid=signed.txid)
 
     def sign_and_broadcast(self, asset: str, destination_address: str, amount: str, user_id: int | None = None) -> str:
+        symbol = asset.upper()
+        if symbol == "USDT":
+            raise ValueError("HD signer does not support USDT")
+        if symbol not in {"BTC", "LTC", "ETH"}:
+            raise ValueError(f"unsupported signing asset: {symbol}")
         if user_id is None:
             raise ValueError("user context is required for withdrawal signing")
-        signed = self.sign_transaction(asset, user_id=int(user_id), destination_address=destination_address, amount=amount)
-        symbol = asset.upper()
+        signed = self.sign_transaction(symbol, user_id=int(user_id), destination_address=destination_address, amount=amount)
         if symbol in {"BTC", "LTC"}:
             adapter = BlockstreamUtxoAdapter(symbol, {})
             txid = adapter.broadcast_raw_transaction(symbol, signed.raw_tx_hex)
-            return txid or signed.txid
-        if symbol == "ETH":
+        else:
             adapter = EthRpcAdapter({})
             txid = adapter.broadcast_raw_transaction(symbol, signed.raw_tx_hex)
-            return txid or signed.txid
-        return signed.txid
+        if not txid:
+            raise RuntimeError("broadcast failed: empty txid")
+        return txid
 
 
 class MockSignerProvider(SignerProvider):
     def sign_and_broadcast(self, asset: str, destination_address: str, amount: str, user_id: int | None = None) -> str:
-        return f"mock_{asset.lower()}_{destination_address[-6:]}_{amount}"
+        symbol = asset.upper()
+        if symbol not in SUPPORTED_SIGNING_ASSETS:
+            raise ValueError(f"unsupported signing asset: {symbol}")
+        return f"mock_{symbol.lower()}_{destination_address[-6:]}_{amount}"
 
 
 class SignerService:
     def __init__(self) -> None:
-        provider = os.getenv("SIGNER_PROVIDER", "hd")
+        provider = os.getenv("SIGNER_PROVIDER", "hd").lower()
+        if Settings.is_production and provider == "hd":
+            raise RuntimeError("SIGNER_PROVIDER=hd is not allowed in production")
         if provider == "vault":
             self.provider: SignerProvider = VaultSignerProvider()
         elif provider == "mock":
@@ -126,6 +157,8 @@ class SignerService:
                     str(w["amount"]),
                     user_id=int(w["user_id"]),
                 )
+                if not isinstance(txid, str) or not txid.strip():
+                    raise RuntimeError("signer returned invalid txid")
                 wallet_service.mark_withdrawal_broadcasted(w["id"], txid)
                 processed += 1
             except Exception as exc:

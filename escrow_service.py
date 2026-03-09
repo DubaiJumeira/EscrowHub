@@ -30,7 +30,7 @@ class EscrowService:
         self.tenant_service = TenantService(conn)
         self.fee_service = FeeService()
         self.price_service = price_service or StaticPriceService(
-            {"BTC": Decimal("65000"), "ETH": Decimal("3500"), "LTC": Decimal("80"), "USDT": Decimal("1"), "USDC": Decimal("1"), "SOL": Decimal("150"), "XRP": Decimal("0.55")}
+            {"BTC": Decimal("65000"), "ETH": Decimal("3500"), "LTC": Decimal("80"), "USDT": Decimal("1")}
         )
 
     def create_escrow(self, bot_id: int, buyer_id: int, seller_id: int, asset: str, amount: Decimal, description: str) -> EscrowView:
@@ -72,8 +72,8 @@ class EscrowService:
 
     def release(self, escrow_id: int, actor_user_id: int) -> EscrowView:
         row = self._escrow(escrow_id)
-        if row["status"] not in {"pending", "active"}:
-            raise ValueError("escrow must be pending/active")
+        if row["status"] != "active":
+            raise ValueError("escrow must be active")
         if int(row["buyer_id"]) != int(actor_user_id):
             raise ValueError("only buyer can release own escrow")
 
@@ -86,14 +86,58 @@ class EscrowService:
         return EscrowView(escrow_id, int(row["bot_id"]), int(row["buyer_id"]), int(row["seller_id"]), row["asset"], amount, "completed", fees, row["description"] or "")
 
     def dispute(self, escrow_id: int, opened_by_user_id: int, reason: str) -> None:
-        row = self._escrow(escrow_id)
-        if row["status"] not in {"pending", "active"}:
-            raise ValueError("only pending/active escrow can be disputed")
-        if int(opened_by_user_id) not in {int(row["buyer_id"]), int(row["seller_id"])}:
-            raise ValueError("only escrow participants can open disputes")
-        self.conn.execute("UPDATE escrows SET status='disputed', updated_at=CURRENT_TIMESTAMP WHERE id=?", (escrow_id,))
-        self.conn.execute("INSERT INTO disputes(escrow_id,opened_by_user_id,reason,status) VALUES(?,?,?,?)", (escrow_id, opened_by_user_id, reason, "open"))
-        self._event(escrow_id, "disputed", {"reason": reason})
+        managed_tx = not bool(getattr(self.conn, "in_transaction", False))
+        if managed_tx:
+            self.conn.execute("BEGIN IMMEDIATE")
+        else:
+            self.conn.execute("SAVEPOINT escrow_dispute")
+        try:
+            row = self._escrow(escrow_id)
+            if row["status"] not in {"pending", "active"}:
+                raise ValueError("only pending/active escrow can be disputed")
+            if int(opened_by_user_id) not in {int(row["buyer_id"]), int(row["seller_id"])}:
+                raise ValueError("only escrow participants can open disputes")
+            self.conn.execute("UPDATE escrows SET status='disputed', updated_at=CURRENT_TIMESTAMP WHERE id=?", (escrow_id,))
+            self.conn.execute("INSERT INTO disputes(escrow_id,opened_by_user_id,reason,status) VALUES(?,?,?,?)", (escrow_id, opened_by_user_id, reason, "open"))
+            self._event(escrow_id, "disputed", {"reason": reason})
+            if managed_tx:
+                self.conn.commit()
+            else:
+                self.conn.execute("RELEASE SAVEPOINT escrow_dispute")
+        except Exception:
+            if managed_tx:
+                self.conn.rollback()
+            else:
+                self.conn.execute("ROLLBACK TO SAVEPOINT escrow_dispute")
+                self.conn.execute("RELEASE SAVEPOINT escrow_dispute")
+            raise
+
+    def cancel_escrow(self, escrow_id: int, actor_user_id: int) -> None:
+        managed_tx = not bool(getattr(self.conn, "in_transaction", False))
+        if managed_tx:
+            self.conn.execute("BEGIN IMMEDIATE")
+        else:
+            self.conn.execute("SAVEPOINT escrow_cancel")
+        try:
+            row = self._escrow(escrow_id)
+            if row["status"] not in {"pending", "active"}:
+                raise ValueError("escrow cannot be cancelled in current state")
+            if int(actor_user_id) not in {int(row["buyer_id"]), int(row["seller_id"])}:
+                raise ValueError("only escrow participants can cancel")
+            self.wallet_service.cancel_escrow_lock(escrow_id)
+            self.conn.execute("UPDATE escrows SET status='cancelled', updated_at=CURRENT_TIMESTAMP WHERE id=?", (escrow_id,))
+            self._event(escrow_id, "cancelled", {"actor_user_id": actor_user_id})
+            if managed_tx:
+                self.conn.commit()
+            else:
+                self.conn.execute("RELEASE SAVEPOINT escrow_cancel")
+        except Exception:
+            if managed_tx:
+                self.conn.rollback()
+            else:
+                self.conn.execute("ROLLBACK TO SAVEPOINT escrow_cancel")
+                self.conn.execute("RELEASE SAVEPOINT escrow_cancel")
+            raise
 
     def resolve_dispute(self, escrow_id: int, admin_user_id: int, resolution: str, split_percent: Decimal = Decimal("50")) -> None:
         row = self._escrow(escrow_id)

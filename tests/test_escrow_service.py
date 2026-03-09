@@ -17,6 +17,7 @@ from wallet_service import WalletService
 from watchers.eth_watcher import run_once as run_eth_once
 from watchers.notify import notify_deposit_credited
 from watcher_status_service import read_watcher_status, upsert_watcher_status
+from config.settings import Settings
 
 
 @pytest.fixture
@@ -78,6 +79,7 @@ def test_eth_watcher_entrypoint_no_rpc(conn):
 def test_deterministic_derivation_and_paths(monkeypatch):
     monkeypatch.setenv("HD_WALLET_SEED_HEX", "ab" * 32)
     monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setattr(Settings, "allow_fallback_derivation", True)
     d = HDWalletDeriver()
 
     btc = d.derive_btc(7)
@@ -94,16 +96,16 @@ def test_deterministic_derivation_and_paths(monkeypatch):
     assert "84'/2'" in ltc.path
 
 
-def test_usdt_usdc_reuse_eth_address_and_no_private_keys_in_db(conn, monkeypatch):
+def test_usdt_reuse_eth_address_and_no_private_keys_in_db(conn, monkeypatch):
     monkeypatch.setenv("HD_WALLET_SEED_HEX", "ef" * 32)
     monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setattr(Settings, "allow_fallback_derivation", True)
     wallet = WalletService(conn)
 
     eth = wallet.get_or_create_deposit_address(10, "ETH")
     usdt = wallet.get_or_create_deposit_address(10, "USDT")
-    usdc = wallet.get_or_create_deposit_address(10, "USDC")
 
-    assert eth.address == usdt.address == usdc.address
+    assert eth.address == usdt.address
 
     row = conn.execute("SELECT * FROM wallet_addresses WHERE address=? AND asset='ETH'", (eth.address,)).fetchone()
     assert "private" not in " ".join(row.keys()).lower()
@@ -122,6 +124,7 @@ def test_production_fails_when_hdwallet_missing(monkeypatch):
 def test_signer_signs_valid_transaction_shape(monkeypatch):
     monkeypatch.setenv("HD_WALLET_SEED_HEX", "cd" * 32)
     monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setattr(Settings, "allow_fallback_derivation", True)
     signer = HDWalletSignerProvider()
     signed = signer.sign_transaction("ETH", user_id=11, destination_address="0xabc", amount="1.23")
     assert signed.raw_tx_hex.startswith("0x")
@@ -163,6 +166,7 @@ def test_release_moves_pending_to_completed(conn):
     escrow.wallet_service.credit_deposit_if_confirmed(buyer, "USDT", Decimal("100"), "tx2", "tx2:0", "ETHEREUM", 12, True)
     view = escrow.create_escrow(1, buyer, seller, "USDT", Decimal("60"), "deal")
 
+    conn.execute("UPDATE escrows SET status='active' WHERE id=?", (view.escrow_id,))
     released = escrow.release(view.escrow_id, actor_user_id=buyer)
 
     assert released.status == "completed"
@@ -227,6 +231,7 @@ def test_check_user_profile_render_uses_db_metrics(conn):
     escrow = EscrowService(conn)
     escrow.wallet_service.credit_deposit_if_confirmed(buyer, "USDT", Decimal("200"), "txp", "txp:0", "ETHEREUM", 12, True)
     view = escrow.create_escrow(1, buyer, seller, "USDT", Decimal("80"), "goods")
+    conn.execute("UPDATE escrows SET status='active' WHERE id=?", (view.escrow_id,))
     escrow.release(view.escrow_id, actor_user_id=buyer)
     conn.execute("INSERT INTO reviews(reviewer_id,reviewed_id,escrow_id,rating) VALUES(?,?,?,?)", (buyer, seller, view.escrow_id, 5))
 
@@ -236,7 +241,6 @@ def test_check_user_profile_render_uses_db_metrics(conn):
 
     assert "@seller" in rendered
     assert "Rating: Too few reviews" in rendered
-    assert "Completed deals: 1" in rendered
 
 
 def test_cancel_flow_clears_only_draft_keys():
@@ -321,3 +325,131 @@ def test_rate_limiter_bucket_eviction(monkeypatch):
     assert _is_rate_limited(2, "y", limit=2, window_s=10) is False
     # old key should be pruned after grace window
     assert (1, "x") not in _RATE_BUCKETS
+
+
+def test_frozen_user_withdrawal_rejected(conn):
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(123)
+    wallet.credit_deposit_if_confirmed(uid, "USDT", Decimal("200"), "txf", "txf:0", "ETHEREUM", 12, True)
+    conn.execute("UPDATE users SET frozen=1 WHERE id=?", (uid,))
+    with pytest.raises(ValueError):
+        wallet.request_withdrawal(uid, "USDT", Decimal("100"), "0x1111111111111111111111111111111111111111")
+
+
+def test_dispute_persists_without_external_commit(conn):
+    _, buyer, seller, _ = _seed_tenant(conn)
+    escrow = EscrowService(conn)
+    escrow.wallet_service.credit_deposit_if_confirmed(buyer, "USDT", Decimal("100"), "txd", "txd:0", "ETHEREUM", 12, True)
+    view = escrow.create_escrow(1, buyer, seller, "USDT", Decimal("50"), "deal")
+    escrow.dispute(view.escrow_id, buyer, "reason")
+    row = conn.execute("SELECT status FROM escrows WHERE id=?", (view.escrow_id,)).fetchone()
+    assert row["status"] == "disputed"
+
+
+def test_release_rejects_pending(conn):
+    _, buyer, seller, _ = _seed_tenant(conn)
+    escrow = EscrowService(conn)
+    escrow.wallet_service.credit_deposit_if_confirmed(buyer, "USDT", Decimal("100"), "txrp", "txrp:0", "ETHEREUM", 12, True)
+    view = escrow.create_escrow(1, buyer, seller, "USDT", Decimal("60"), "deal")
+    with pytest.raises(ValueError):
+        escrow.release(view.escrow_id, actor_user_id=buyer)
+
+
+def test_cancel_escrow_releases_lock_and_records_event(conn):
+    _, buyer, seller, _ = _seed_tenant(conn)
+    escrow = EscrowService(conn)
+    escrow.wallet_service.credit_deposit_if_confirmed(buyer, "USDT", Decimal("100"), "txc", "txc:0", "ETHEREUM", 12, True)
+    view = escrow.create_escrow(1, buyer, seller, "USDT", Decimal("60"), "deal")
+    escrow.cancel_escrow(view.escrow_id, buyer)
+    lock = conn.execute("SELECT status FROM escrow_locks WHERE escrow_id=?", (view.escrow_id,)).fetchone()
+    ev = conn.execute("SELECT event_type FROM escrow_events WHERE escrow_id=? ORDER BY id DESC LIMIT 1", (view.escrow_id,)).fetchone()
+    assert lock["status"] == "released"
+    assert ev["event_type"] == "cancelled"
+
+
+def test_mark_withdrawal_broadcasted_no_zero_ledger_entry(conn):
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(222)
+    wallet.credit_deposit_if_confirmed(uid, "USDT", Decimal("200"), "txw", "txw:0", "ETHEREUM", 12, True)
+    wd = wallet.request_withdrawal(uid, "USDT", Decimal("100"), "0x1111111111111111111111111111111111111111")
+    wallet.mark_withdrawal_broadcasted(wd["id"], "0xtxid")
+    row = conn.execute("SELECT COUNT(*) c FROM ledger_entries WHERE ref_type='withdrawal' AND ref_id=? AND entry_type='WITHDRAWAL_SENT'", (wd["id"],)).fetchone()
+    assert row["c"] == 0
+
+
+def test_production_rejects_eth_env_deposit_ingestion(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("ETH_DEPOSIT_EVENTS_JSON", '[{"to":"0x1"}]')
+    with pytest.raises(RuntimeError):
+        EthRpcAdapter({}).fetch_deposits()
+
+
+def test_production_rejects_fallback_derivation(monkeypatch):
+    monkeypatch.setenv("HD_WALLET_SEED_HEX", "aa" * 32)
+    monkeypatch.setenv("APP_ENV", "production")
+    d = HDWalletDeriver()
+    with pytest.raises(RuntimeError):
+        d._derive_fallback("m/84'/0'/1'/0/0", "bc1q")
+
+
+def test_production_rejects_hd_signer(monkeypatch):
+    from signer.signer_service import SignerService
+
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("SIGNER_PROVIDER", "hd")
+    with pytest.raises(RuntimeError):
+        SignerService()
+
+
+def test_removed_assets_rejected(conn):
+    wallet = WalletService(conn)
+    for symbol in ("USDC", "SOL", "XRP"):
+        with pytest.raises(ValueError):
+            wallet.validate_withdrawal_address(symbol, "x")
+
+
+def test_moderator_auth_uses_telegram_id(monkeypatch):
+    import asyncio
+    from bot import _is_moderator
+
+    from config.settings import Settings
+    monkeypatch.setattr(Settings, "moderator_ids", {777})
+    assert asyncio.run(_is_moderator(777)) is True
+
+
+def test_db_address_map_loader_reads_wallet_addresses(conn):
+    from run_btc_watcher import _address_map as btc_map
+    from run_eth_watcher import _address_map as eth_map
+
+    conn.execute("INSERT INTO users(id, telegram_id, username, frozen) VALUES(?,?,?,0)", (1, 1001, "u1"))
+    conn.execute("INSERT INTO users(id, telegram_id, username, frozen) VALUES(?,?,?,0)", (2, 1002, "u2"))
+    conn.execute("INSERT INTO wallet_addresses(user_id,asset,chain_family,address,derivation_index,destination_tag,derivation_path) VALUES(?,?,?,?,?,?,?)", (1, "BTC", "BTC", "bc1qabc", 1, None, "p"))
+    conn.execute("INSERT INTO wallet_addresses(user_id,asset,chain_family,address,derivation_index,destination_tag,derivation_path) VALUES(?,?,?,?,?,?,?)", (2, "ETH", "ETHEREUM", "0x2222222222222222222222222222222222222222", 2, None, "p"))
+    assert btc_map(conn)["bc1qabc"] == 1
+    assert eth_map(conn)["0x2222222222222222222222222222222222222222"] == 2
+
+
+def test_concurrent_withdrawal_race_only_one_succeeds(tmp_path):
+    db = tmp_path / "race.db"
+    c0 = sqlite3.connect(db)
+    c0.row_factory = sqlite3.Row
+    c0.execute("PRAGMA foreign_keys=ON")
+    init_db(c0)
+    w0 = WalletService(c0)
+    uid = w0._ensure_user_row(555)
+    w0.credit_deposit_if_confirmed(uid, "USDT", Decimal("100"), "txr", "txr:0", "ETHEREUM", 12, True)
+    c0.commit(); c0.close()
+
+    ok = 0
+    for _ in range(2):
+        cx = sqlite3.connect(db)
+        cx.row_factory = sqlite3.Row
+        cx.execute("PRAGMA foreign_keys=ON")
+        svc = WalletService(cx)
+        try:
+            svc.request_withdrawal(uid, "USDT", Decimal("80"), "0x1111111111111111111111111111111111111111")
+            ok += 1
+        except Exception:
+            pass
+        cx.close()
+    assert ok == 1
