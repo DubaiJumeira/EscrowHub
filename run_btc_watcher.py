@@ -5,6 +5,7 @@ import os
 import time
 
 from infra.db.database import get_connection, init_db
+from error_sanitizer import sanitize_runtime_error
 from runtime_preflight import PreflightIntegrityError, run_startup_preflight
 from wallet_service import WalletService
 from watcher_status_service import upsert_watcher_status
@@ -30,6 +31,12 @@ def main() -> None:
         run_startup_preflight("btc_watcher")
     except PreflightIntegrityError as exc:
         # WARNING: startup fails closed when route-integrity checks detect tampering/collision risk.
+        conn = get_connection(); init_db(conn)
+        try:
+            upsert_watcher_status(conn, "btc_watcher", success=False, error="; ".join(exc.status.reasons) or str(exc), health="fatal_startup_blocked")
+            conn.commit()
+        finally:
+            conn.close()
         LOGGER.error("btc watcher startup aborted by fatal integrity preflight: %s", "; ".join(exc.status.reasons) or str(exc))
         raise
 
@@ -39,12 +46,12 @@ def main() -> None:
         try:
             start = time.time()
             credited = run_once("BTC", _address_map(conn))
-            upsert_watcher_status(conn, "btc_watcher", success=True)
+            upsert_watcher_status(conn, "btc_watcher", success=True, health="ok")
             conn.commit()
             LOGGER.info("btc watcher cycle success credited=%s duration=%.2fs", credited, time.time() - start)
         except Exception as exc:
             conn.rollback()
-            upsert_watcher_status(conn, "btc_watcher", success=False, error=str(exc))
+            upsert_watcher_status(conn, "btc_watcher", success=False, error=sanitize_runtime_error(exc), health="transient_failure")
             conn.commit()
             LOGGER.exception("btc watcher cycle failed")
         finally:

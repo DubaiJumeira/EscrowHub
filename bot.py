@@ -22,6 +22,7 @@ from telegram.ext import (
 
 from config.settings import Settings
 from escrow_service import EscrowService
+from error_sanitizer import sanitize_runtime_error
 from infra.db.database import get_connection, init_db
 from signer.signer_service import SignerService
 from runtime_preflight import PreflightIntegrityError, run_startup_preflight
@@ -68,10 +69,10 @@ def _sanitize_destination_preview(address: str | None) -> str:
 
 
 def _sanitize_failure_summary(reason: str | None) -> str:
-    text = " ".join((reason or "").split())
+    text = sanitize_runtime_error(reason, max_len=120)
     if not text:
         return "n/a"
-    return text[:120]
+    return text
 
 WITHDRAWAL_STATUS_LABELS = {
     "pending": "Pending",
@@ -1258,7 +1259,7 @@ async def withdraw_address_input(update: Update, context: ContextTypes.DEFAULT_T
         try:
             wallet.validate_withdrawal_address(asset, address)
         except ValueError as exc:
-            await update.effective_message.reply_text(_profile_section("<b>🏦 Withdraw</b>", [html.escape(str(exc))]), parse_mode=ParseMode.HTML)
+            await update.effective_message.reply_text(_profile_section("<b>🏦 Withdraw</b>", [html.escape(_sanitize_failure_summary(str(exc)))]), parse_mode=ParseMode.HTML)
             return WD_ENTER_ADDRESS
     finally:
         conn.close()
@@ -1294,7 +1295,7 @@ async def withdraw_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             wallet.request_withdrawal(user_id, context.user_data["wd_asset"], Decimal(context.user_data["wd_amount"]), context.user_data["wd_address"])
         except ValueError as exc:
             conn.rollback()
-            await query.edit_message_text(_profile_section("<b>🏦 Withdraw</b>", [html.escape(str(exc))]), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="profile_open")]]), parse_mode=ParseMode.HTML)
+            await query.edit_message_text(_profile_section("<b>🏦 Withdraw</b>", [html.escape(_sanitize_failure_summary(str(exc)))]), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="profile_open")]]), parse_mode=ParseMode.HTML)
             return ConversationHandler.END
         conn.commit()
     finally:
@@ -1942,7 +1943,7 @@ async def deal_conditions_input(update: Update, context: ContextTypes.DEFAULT_TY
             view = escrow.create_escrow(bot_id=runtime_bot_id, buyer_id=buyer_id, seller_id=seller_id, asset=asset, amount=amount, description=conditions)
         except ValueError as exc:
             conn.rollback()
-            await update.effective_message.reply_text(_profile_section("<b>🏦 Withdraw</b>", [html.escape(str(exc))]), parse_mode=ParseMode.HTML)
+            await update.effective_message.reply_text(_profile_section("<b>🏦 Withdraw</b>", [html.escape(_sanitize_failure_summary(str(exc)))]), parse_mode=ParseMode.HTML)
             return DEAL_ENTER_CONDITIONS
         context.user_data["escrow_id"] = view.escrow_id
 
@@ -2160,7 +2161,7 @@ async def deal_release_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
             view = escrow.release(escrow_id, actor_user_id=buyer_id)
         except ValueError as exc:
             conn.rollback()
-            await query.edit_message_text(str(exc), reply_markup=_start_menu())
+            await query.edit_message_text(_sanitize_failure_summary(str(exc)), reply_markup=_start_menu())
             return ConversationHandler.END
 
         seller_username = context.user_data.get("seller_username", "unknown")
@@ -2356,24 +2357,24 @@ async def watcher_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         dep_ready, dep_reason = wallet.address_provider.is_ready()
         degraded: list[str] = []
         if not DEPOSIT_ISSUANCE_READY:
-            degraded.append(f"deposit: {DEPOSIT_ISSUANCE_ERROR or dep_reason or 'not ready'}")
+            degraded.append(f"deposit: {_sanitize_failure_summary(DEPOSIT_ISSUANCE_ERROR or dep_reason or 'not ready')}")
         if not signer_ready:
-            degraded.append(f"withdrawals/signer: {signer_reason or 'not ready'}")
+            degraded.append(f"withdrawals/signer: {_sanitize_failure_summary(signer_reason or 'not ready')}")
 
         msg = (
             f"BTC watcher\n- last run: {b['last_run_at']}\n- last success: {b['last_success_at']}\n"
-            f"- consecutive failures: {b['consecutive_failures']}\n- last error: {b['last_error']}\n\n"
+            f"- health: {b.get('health_state') or 'ok'}\n- consecutive failures: {b['consecutive_failures']}\n- last error: {_sanitize_failure_summary(b['last_error'])}\n\n"
             f"ETH watcher\n- last run: {e['last_run_at']}\n- last success: {e['last_success_at']}\n"
-            f"- consecutive failures: {e['consecutive_failures']}\n- last error: {e['last_error']}\n\n"
+            f"- health: {e.get('health_state') or 'ok'}\n- consecutive failures: {e['consecutive_failures']}\n- last error: {_sanitize_failure_summary(e['last_error'])}\n\n"
             f"Signer loop\n- last run: {s['last_run_at']}\n- last success: {s['last_success_at']}\n"
-            f"- consecutive failures: {s['consecutive_failures']}\n- last error: {s['last_error']}\n\n"
+            f"- health: {s.get('health_state') or 'ok'}\n- consecutive failures: {s['consecutive_failures']}\n- last error: {_sanitize_failure_summary(s['last_error'])}\n\n"
             f"Deposit issuance readiness\n- ready: {'yes' if dep_ready and DEPOSIT_ISSUANCE_READY else 'no'}\n"
-            f"- detail: {DEPOSIT_ISSUANCE_ERROR or dep_reason or 'ok'}\n\n"
+            f"- detail: {_sanitize_failure_summary(DEPOSIT_ISSUANCE_ERROR or dep_reason or 'ok')}\n\n"
             f"Withdrawal provider\n- ready: {'yes' if signer_ready else 'no'}\n"
-            f"- detail: {signer_reason or 'ok'}\n\n"
+            f"- detail: {_sanitize_failure_summary(signer_reason or 'ok')}\n\n"
             f"Signer retry backlog\n" + "\n".join(retry_lines) + "\n\n"
             f"Unresolved withdrawals\n" + ("\n".join([f"- {r['status']}: {r['c']}" for r in unresolved_rows]) if unresolved_rows else "- none") + "\n\n"
-            f"Signer loop health\n- ready: {'yes' if signer_ready else 'no'}\n- detail: {signer_reason or 'ok'}\n\n"
+            f"Signer loop health\n- ready: {'yes' if signer_ready else 'no'}\n- detail: {_sanitize_failure_summary(signer_reason or 'ok')}\n\n"
             f"Degraded mode reasons\n- " + ("\n- ".join(degraded) if degraded else "none")
         )
         conn.execute(

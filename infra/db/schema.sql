@@ -147,7 +147,8 @@ CREATE TABLE IF NOT EXISTS watcher_status (
   last_error TEXT,
   consecutive_failures INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT,
-  cursor INTEGER
+  cursor INTEGER,
+  health_state TEXT NOT NULL DEFAULT 'ok'
 );
 
 

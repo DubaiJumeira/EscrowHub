@@ -9,6 +9,7 @@ import pytest
 from apps.bot_tenant_router.router import TenantNotFoundError, TenantRouter
 from config.settings import Settings
 from escrow_service import EscrowService
+from error_sanitizer import sanitize_runtime_error
 from hd_wallet import HDWalletDeriver
 from infra.chain_adapters.eth_rpc import EthRpcAdapter
 from signer.errors import AmbiguousBroadcastError, DeterministicSigningError
@@ -20,6 +21,7 @@ import bot
 import run_signer
 import run_btc_watcher
 import run_eth_watcher
+import run_bot
 from runtime_preflight import PreflightIntegrityError, PreflightStatus, run_startup_preflight
 from watchers.sweep_job import run_once as run_sweep_once
 
@@ -1040,3 +1042,79 @@ def test_reconcile_backoff_uses_last_reconciled_at(conn):
     assert "k-sub-old" in keys and "k-sub-now" not in keys
     assert "k-br-old" in keys and "k-br-now" not in keys
     assert "k-retry-old" in keys and "k-retry-now" not in keys
+
+
+def test_error_sanitizer_redacts_secrets_and_payloads():
+    raw = "Bearer abc123 token=xyz authorization:secret https://user:pass@example.com Traceback (most recent call last): boom {\"k\":\"v\"}"
+    safe = sanitize_runtime_error(raw)
+    assert "abc123" not in safe
+    assert "user:pass" not in safe
+    assert "Traceback" not in safe
+
+
+def test_run_bot_fatal_startup_error_classification():
+    status = PreflightStatus(service_name="bot", reasons=("route integrity failed",), route_integrity_ready=False)
+    assert run_bot._is_fatal_startup_error(PreflightIntegrityError(status)) is True
+    assert run_bot._is_fatal_startup_error(RuntimeError("TELEGRAM_BOT_TOKEN is required")) is True
+    assert run_bot._is_fatal_startup_error(RuntimeError("worker crashed after startup")) is False
+
+
+def test_record_withdrawal_provider_result_rejects_oversized_or_malformed_metadata(conn):
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(98001)
+    conn.execute("INSERT INTO withdrawals(user_id,asset,amount,destination_address,status,idempotency_key) VALUES(?,?,?,?,?,?)", (uid, "USDT", "1", "enc", "pending", "k-meta"))
+    wid = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+
+    class BadType:
+        status = "submitted"
+        provider_ref = "r-meta"
+        asset = "USDT"
+        external_status = "submitted"
+        submitted_at = None
+        broadcasted_at = None
+        metadata = ["not", "dict"]
+
+    with pytest.raises(RuntimeError, match="metadata must be an object"):
+        wallet.record_withdrawal_provider_result(wid, "external_http", "k-meta", BadType())
+
+    class TooLarge:
+        status = "submitted"
+        provider_ref = "r-meta"
+        asset = "USDT"
+        external_status = "submitted"
+        submitted_at = None
+        broadcasted_at = None
+        metadata = {"blob": "x" * 5000}
+
+    with pytest.raises(RuntimeError, match="metadata too large"):
+        wallet.record_withdrawal_provider_result(wid, "external_http", "k-meta", TooLarge())
+
+
+def test_withdrawal_lifecycle_execute_and_reconcile_to_confirmed(conn, monkeypatch):
+    monkeypatch.setattr(Settings, "withdrawals_enabled", True)
+    monkeypatch.setattr(Settings, "withdrawal_min_interval_seconds", 0)
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(98002)
+    wallet.ledger.add_entry("USER", uid, uid, "USDT", Decimal("20"), "DEPOSIT", "deposit", 101)
+    req = wallet.request_withdrawal(uid, "USDT", Decimal("2"), "0x1111111111111111111111111111111111111111")
+
+    class Provider:
+        provider_origin = "external_http"
+        def is_ready(self):
+            return True, None
+        def execute_withdrawal(self, _req):
+            from signer.withdrawal_provider import WithdrawalExecutionResult
+            return WithdrawalExecutionResult(status="submitted", provider_ref="r-lc", asset="USDT", external_status="queued")
+        def reconcile_withdrawal(self, _req):
+            from signer.withdrawal_provider import WithdrawalReconciliationResult
+            return WithdrawalReconciliationResult(status="confirmed", provider_ref="r-lc", txid="0x" + "a"*64, asset="USDT", external_status="confirmed")
+
+    svc = SignerService()
+    svc.provider = Provider()
+    svc.process_withdrawals(wallet)
+    conn.execute("UPDATE withdrawals SET submitted_at=datetime('now','-600 seconds') WHERE id=?", (req["id"],))
+    svc.process_withdrawals(wallet)
+    row = conn.execute("SELECT status,provider_ref,txid FROM withdrawals WHERE id=?", (req["id"],)).fetchone()
+    assert row["status"] == "confirmed"
+    assert row["provider_ref"] == "r-lc"
+    assert str(row["txid"]).startswith("0x")

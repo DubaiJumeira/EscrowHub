@@ -5,6 +5,7 @@ import os
 import time
 
 from infra.db.database import get_connection, init_db
+from error_sanitizer import sanitize_runtime_error
 from signer.signer_service import SignerService
 from runtime_preflight import PreflightIntegrityError, run_startup_preflight
 from wallet_service import WalletService
@@ -20,6 +21,12 @@ def main() -> None:
         preflight = run_startup_preflight("signer")
     except PreflightIntegrityError as exc:
         # WARNING: startup fails closed when route-integrity checks detect tampering/collision risk.
+        conn = get_connection(); init_db(conn)
+        try:
+            upsert_watcher_status(conn, "signer_loop", success=False, error="; ".join(exc.status.reasons) or str(exc), health="fatal_startup_blocked")
+            conn.commit()
+        finally:
+            conn.close()
         LOGGER.error("signer startup aborted by fatal integrity preflight: %s", "; ".join(exc.status.reasons) or str(exc))
         raise
     if preflight is not None and not preflight.signer_ready:
@@ -32,12 +39,12 @@ def main() -> None:
             start = time.time()
             wallet = WalletService(conn)
             count = SignerService().process_withdrawals(wallet)
-            upsert_watcher_status(conn, "signer_loop", success=True)
+            upsert_watcher_status(conn, "signer_loop", success=True, health="ok")
             conn.commit()
             LOGGER.info("signer cycle success processed=%s duration=%.2fs", count, time.time() - start)
         except Exception as exc:
             conn.rollback()
-            upsert_watcher_status(conn, "signer_loop", success=False, error=str(exc))
+            upsert_watcher_status(conn, "signer_loop", success=False, error=sanitize_runtime_error(exc), health="transient_failure")
             conn.commit()
             LOGGER.exception("signer cycle failed")
         finally:

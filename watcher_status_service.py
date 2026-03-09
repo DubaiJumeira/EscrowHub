@@ -2,26 +2,43 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from error_sanitizer import sanitize_runtime_error
 
-def upsert_watcher_status(conn, watcher_name: str, success: bool, error: str | None = None) -> None:
+
+VALID_HEALTH = {"ok", "degraded", "fatal_startup_blocked", "transient_failure"}
+
+
+def upsert_watcher_status(
+    conn,
+    watcher_name: str,
+    success: bool,
+    error: str | None = None,
+    health: str | None = None,
+) -> None:
     now = datetime.utcnow().isoformat()
     row = conn.execute("SELECT * FROM watcher_status WHERE watcher_name=?", (watcher_name,)).fetchone()
+    if success:
+        status_health = "ok"
+    else:
+        status_health = health if health in VALID_HEALTH else "transient_failure"
+    safe_error = None if success else sanitize_runtime_error(error)
     if not row:
         conn.execute(
-            "INSERT INTO watcher_status(watcher_name,last_run_at,last_success_at,last_error,consecutive_failures,updated_at) VALUES(?,?,?,?,?,?)",
-            (watcher_name, now, now if success else None, None if success else (error or ""), 0 if success else 1, now),
+            "INSERT INTO watcher_status(watcher_name,last_run_at,last_success_at,last_error,consecutive_failures,updated_at,health_state) VALUES(?,?,?,?,?,?,?)",
+            (watcher_name, now, now if success else None, safe_error, 0 if success else 1, now, status_health),
         )
         return
 
     failures = 0 if success else int(row["consecutive_failures"]) + 1
     conn.execute(
-        "UPDATE watcher_status SET last_run_at=?, last_success_at=?, last_error=?, consecutive_failures=?, updated_at=? WHERE watcher_name=?",
+        "UPDATE watcher_status SET last_run_at=?, last_success_at=?, last_error=?, consecutive_failures=?, updated_at=?, health_state=? WHERE watcher_name=?",
         (
             now,
             now if success else row["last_success_at"],
-            None if success else (error or ""),
+            safe_error,
             failures,
             now,
+            status_health,
             watcher_name,
         ),
     )
@@ -39,6 +56,7 @@ def read_watcher_status(conn, watcher_names: list[str]) -> dict[str, dict]:
             "consecutive_failures": 0,
             "updated_at": None,
             "cursor": None,
+            "health_state": "ok",
         }
     return out
 
@@ -58,6 +76,6 @@ def write_watcher_cursor(conn, watcher_name: str, cursor: int) -> None:
         conn.execute("UPDATE watcher_status SET cursor=?, updated_at=? WHERE watcher_name=?", (int(cursor), now, watcher_name))
         return
     conn.execute(
-        "INSERT INTO watcher_status(watcher_name,last_run_at,last_success_at,last_error,consecutive_failures,updated_at,cursor) VALUES(?,?,?,?,?,?,?)",
-        (watcher_name, None, None, None, 0, now, int(cursor)),
+        "INSERT INTO watcher_status(watcher_name,last_run_at,last_success_at,last_error,consecutive_failures,updated_at,cursor,health_state) VALUES(?,?,?,?,?,?,?,?)",
+        (watcher_name, None, None, None, 0, now, int(cursor), "ok"),
     )
