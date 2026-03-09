@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS bots (
   bot_extra_fee_percent TEXT NOT NULL DEFAULT '0',
   support_contact TEXT,
   display_name TEXT NOT NULL,
-  telegram_username TEXT UNIQUE,
+  telegram_username TEXT UNIQUE CHECK(telegram_username IS NULL OR (telegram_username = lower(telegram_username) AND instr(telegram_username, "@") = 0)),
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY(owner_user_id) REFERENCES users(id)
 );
@@ -20,8 +20,8 @@ CREATE TABLE IF NOT EXISTS bots (
 CREATE TABLE IF NOT EXISTS wallet_addresses (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL,
-  asset TEXT NOT NULL,
-  chain_family TEXT NOT NULL,
+  asset TEXT NOT NULL CHECK(asset IN ('BTC','LTC','ETH','USDT')),
+  chain_family TEXT NOT NULL CHECK(chain_family IN ('BTC','LTC','ETHEREUM')),
   address TEXT NOT NULL,
   derivation_index INTEGER,
   destination_tag TEXT,
@@ -34,11 +34,11 @@ CREATE TABLE IF NOT EXISTS wallet_addresses (
 CREATE TABLE IF NOT EXISTS deposits (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL,
-  asset TEXT NOT NULL,
+  asset TEXT NOT NULL CHECK(asset IN ('BTC','LTC','ETH','USDT')),
   amount TEXT NOT NULL,
   txid TEXT NOT NULL,
   unique_key TEXT UNIQUE NOT NULL,
-  chain_family TEXT NOT NULL,
+  chain_family TEXT NOT NULL CHECK(chain_family IN ('BTC','LTC','ETHEREUM')),
   confirmations INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL CHECK(status IN ('seen','credited','rejected')),
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS deposits (
 CREATE TABLE IF NOT EXISTS withdrawals (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER,
-  asset TEXT NOT NULL,
+  asset TEXT NOT NULL CHECK(asset IN ('BTC','LTC','ETH','USDT')),
   amount TEXT NOT NULL,
   destination_address TEXT NOT NULL,
   status TEXT NOT NULL CHECK(status IN ('pending','broadcasted','failed')),
@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS escrows (
   bot_id INTEGER NOT NULL,
   buyer_id INTEGER NOT NULL,
   seller_id INTEGER NOT NULL,
-  asset TEXT NOT NULL,
+  asset TEXT NOT NULL CHECK(asset IN ('BTC','LTC','ETH','USDT')),
   amount TEXT NOT NULL,
   status TEXT NOT NULL CHECK(status IN ('pending','active','completed','cancelled','disputed')),
   description TEXT,
@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS disputes (
   escrow_id INTEGER NOT NULL,
   opened_by_user_id INTEGER NOT NULL,
   reason TEXT NOT NULL,
-  status TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('open','resolved','closed')),
   resolution_json TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   resolved_at TEXT
@@ -93,7 +93,7 @@ CREATE TABLE IF NOT EXISTS disputes (
 CREATE TABLE IF NOT EXISTS escrow_locks (
   escrow_id INTEGER PRIMARY KEY,
   user_id INTEGER NOT NULL,
-  asset TEXT NOT NULL,
+  asset TEXT NOT NULL CHECK(asset IN ('BTC','LTC','ETH','USDT')),
   amount TEXT NOT NULL,
   status TEXT NOT NULL CHECK(status IN ('locked','released'))
 );
@@ -103,7 +103,7 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
   account_type TEXT NOT NULL,
   account_owner_id INTEGER,
   user_id INTEGER,
-  asset TEXT NOT NULL,
+  asset TEXT NOT NULL CHECK(asset IN ('BTC','LTC','ETH','USDT')),
   amount TEXT NOT NULL,
   entry_type TEXT NOT NULL,
   ref_type TEXT NOT NULL,

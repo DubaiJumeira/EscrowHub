@@ -6,6 +6,7 @@ import time
 
 from infra.db.database import get_connection, init_db
 from signer.signer_service import SignerService
+from runtime_preflight import run_startup_preflight
 from wallet_service import WalletService
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -14,6 +15,7 @@ LOGGER = logging.getLogger("run_signer")
 
 def main() -> None:
     interval = int(os.getenv("WATCHER_POLL_INTERVAL_SECONDS", "30"))
+    run_startup_preflight("signer")
     LOGGER.info("starting signer loop interval=%ss", interval)
     while True:
         conn = get_connection()

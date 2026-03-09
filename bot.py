@@ -24,6 +24,7 @@ from config.settings import Settings
 from escrow_service import EscrowService
 from infra.db.database import get_connection, init_db
 from signer.signer_service import SignerService
+from runtime_preflight import run_startup_preflight
 from tenant_service import TenantService
 from wallet_service import NETWORK_LABELS, WalletService
 from watcher_status_service import read_watcher_status
@@ -3224,9 +3225,7 @@ def main() -> None:
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
 
-    conn = get_connection()
-    init_db(conn)
-    conn.close()
+    run_startup_preflight("bot")
 
     conv = ConversationHandler(
         entry_points=[

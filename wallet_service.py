@@ -125,24 +125,38 @@ class WalletService:
         if row and int(row["frozen"]):
             raise ValueError("account is frozen")
 
-    def verify_address_derivation_consistency(self, sample_size: int = 25) -> None:
-        rows = self.conn.execute(
-            "SELECT user_id, asset, address FROM wallet_addresses WHERE asset IN ('BTC','LTC','ETH','USDT') ORDER BY id DESC LIMIT ?",
-            (int(sample_size),),
-        ).fetchall()
+    def verify_address_derivation_consistency(self, sample_size: int | None = 25) -> None:
+        self.hd.validate_xpub_configuration()
         mismatches: list[str] = []
-        for row in rows:
-            asset = str(row["asset"])
-            user_id = int(row["user_id"])
-            stored = self._decrypt_field(row["address"])
-            if asset == "BTC":
-                derived = self.hd.derive_btc_address(user_id).public_address
-            elif asset == "LTC":
-                derived = self.hd.derive_ltc_address(user_id).public_address
-            else:
-                derived = self.hd.derive_eth_address(user_id).public_address
-            if stored and stored != derived:
-                mismatches.append(f"asset={asset} user_id={user_id}")
+        last_id = 0
+        remaining = None if sample_size is None else int(sample_size)
+
+        while True:
+            limit = 500 if remaining is None else min(500, remaining)
+            if limit <= 0:
+                break
+            rows = self.conn.execute(
+                "SELECT id, user_id, asset, address FROM wallet_addresses WHERE asset IN ('BTC','LTC','ETH','USDT') AND id>? ORDER BY id ASC LIMIT ?",
+                (last_id, limit),
+            ).fetchall()
+            if not rows:
+                break
+            for row in rows:
+                last_id = int(row["id"])
+                asset = str(row["asset"])
+                user_id = int(row["user_id"])
+                stored = self._decrypt_field(row["address"])
+                if asset == "BTC":
+                    derived = self.hd.derive_btc_address(user_id).public_address
+                elif asset == "LTC":
+                    derived = self.hd.derive_ltc_address(user_id).public_address
+                else:
+                    derived = self.hd.derive_eth_address(user_id).public_address
+                if stored and stored != derived:
+                    mismatches.append(f"asset={asset} user_id={user_id}")
+            if remaining is not None:
+                remaining -= len(rows)
+
         if mismatches:
             # WARNING: Derivation mismatch means watcher routing may miss deposits after seed/xpub migration.
             # Secure alternative: migrate addresses with explicit per-row derivation metadata and verified replay before production startup.

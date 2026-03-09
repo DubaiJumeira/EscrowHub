@@ -22,11 +22,17 @@ Each escrow is bound to `bot_id`. Tenant config includes:
 
 ## Wallet architecture (self-custody option B)
 
-- User deposit addresses per asset (`wallet_addresses`)
-- XRP supports destination tag model
+- User deposit addresses per active asset (BTC/LTC/ETH/USDT)
 - Chain watchers (integration boundary) detect deposits and then call `credit_deposit`
 - Internal immutable ledger entries track credits/debits/locks/releases
 - Withdrawals call `SignerService` boundary so private keys are outside Telegram process
+
+### Derivation and xpub constraint
+Current persisted derivation path contract uses hardened user nodes (`m/.../{user_id}'/...`). xpub-only derivation is not cryptographically valid for this contract and is rejected fail-closed at runtime.
+
+Secure alternatives:
+- external address derivation/HSM service, or
+- explicit migration to an xpub-compatible non-hardened user index path.
 
 ## Key modules
 
