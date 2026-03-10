@@ -98,3 +98,15 @@ The check is fail-closed and evaluates DB connectivity/schema init, route integr
 5. Run smoke checks without creating chain transactions.
 
 If readiness is `BLOCKED`, do **not** launch. Fix provider/env/integrity issues, rerun readiness, and only proceed on `READY`/approved `DEGRADED`. `--allow-degraded` affects process exit only; the reported status remains `DEGRADED`.
+
+
+## `/watcher_status` operator truth model
+Admin-only `/watcher_status` reports normalized minimal states for BTC watcher, ETH watcher, signer, and deposit provider:
+- `ready`: fully healthy.
+- `degraded`: tolerated partial health issue.
+- `blocked`: no-go/fatal startup blocked condition.
+- `disabled`: intentionally disabled by config.
+
+Safety invariants:
+- Disabled watcher config (`BTC_WATCHER_ENABLED=false` / `ETH_WATCHER_ENABLED=false`) is enforced in status rendering and watcher startup persists `health_state=disabled` before exit to prevent stale `ok` rows from showing false-ready.
+- Deposit-provider state is normalized with shared helper logic and distinguishes `ready|degraded|blocked|disabled` without exposing raw provider payloads/secrets.

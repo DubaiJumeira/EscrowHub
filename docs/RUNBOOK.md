@@ -155,3 +155,23 @@ If readiness is `BLOCKED` or smoke checks fail:
 - Roll back config/provider changes to last known-good values.
 - Restore DB snapshot only if migration/data integrity is uncertain.
 - Re-run readiness + smoke checks before any relaunch.
+
+
+## No-go / rollback rule
+- If `scripts/release_readiness_check.py` reports `BLOCKED`, launch is a no-go.
+- Remediate blocked reasons, rerun readiness, and only proceed once status is `READY` (or explicitly approved `DEGRADED`).
+- If a deployment is already live and readiness transitions to `BLOCKED`, roll back to the last known-good release and keep withdrawals/deposits gated until checks pass.
+
+
+## `/watcher_status` normalization details
+`/watcher_status` is admin-only and intentionally minimal. It normalizes BTC watcher, ETH watcher, signer, and deposit provider to:
+- `ready` = fully healthy
+- `degraded` = tolerated non-fatal issue
+- `blocked` = fatal startup/preflight/config no-go
+- `disabled` = intentionally off by config
+
+Deposit provider classification:
+- `disabled` when `ADDRESS_PROVIDER` is not `http`
+- `blocked` when production-required deposit provider config is missing/invalid (e.g., missing URL/token, non-HTTPS in production)
+- `degraded` for tolerated partial provider unhealthy conditions
+- `ready` only when provider handshake and issuance readiness are both healthy
