@@ -12,3 +12,5 @@ Do not claim production readiness unless all of the following are true:
 - Docs match implementation exactly
 
 If any of these are false, continue working until fixed.
+
+When you find a security vunerabilty, flag it immediately with a WARNING comment and suggest a secure alternative. Never implement insecure patters even if asked.
