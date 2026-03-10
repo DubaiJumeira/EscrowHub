@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from infra.db.database import get_connection, init_db
 from error_sanitizer import sanitize_runtime_error
+from infra.db.database import get_connection, init_db
+from runtime_preflight import run_startup_preflight
 from signer.signer_service import SignerService
 from wallet_service import WalletService
 
@@ -21,11 +22,29 @@ def main() -> int:
     finally:
         conn.close()
 
-    if not dep_ready or not wd_ready:
-        print(f"STAGING_SMOKE=BLOCKED deposit={sanitize_runtime_error(dep_reason or 'not ready')} withdrawal={sanitize_runtime_error(wd_reason or 'not ready')}")
+    route_ok = False
+    route_detail = "unknown"
+    try:
+        bot_pf = run_startup_preflight("bot")
+        signer_pf = run_startup_preflight("signer")
+        watcher_pf = run_startup_preflight("watcher")
+        route_ok = bool(bot_pf.route_integrity_ready and signer_pf.route_integrity_ready and watcher_pf.route_integrity_ready)
+        route_detail = "ok" if route_ok else "route_integrity_unavailable"
+    except Exception as exc:
+        # WARNING: route/startup integrity uncertainty is treated as BLOCKED to prevent false-green staging signals.
+        route_ok = False
+        route_detail = sanitize_runtime_error(exc)
+
+    if not route_ok or not dep_ready or not wd_ready:
+        print(
+            "STAGING_SMOKE=BLOCKED "
+            f"route_integrity={sanitize_runtime_error(route_detail or 'not ready')} "
+            f"deposit={sanitize_runtime_error(dep_reason or 'not ready')} "
+            f"withdrawal={sanitize_runtime_error(wd_reason or 'not ready')}"
+        )
         return 2
 
-    print("STAGING_SMOKE=READY deposit=ok withdrawal=ok route_integrity=ok")
+    print("STAGING_SMOKE=READY route_integrity=ok deposit=ok withdrawal=ok")
     return 0
 
 

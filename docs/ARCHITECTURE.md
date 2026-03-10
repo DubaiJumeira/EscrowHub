@@ -103,8 +103,8 @@ The readiness assessor reuses startup preflight (`run_startup_preflight`) and pr
 
 ### Readiness semantics
 - `READY`: all critical checks healthy.
-- `DEGRADED`: only intentionally tolerated warnings (single-node SQLite posture).
-- `BLOCKED`: launch must stop (non-zero exit).
+- `DEGRADED`: launch-critical checks passed but tolerated degradations/warnings remain.
+- `BLOCKED`: launch must stop (non-zero exit). `--allow-degraded` only changes exit behavior for DEGRADED and never rewrites reported state.
 
 ### Startup-fatal behavior
 Route-integrity and signer configuration failures remain startup-fatal and fail closed. Operator-facing status reasons are sanitized to avoid secret/token/payload leakage.

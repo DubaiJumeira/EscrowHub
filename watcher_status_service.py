@@ -5,7 +5,15 @@ from datetime import datetime
 from error_sanitizer import sanitize_runtime_error
 
 
-VALID_HEALTH = {"ok", "degraded", "fatal_startup_blocked", "transient_failure"}
+VALID_HEALTH = {"ok", "degraded", "fatal_startup_blocked", "transient_failure", "disabled"}
+
+
+def classify_watcher_health_state(raw_health: str | None) -> tuple[bool, bool, bool]:
+    health = str(raw_health or "").strip().lower()
+    blocked = health == "fatal_startup_blocked"
+    disabled = health == "disabled"
+    degraded = health in {"degraded", "transient_failure"}
+    return blocked, disabled, degraded
 
 
 def map_operator_health_state(
@@ -72,7 +80,9 @@ def read_watcher_status(conn, watcher_names: list[str]) -> dict[str, dict]:
             "consecutive_failures": 0,
             "updated_at": None,
             "cursor": None,
-            "health_state": "ok",
+            # WARNING: absent watcher rows are treated as disabled to fail closed; never default to ready.
+            # Secure alternative: persist explicit startup health rows before exposing operator status.
+            "health_state": "disabled",
         }
     return out
 

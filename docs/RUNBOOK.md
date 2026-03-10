@@ -44,7 +44,7 @@ These run as independent long-running loops. Watchers and signer are **not** sta
 - consecutive_failures
 - updated_at
 
-Use bot admin command `/watcher_status` to read BTC/ETH watcher health, signer loop health, deposit and withdrawal provider readiness, unresolved withdrawal backlog by state, signer_retry count/amount, and degraded reasons.
+Use bot admin command `/watcher_status` to read minimal normalized BTC/ETH watcher, signer, and deposit-provider states (`ready|degraded|blocked|disabled`) with sanitized detail only.
 
 ## Active assets
 Only BTC, LTC, ETH, and USDT are supported in active runtime.
@@ -73,7 +73,7 @@ Withdrawals remain disabled by default. If enabled for controlled testing, ambig
 - Provider responses map to internal states: `pending|submitted|broadcasted|confirmed|failed|signer_retry` (fail-closed on malformed/unknown outcomes).
 
 ### Unresolved withdrawal operator workflow
-- `/watcher_status` for provider + signer + backlog health.
+- `/watcher_status` for minimal provider/watcher/signer health (`ready|degraded|blocked|disabled`) only.
 - `/signer_retry_list` for signer_retry backlog summary.
 - `/unresolved_withdrawals` for pending/submitted/broadcasted/signer_retry list.
 - `/withdrawal_reconcile <withdrawal_id> CONFIRM [FORCE]` for explicit single-withdrawal reconciliation trigger (targeted; unrelated unresolved rows are not processed).
@@ -117,14 +117,15 @@ Run before every production start:
 ```bash
 python scripts/release_readiness_check.py
 python scripts/release_readiness_check.py --json
+python scripts/release_readiness_check.py --allow-degraded
 ```
 
 Readiness states:
 - `READY`: all launch-critical checks passed.
-- `DEGRADED`: only allowed degradations are present (currently single-node SQLite posture warning).
-- `BLOCKED`: fail-closed hard stop; command exits non-zero.
+- `DEGRADED`: launch-critical checks passed, but tolerated warnings/degradations exist (for example single-node SQLite posture warning).
+- `BLOCKED`: fail-closed hard stop; command exits non-zero regardless of flags.
 
-Covered checks: DB connectivity, schema init, route integrity, deposit provider readiness, withdrawal provider readiness, signer readiness, startup-fatal conditions, required production env vars, and single-node SQLite posture.
+Covered checks: DB connectivity, schema init, route integrity, deposit provider readiness, withdrawal provider readiness, signer readiness, startup-fatal conditions, required production env vars, and single-node SQLite posture. `--allow-degraded` changes exit behavior only and never relabels the reported state.
 
 ## Staging smoke harness (non-destructive)
 Use this to verify route/provider handshakes without chain transactions:

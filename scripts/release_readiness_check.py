@@ -4,7 +4,7 @@ import argparse
 import json
 import sys
 
-from readiness_service import READINESS_BLOCKED, assess_release_readiness
+from readiness_service import READINESS_BLOCKED, READINESS_DEGRADED, assess_release_readiness
 
 
 def _render_human(report) -> str:
@@ -47,7 +47,12 @@ def main() -> int:
         print(_render_human(report))
 
     # WARNING: blocked readiness exits non-zero to fail closed before launch.
-    return 2 if report.status == READINESS_BLOCKED else 0
+    # WARNING: allow-degraded affects exit behavior only; reported status remains truthful (DEGRADED).
+    if report.status == READINESS_BLOCKED:
+        return 2
+    if report.status == READINESS_DEGRADED and not args.allow_degraded:
+        return 3
+    return 0
 
 
 if __name__ == "__main__":

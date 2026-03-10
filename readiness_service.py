@@ -133,16 +133,17 @@ def assess_release_readiness(allow_degraded: bool = False) -> ReadinessReport:
     if warnings and not blocked:
         degraded.extend(warnings)
 
+    if watcher_status is not None and watcher_status.reasons:
+        degraded.append("watcher startup preflight reported degraded reasons")
+
     if blocked:
         status = READINESS_BLOCKED
-    elif degraded and not allow_degraded:
+    elif degraded:
+        # WARNING: allow_degraded intentionally affects exit policy only, never the reported readiness truth state.
+        # Secure alternative: keep state truthful (DEGRADED) and let entrypoint decide process exit behavior.
         status = READINESS_DEGRADED
     else:
         status = READINESS_READY
-
-    if watcher_status is not None and watcher_status.reasons and status == READINESS_READY:
-        status = READINESS_DEGRADED
-        degraded.append("watcher startup preflight reported degraded reasons")
 
     return ReadinessReport(
         status=status,
