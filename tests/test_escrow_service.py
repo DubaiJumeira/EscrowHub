@@ -391,7 +391,8 @@ def test_production_rejects_hd_signer(monkeypatch):
 
     monkeypatch.setattr(Settings, "is_production", True)
     monkeypatch.setenv("SIGNER_PROVIDER", "hd")
-    with pytest.raises(RuntimeError):
+    from signer.errors import SignerConfigurationError
+    with pytest.raises(SignerConfigurationError):
         SignerService()
 
 
@@ -863,8 +864,8 @@ def test_withdrawal_reconcile_targets_only_requested_id(monkeypatch, conn):
 
     calls = []
     class FakeSigner:
-        def reconcile_withdrawal_by_id(self, _wallet, wid):
-            calls.append(wid)
+        def reconcile_withdrawal_by_id(self, _wallet, wid, force=False):
+            calls.append((wid, force))
             return 1
 
     monkeypatch.setattr(bot, "SignerService", lambda: FakeSigner())
@@ -879,7 +880,7 @@ def test_withdrawal_reconcile_targets_only_requested_id(monkeypatch, conn):
     msg = Msg()
     upd = SimpleNamespace(effective_user=SimpleNamespace(id=999), effective_message=msg, message=msg)
     asyncio.run(bot.withdrawal_reconcile(upd, None))
-    assert calls == [11]
+    assert calls == [(11, False)]
     assert "processed=1" in msg.replies[-1]
 
 
@@ -894,7 +895,7 @@ def test_withdrawal_reconcile_fails_closed_when_not_eligible(monkeypatch, conn):
     monkeypatch.setattr(bot, "_services", lambda: (conn, WalletService(conn), TenantService(conn), None))
 
     class FakeSigner:
-        def reconcile_withdrawal_by_id(self, _wallet, _wid):
+        def reconcile_withdrawal_by_id(self, _wallet, _wid, force=False):
             return 0
 
     monkeypatch.setattr(bot, "SignerService", lambda: FakeSigner())
@@ -910,3 +911,85 @@ def test_withdrawal_reconcile_fails_closed_when_not_eligible(monkeypatch, conn):
     upd = SimpleNamespace(effective_user=SimpleNamespace(id=999), effective_message=msg, message=msg)
     asyncio.run(bot.withdrawal_reconcile(upd, None))
     assert msg.replies[-1] == "Withdrawal is not in a reconcilable state"
+
+
+def test_withdrawal_reconcile_force_override_targets_only_requested_id(monkeypatch, conn):
+    import asyncio
+    import bot
+
+    conn.execute("INSERT INTO users(id,telegram_id,username,frozen) VALUES(?,?,?,0)", (1, 1001, "u1"))
+    conn.execute("INSERT INTO withdrawals(id,user_id,asset,amount,destination_address,status,idempotency_key,submitted_at) VALUES(?,?,?,?,?,?,?,datetime('now'))", (31, 1, "USDT", "1", "enc", "submitted", "k31"))
+    conn.execute("INSERT INTO withdrawals(id,user_id,asset,amount,destination_address,status,idempotency_key,submitted_at) VALUES(?,?,?,?,?,?,?,datetime('now','-700 seconds'))", (32, 1, "USDT", "1", "enc", "submitted", "k32"))
+
+    monkeypatch.setattr(bot, "ADMIN_IDS", {999})
+    monkeypatch.setattr(bot, "_services", lambda: (conn, WalletService(conn), TenantService(conn), None))
+
+    calls = []
+
+    class FakeSigner:
+        def reconcile_withdrawal_by_id(self, _wallet, wid, force=False):
+            calls.append((wid, force))
+            return 1 if wid == 31 and force else 0
+
+    monkeypatch.setattr(bot, "SignerService", lambda: FakeSigner())
+
+    class Msg:
+        text = "/withdrawal_reconcile 31 CONFIRM FORCE"
+        def __init__(self):
+            self.replies = []
+        async def reply_text(self, txt, **kwargs):
+            self.replies.append(txt)
+
+    msg = Msg()
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=999), effective_message=msg, message=msg)
+    asyncio.run(bot.withdrawal_reconcile(upd, None))
+    assert calls == [(31, True)]
+    assert "processed=1" in msg.replies[-1]
+
+
+def test_signer_service_force_reconcile_bypasses_backoff_for_target_only(conn, monkeypatch):
+    from signer.signer_service import SignerService
+
+    monkeypatch.setattr(Settings, "withdrawals_enabled", True)
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(99111)
+    conn.execute("INSERT INTO withdrawals(id,user_id,asset,amount,destination_address,status,idempotency_key,submitted_at,last_reconciled_at) VALUES(?,?,?,?,?,?,?,datetime('now'),datetime('now'))", (401, uid, "USDT", "1", "enc", "submitted", "k401"))
+    conn.execute("INSERT INTO withdrawals(id,user_id,asset,amount,destination_address,status,idempotency_key,submitted_at,last_reconciled_at) VALUES(?,?,?,?,?,?,?,datetime('now'),datetime('now'))", (402, uid, "USDT", "1", "enc", "submitted", "k402"))
+
+    class Provider:
+        provider_origin = "http"
+        def is_ready(self):
+            return True, None
+        def reconcile_withdrawal(self, _req):
+            return SimpleNamespace(status="submitted", message="still pending", provider_ref=None, external_status="submitted", submitted_at=None)
+
+    svc = SignerService()
+    svc.provider = Provider()
+
+    assert svc.reconcile_withdrawal_by_id(wallet, 401, force=False) == 0
+    assert svc.reconcile_withdrawal_by_id(wallet, 401, force=True) == 1
+    untouched = conn.execute("SELECT last_reconciled_at FROM withdrawals WHERE id=402").fetchone()["last_reconciled_at"]
+    assert untouched is not None
+
+
+def test_watcher_status_distinguishes_signer_health_states(monkeypatch, conn):
+    import bot
+
+    monkeypatch.setattr(bot.Settings, "withdrawals_enabled", True)
+    state, detail = bot._signer_operator_state({"health_state": "fatal_startup_blocked", "last_error": "fatal"}, True, None)
+    assert state == "fatal startup blocked"
+    assert "fatal" in detail
+
+    monkeypatch.setattr(bot.Settings, "withdrawals_enabled", False)
+    state2, detail2 = bot._signer_operator_state({"health_state": "ok", "last_error": None}, True, None)
+    assert state2 == "running: withdrawals disabled"
+    assert detail2 == "WITHDRAWALS_ENABLED=false"
+
+    monkeypatch.setattr(bot.Settings, "withdrawals_enabled", True)
+    state3, detail3 = bot._signer_operator_state({"health_state": "ok", "last_error": None}, False, "provider unavailable")
+    assert state3 == "running: provider not ready"
+    assert "provider unavailable" in detail3
+
+    state4, detail4 = bot._signer_operator_state({"health_state": "ok", "last_error": None}, True, None)
+    assert state4 == "running: healthy"
+    assert detail4 == "ok"

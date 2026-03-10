@@ -153,12 +153,12 @@ def _runtime_bot_id(conn, tenant: TenantService) -> int:
     if tenant.get_tenant(bot_id):
         return bot_id
     if Settings.is_production:
-        raise RuntimeError("Configured bot tenant missing in production")
+        raise FatalStartupError("Configured bot tenant missing in production")
     if not Settings.allow_dev_bot_bootstrap:
-        raise RuntimeError("Bot tenant missing; set ALLOW_DEV_BOT_BOOTSTRAP=true in non-production to bootstrap")
+        raise FatalStartupError("Bot tenant missing; set ALLOW_DEV_BOT_BOOTSTRAP=true in non-production to bootstrap")
     owner_row = conn.execute("SELECT id FROM users ORDER BY id LIMIT 1").fetchone()
     if not owner_row:
-        raise RuntimeError("Cannot bootstrap bot tenant without an existing owner user")
+        raise FatalStartupError("Cannot bootstrap bot tenant without an existing owner user")
     conn.execute(
         "INSERT OR IGNORE INTO bots(id, owner_user_id, bot_extra_fee_percent, display_name, telegram_username) VALUES(?,?,'0','EscrowHub','escrowhub')",
         (bot_id, int(owner_row["id"])),
@@ -1953,6 +1953,8 @@ async def deal_conditions_input(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data["previous_view"] = "pending"
         usd_amount = context.user_data.get("usd_amount", "")
         usd_str = f" (${_usd_text(usd_amount)} USD)" if usd_amount else ""
+        signer_state, signer_state_detail = _signer_operator_state(s, signer_ready, signer_reason)
+
         msg = (
             f"✅ Deal sent to @{seller_username}\n\n"
             f"⏳ Waiting for @{seller_username} to accept...\n\n"
@@ -2331,6 +2333,16 @@ async def deal_back_from_conditions(update: Update, context: ContextTypes.DEFAUL
     await _show_deal_amount_prompt(query, int(buyer_id), asset)
     return DEAL_ENTER_AMOUNT
 
+def _signer_operator_state(signer_row: dict, signer_ready: bool, signer_reason: str | None) -> tuple[str, str]:
+    health = str(signer_row.get("health_state") or "ok")
+    if health == "fatal_startup_blocked":
+        return "fatal startup blocked", _sanitize_failure_summary(signer_row.get("last_error") or signer_reason or "fatal startup blocked")
+    if not Settings.withdrawals_enabled:
+        return "running: withdrawals disabled", "WITHDRAWALS_ENABLED=false"
+    if not signer_ready:
+        return "running: provider not ready", _sanitize_failure_summary(signer_reason or signer_row.get("last_error") or "not ready")
+    return "running: healthy", "ok"
+
 
 async def watcher_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_IDS:
@@ -2361,6 +2373,8 @@ async def watcher_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not signer_ready:
             degraded.append(f"withdrawals/signer: {_sanitize_failure_summary(signer_reason or 'not ready')}")
 
+        signer_state, signer_state_detail = _signer_operator_state(s, signer_ready, signer_reason)
+
         msg = (
             f"BTC watcher\n- last run: {b['last_run_at']}\n- last success: {b['last_success_at']}\n"
             f"- health: {b.get('health_state') or 'ok'}\n- consecutive failures: {b['consecutive_failures']}\n- last error: {_sanitize_failure_summary(b['last_error'])}\n\n"
@@ -2374,7 +2388,7 @@ async def watcher_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"- detail: {_sanitize_failure_summary(signer_reason or 'ok')}\n\n"
             f"Signer retry backlog\n" + "\n".join(retry_lines) + "\n\n"
             f"Unresolved withdrawals\n" + ("\n".join([f"- {r['status']}: {r['c']}" for r in unresolved_rows]) if unresolved_rows else "- none") + "\n\n"
-            f"Signer loop health\n- ready: {'yes' if signer_ready else 'no'}\n- detail: {_sanitize_failure_summary(signer_reason or 'ok')}\n\n"
+            f"Signer loop health\n- state: {signer_state}\n- detail: {signer_state_detail}\n\n"
             f"Degraded mode reasons\n- " + ("\n- ".join(degraded) if degraded else "none")
         )
         conn.execute(
@@ -2508,25 +2522,31 @@ async def withdrawal_reconcile(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.effective_message.reply_text("Admin only")
         return
     if not update.message or not update.message.text:
-        await update.effective_message.reply_text("Usage: /withdrawal_reconcile <withdrawal_id> CONFIRM")
+        await update.effective_message.reply_text("Usage: /withdrawal_reconcile <withdrawal_id> CONFIRM [FORCE]")
         return
     parts = update.message.text.split()
     if len(parts) < 3 or not parts[1].isdigit() or parts[2].upper() != "CONFIRM":
-        await update.effective_message.reply_text("Usage: /withdrawal_reconcile <withdrawal_id> CONFIRM")
+        await update.effective_message.reply_text("Usage: /withdrawal_reconcile <withdrawal_id> CONFIRM [FORCE]")
+        return
+    force = len(parts) >= 4 and parts[3].upper() == "FORCE"
+    if len(parts) >= 4 and not force:
+        await update.effective_message.reply_text("Usage: /withdrawal_reconcile <withdrawal_id> CONFIRM [FORCE]")
         return
     wid = int(parts[1])
     conn, wallet, _, _ = _services()
     try:
         row = conn.execute("SELECT id,status FROM withdrawals WHERE id=?", (wid,)).fetchone()
         if not row or row["status"] not in {"submitted", "broadcasted", "signer_retry"}:
+            # WARNING: targeted reconcile intentionally fails closed for non-unresolved states.
             await update.effective_message.reply_text("Withdrawal is not in a reconcilable state")
             return
         signer = SignerService()
-        count = signer.reconcile_withdrawal_by_id(wallet, wid)
+        count = signer.reconcile_withdrawal_by_id(wallet, wid, force=force)
         if count == 0:
+            # WARNING: targeted reconcile intentionally fails closed when provider outcome remains ambiguous or row is ineligible.
             await update.effective_message.reply_text("Withdrawal is not in a reconcilable state")
             return
-        conn.execute("INSERT INTO admin_actions(admin_user_id,action_type,data_json) VALUES(?,?,?)", (update.effective_user.id, "withdrawal_reconcile", json.dumps({"withdrawal_id": wid, "processed": count})))
+        conn.execute("INSERT INTO admin_actions(admin_user_id,action_type,data_json) VALUES(?,?,?)", (update.effective_user.id, "withdrawal_reconcile", json.dumps({"withdrawal_id": wid, "processed": count, "force": force})))
         conn.commit()
         await update.effective_message.reply_text(f"Reconciliation cycle complete (processed={count}).")
     finally:

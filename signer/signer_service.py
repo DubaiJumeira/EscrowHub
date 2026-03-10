@@ -7,7 +7,7 @@ from urllib.request import Request, urlopen
 
 from config.settings import Settings
 from error_sanitizer import sanitize_runtime_error
-from signer.errors import AmbiguousBroadcastError, DeterministicSigningError, RetryableSignerError
+from signer.errors import AmbiguousBroadcastError, DeterministicSigningError, RetryableSignerError, SignerConfigurationError
 from signer.withdrawal_provider import (
     DisabledWithdrawalProvider,
     HttpWithdrawalProvider,
@@ -52,7 +52,7 @@ class SignerService:
             self.provider = VaultSignerProvider()
         else:
             if Settings.is_production:
-                raise RuntimeError("Only real external withdrawal providers are allowed in production")
+                raise SignerConfigurationError("Only real external withdrawal providers are allowed in production")
             self.provider = DisabledWithdrawalProvider()
 
     def readiness(self) -> tuple[bool, str | None]:
@@ -98,7 +98,7 @@ class SignerService:
     def process_pending_withdrawals(self, wallet_service) -> int:
         return self.process_withdrawals(wallet_service)
 
-    def reconcile_withdrawal_by_id(self, wallet_service, withdrawal_id: int) -> int:
+    def reconcile_withdrawal_by_id(self, wallet_service, withdrawal_id: int, force: bool = False) -> int:
         ready, reason = self.readiness()
         if not ready:
             LOGGER.info("targeted reconciliation skipped: %s", reason or "not ready")
@@ -109,9 +109,10 @@ class SignerService:
             submitted_after_s=submitted_after_s,
             broadcasted_after_s=broadcasted_after_s,
             signer_retry_after_s=signer_retry_after_s,
+            ignore_backoff=bool(force),
         )
         if not row:
-            # WARNING: targeted reconcile fails closed when row is missing or not yet eligible under backoff gates.
+            # WARNING: targeted reconcile fails closed when row is missing or outside eligible unresolved states.
             return 0
         return self._reconcile_single(wallet_service, row)
 
