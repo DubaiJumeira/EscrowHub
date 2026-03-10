@@ -7,7 +7,7 @@ import time
 from infra.db.database import get_connection, init_db
 from error_sanitizer import sanitize_runtime_error
 from signer.signer_service import SignerService
-from runtime_preflight import PreflightIntegrityError, run_startup_preflight
+from runtime_preflight import FatalStartupError, PreflightIntegrityError, run_startup_preflight
 from wallet_service import WalletService
 from watcher_status_service import upsert_watcher_status
 
@@ -19,15 +19,17 @@ def main() -> None:
     interval = int(os.getenv("WATCHER_POLL_INTERVAL_SECONDS", "30"))
     try:
         preflight = run_startup_preflight("signer")
-    except PreflightIntegrityError as exc:
+    except (PreflightIntegrityError, FatalStartupError) as exc:
         # WARNING: startup fails closed when route-integrity checks detect tampering/collision risk.
+        reasons = tuple(getattr(getattr(exc, "status", None), "reasons", ()) or ())
+        message = "; ".join(reasons) or str(exc)
         conn = get_connection(); init_db(conn)
         try:
-            upsert_watcher_status(conn, "signer_loop", success=False, error="; ".join(exc.status.reasons) or str(exc), health="fatal_startup_blocked")
+            upsert_watcher_status(conn, "signer_loop", success=False, error=message, health="fatal_startup_blocked")
             conn.commit()
         finally:
             conn.close()
-        LOGGER.error("signer startup aborted by fatal integrity preflight: %s", "; ".join(exc.status.reasons) or str(exc))
+        LOGGER.error("signer startup aborted by fatal preflight/configuration error: %s", message)
         raise
     if preflight is not None and not preflight.signer_ready:
         LOGGER.warning("signer preflight degraded: %s", "; ".join(preflight.reasons) or "not ready")
@@ -38,8 +40,11 @@ def main() -> None:
         try:
             start = time.time()
             wallet = WalletService(conn)
-            count = SignerService().process_withdrawals(wallet)
-            upsert_watcher_status(conn, "signer_loop", success=True, health="ok")
+            signer = SignerService()
+            count = signer.process_withdrawals(wallet)
+            signer_ready, signer_reason = signer.readiness()
+            health = "ok" if signer_ready else "degraded"
+            upsert_watcher_status(conn, "signer_loop", success=True, error=None if signer_ready else signer_reason, health=health)
             conn.commit()
             LOGGER.info("signer cycle success processed=%s duration=%.2fs", count, time.time() - start)
         except Exception as exc:

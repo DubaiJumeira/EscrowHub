@@ -631,14 +631,15 @@ class WalletService:
             out.append(item)
         return out
 
-    def unresolved_withdrawal_for_reconcile_by_id(self, withdrawal_id: int, submitted_after_s: int = 45, broadcasted_after_s: int = 120, signer_retry_after_s: int = 300):
+    def unresolved_withdrawal_for_reconcile_by_id(self, withdrawal_id: int, submitted_after_s: int = 45, broadcasted_after_s: int = 120, signer_retry_after_s: int = 300, ignore_backoff: bool = False):
         rows = self.conn.execute(
             """
             SELECT *
             FROM withdrawals
             WHERE id=?
               AND (
-                    (status='submitted' AND (
+                    (? = 1 AND status IN ('submitted','broadcasted','signer_retry'))
+                 OR (status='submitted' AND (
                         (last_reconciled_at IS NULL AND COALESCE(submitted_at, created_at) <= datetime('now', '-' || ? || ' seconds'))
                         OR
                         (last_reconciled_at IS NOT NULL AND last_reconciled_at <= datetime('now', '-' || ? || ' seconds'))
@@ -658,6 +659,7 @@ class WalletService:
             """,
             (
                 int(withdrawal_id),
+                1 if ignore_backoff else 0,
                 int(submitted_after_s), int(submitted_after_s),
                 int(broadcasted_after_s), int(broadcasted_after_s),
                 int(signer_retry_after_s), int(signer_retry_after_s),

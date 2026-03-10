@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from infra.db.database import get_connection, init_db
 from error_sanitizer import sanitize_runtime_error
+from signer.errors import SignerConfigurationError
 from signer.signer_service import SignerService
 from wallet_service import WalletService
 
@@ -88,7 +89,22 @@ def run_startup_preflight(service_name: str) -> PreflightStatus:
             return status
 
         if service_name == "signer":
-            signer = SignerService()
+            try:
+                signer = SignerService()
+            except SignerConfigurationError as exc:
+                reasons.append(f"signer configuration failed: {sanitize_runtime_error(exc)}")
+                status = PreflightStatus(
+                    service_name=service_name,
+                    ok=False,
+                    deposit_issuance_ready=False,
+                    withdrawal_provider_ready=False,
+                    signer_ready=False,
+                    reasons=tuple(reasons),
+                    route_integrity_ready=route_integrity_ready,
+                    signer_loop_degraded=True,
+                )
+                # WARNING: signer startup fails closed on deterministic configuration errors to prevent unsafe withdrawal handling.
+                raise FatalStartupError("; ".join(status.reasons) or "signer configuration failed")
             signer_ready, signer_reason = signer.readiness()
             withdrawal_ready = signer_ready
             if not signer_ready:

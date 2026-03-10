@@ -66,3 +66,7 @@ Withdrawal rows persist: `provider_origin`, `provider_ref`, `idempotency_key`, `
 - Watcher/signer/operator status surfaces persist and display sanitized error summaries only (secrets/payloads redacted).
 - Single-node SQLite is a supported production posture for this repo; multi-node shared-database topology is not the target architecture.
 - External withdrawal/address providers remain the final go-live dependency and must be configured/operated securely.
+
+- Signer startup/provider misconfiguration now raises typed fatal startup errors and persists signer watcher health as `fatal_startup_blocked` before hard exit.
+
+- Signer loop state meanings: `fatal startup blocked`, `running: withdrawals disabled`, `running: provider not ready`, `running: healthy`.

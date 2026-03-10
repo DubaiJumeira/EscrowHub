@@ -76,7 +76,7 @@ Withdrawals remain disabled by default. If enabled for controlled testing, ambig
 - `/watcher_status` for provider + signer + backlog health.
 - `/signer_retry_list` for signer_retry backlog summary.
 - `/unresolved_withdrawals` for pending/submitted/broadcasted/signer_retry list.
-- `/withdrawal_reconcile <withdrawal_id> CONFIRM` for explicit single-withdrawal reconciliation trigger (targeted; unrelated unresolved rows are not processed).
+- `/withdrawal_reconcile <withdrawal_id> CONFIRM [FORCE]` for explicit single-withdrawal reconciliation trigger (targeted; unrelated unresolved rows are not processed).
 - `/signer_retry_action <withdrawal_id> <requeue|fail> CONFIRM` for explicit state action.
 
 
@@ -91,3 +91,7 @@ Withdrawals remain disabled by default. If enabled for controlled testing, ambig
 - Watcher/signer/operator status surfaces persist and display sanitized error summaries only (secrets/payloads redacted).
 - Single-node SQLite is a supported production posture for this repo; multi-node shared-database topology is not the target architecture.
 - External withdrawal/address providers remain the final go-live dependency and must be configured/operated securely.
+
+- Signer startup/provider misconfiguration now raises typed fatal startup errors and persists signer watcher health as `fatal_startup_blocked` before hard exit.
+
+- Signer loop state meanings: `fatal startup blocked`, `running: withdrawals disabled`, `running: provider not ready`, `running: healthy`.

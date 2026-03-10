@@ -284,6 +284,43 @@ def test_signer_startup_preflight_called(monkeypatch):
     assert called == ["preflight"]
 
 
+def test_run_startup_preflight_signer_raises_typed_fatal_on_configuration(monkeypatch, tmp_path):
+    from runtime_preflight import FatalStartupError
+
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "signer-fatal.sqlite3"))
+    monkeypatch.setattr(Settings, "is_production", True)
+    monkeypatch.setenv("WITHDRAWAL_PROVIDER", "invalid")
+
+    with pytest.raises(FatalStartupError, match="signer configuration failed"):
+        run_startup_preflight("signer")
+
+
+def test_run_signer_persists_fatal_startup_blocked_for_typed_fatal(monkeypatch):
+    from runtime_preflight import FatalStartupError
+
+    calls = []
+
+    class DummyConn:
+        def commit(self):
+            return None
+        def close(self):
+            return None
+
+    monkeypatch.setattr(run_signer, "run_startup_preflight", lambda _s: (_ for _ in ()).throw(FatalStartupError("signer configuration failed: bad provider")))
+    monkeypatch.setattr(run_signer, "get_connection", lambda: DummyConn())
+    monkeypatch.setattr(run_signer, "init_db", lambda _c: None)
+
+    def _upsert(_conn, watcher_name, success, error=None, health=None):
+        calls.append((watcher_name, success, error, health))
+
+    monkeypatch.setattr(run_signer, "upsert_watcher_status", _upsert)
+
+    with pytest.raises(FatalStartupError):
+        run_signer.main()
+
+    assert calls == [("signer_loop", False, "signer configuration failed: bad provider", "fatal_startup_blocked")]
+
+
 def test_preflight_initializes_db_and_runs_consistency(monkeypatch, tmp_path):
     monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "db.sqlite3"))
     calls = []
