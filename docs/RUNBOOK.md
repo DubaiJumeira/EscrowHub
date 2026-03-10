@@ -95,3 +95,18 @@ Withdrawals remain disabled by default. If enabled for controlled testing, ambig
 - Signer startup/provider misconfiguration now raises typed fatal startup errors and persists signer watcher health as `fatal_startup_blocked` before hard exit.
 
 - Signer loop state meanings: `fatal startup blocked`, `running: withdrawals disabled`, `running: provider not ready`, `running: healthy`.
+
+
+## Conversation recovery and flow safety
+- `/check_user` is globally available and clears conflicting in-memory flow state before starting lookup/create-deal flow.
+- `/recover` restores latest open escrow context (`pending|active|disputed`) from DB and refuses closed states.
+- Active cancellation requests are tracked server-side and response callbacks fail closed when stale, replayed, forged, or self-responded.
+
+## Deposit/dispute policy alignment
+- Deposit minimum is enforced at address issuance path: **$40.00 USD minimum**.
+- Dispute reason input is limited to 1000 characters.
+- Every configured moderator is notified on dispute submit; one failed moderator send does not block others.
+
+## Operator configuration
+- Set `SUPPORT_HANDLE` (e.g. `@escrow_support`) to expose support contact in bot UI.
+- `ADMIN_USER_IDS` and `MODERATOR_TELEGRAM_IDS` are separate role surfaces; configure both intentionally.

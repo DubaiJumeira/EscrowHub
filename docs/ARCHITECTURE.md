@@ -83,3 +83,13 @@ Internal statuses: `pending -> submitted -> broadcasted -> confirmed` with fail 
 - Signer startup/provider misconfiguration now raises typed fatal startup errors and persists signer watcher health as `fatal_startup_blocked` before hard exit.
 
 - Signer loop state meanings: `fatal startup blocked`, `running: withdrawals disabled`, `running: provider not ready`, `running: healthy`.
+
+
+## Security controls (latest)
+- Active-cancel handshake uses DB-backed `active_cancel_requests` state; callback payload identity is not trusted.
+- Non-buyer release attempts are blocked in handler and service layer (defense in depth).
+- Deposit routing is fail-closed below enforced minimum ($40.00) before route issuance.
+- Dispute reasons are bounded (1000 chars) before persistence path.
+- Dispute fanout targets all moderators with isolated send attempts and sanitized error logging.
+- Runtime support contact comes from `SUPPORT_HANDLE`; unset values return safe fallback text.
+- `/recover` restores only recoverable open deal context from DB after restart; unsafe reconstruction is rejected.

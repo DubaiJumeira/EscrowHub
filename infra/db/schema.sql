@@ -102,6 +102,16 @@ CREATE TABLE IF NOT EXISTS disputes (
   resolved_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS active_cancel_requests (
+  escrow_id INTEGER PRIMARY KEY,
+  requester_user_id INTEGER NOT NULL,
+  responder_user_id INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('open','accepted','declined','expired')),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  responded_at TEXT,
+  FOREIGN KEY(escrow_id) REFERENCES escrows(id)
+);
+
 CREATE TABLE IF NOT EXISTS escrow_locks (
   escrow_id INTEGER PRIMARY KEY,
   user_id INTEGER NOT NULL,
@@ -172,5 +182,6 @@ CREATE INDEX IF NOT EXISTS idx_wallet_addresses_chain_fingerprint ON wallet_addr
 CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_addresses_provider_ref ON wallet_addresses(provider_origin, provider_ref) WHERE COALESCE(provider_origin,'') != '' AND COALESCE(provider_ref,'') != '';
 CREATE INDEX IF NOT EXISTS idx_escrows_status_buyer_seller_created ON escrows(status, buyer_id, seller_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_reviews_reviewed_created ON reviews(reviewed_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_active_cancel_requests_responder_status ON active_cancel_requests(responder_user_id, status, created_at);
 
 CREATE INDEX IF NOT EXISTS idx_rate_limit_events_user_action_created ON rate_limit_events(user_id, action, created_at);

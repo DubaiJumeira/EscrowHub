@@ -37,6 +37,7 @@ class Settings:
     withdrawals_enabled = _as_bool("WITHDRAWALS_ENABLED", "false")
     eth_max_blocks_per_run = int(os.getenv("ETH_MAX_BLOCKS_PER_RUN", "500"))
     encryption_kdf_iterations = int(os.getenv("ENCRYPTION_KDF_ITERATIONS", "600000"))
+    support_handle = os.getenv("SUPPORT_HANDLE", "").strip()
     btc_xpub = os.getenv("BTC_XPUB", "").strip()
     ltc_xpub = os.getenv("LTC_XPUB", "").strip()
     eth_xpub = os.getenv("ETH_XPUB", "").strip()
@@ -48,3 +49,9 @@ if Settings.is_production and not Settings.sqlite_db_path:
     raise RuntimeError("SQLITE_DB_PATH is required in production")
 if not Settings.moderator_ids:
     LOGGER.warning("No moderator IDs configured; dispute moderation controls are disabled")
+
+if Settings.support_handle and not Settings.support_handle.startswith("@"):
+    LOGGER.warning("SUPPORT_HANDLE should start with @; normalizing at runtime")
+
+if Settings.moderator_ids and not os.getenv("ADMIN_USER_IDS", "").strip():
+    LOGGER.warning("ADMIN_USER_IDS is empty while moderators are configured; admin and moderator duties are intentionally distinct")
