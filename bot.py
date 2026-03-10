@@ -54,7 +54,19 @@ def _parse_admin_ids() -> set[int]:
 
 ADMIN_IDS = _parse_admin_ids()
 
+
+def _validate_role_configuration() -> None:
+    if not ADMIN_IDS:
+        LOGGER.warning("No ADMIN_USER_IDS configured; admin commands are unavailable")
+    if not Settings.moderator_ids:
+        LOGGER.warning("No MODERATOR_TELEGRAM_IDS configured; dispute resolution is unavailable")
+    if ADMIN_IDS and Settings.moderator_ids and not (ADMIN_IDS & Settings.moderator_ids):
+        LOGGER.info("ADMIN_USER_IDS and MODERATOR_TELEGRAM_IDS are configured as distinct role sets")
+
 BASE_ASSETS = ["USDT", "BTC", "ETH", "LTC"]
+MIN_ESCROW_USD = Decimal("40")
+DEPOSIT_MIN_USD = MIN_ESCROW_USD
+MAX_DISPUTE_REASON_CHARS = 1000
 DEPOSIT_ISSUANCE_READY = True
 DEPOSIT_ISSUANCE_ERROR: str | None = None
 
@@ -1052,7 +1064,7 @@ async def deposit_select_asset(update: Update, context: ContextTypes.DEFAULT_TYP
         _profile_block_html(f"<b>{asset_label_html} Deposit</b>"),
         _profile_block_html(
             "<b>💰 Enter the amount in USD to deposit</b>\n"
-            "Min: $45.00\n"
+            f"Min: ${_usd_text(DEPOSIT_MIN_USD)}\n"
             "Max: $10000.00\n\n"
             "Provider fee: 3%\n"
             "Platform fee: 2%\n\n"
@@ -1086,6 +1098,11 @@ async def deposit_amount_input(update: Update, context: ContextTypes.DEFAULT_TYP
         return DEPOSIT_ENTER_AMOUNT
     if usd_amount > Decimal("10000"):
         await update.effective_message.reply_text("Maximum deposit is $10,000 USD.")
+        return DEPOSIT_ENTER_AMOUNT
+    if usd_amount < DEPOSIT_MIN_USD:
+        # WARNING: Fail closed before address issuance to prevent below-policy deposit routing.
+        # Secure alternative: require at least configured minimum before creating a deposit route.
+        await update.effective_message.reply_text(f"Minimum deposit is ${_usd_text(DEPOSIT_MIN_USD)} USD.")
         return DEPOSIT_ENTER_AMOUNT
 
     if not DEPOSIT_ISSUANCE_READY:
@@ -1953,8 +1970,6 @@ async def deal_conditions_input(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data["previous_view"] = "pending"
         usd_amount = context.user_data.get("usd_amount", "")
         usd_str = f" (${_usd_text(usd_amount)} USD)" if usd_amount else ""
-        signer_state, signer_state_detail = _signer_operator_state(s, signer_ready, signer_reason)
-
         msg = (
             f"✅ Deal sent to @{seller_username}\n\n"
             f"⏳ Waiting for @{seller_username} to accept...\n\n"
@@ -2029,7 +2044,11 @@ async def deal_pending_actions(update: Update, context: ContextTypes.DEFAULT_TYP
             if row["status"] != "pending":
                 await query.answer("Cannot cancel — seller already accepted this deal.", show_alert=True)
                 return DEAL_PENDING_VIEW
-            actor_user_id = _resolve_user_id(conn, query.from_user.id)
+            try:
+                actor_user_id = _resolve_user_id(conn, query.from_user.id)
+            except UserResolutionError:
+                await query.answer("User not registered.", show_alert=True)
+                return DEAL_PENDING_VIEW
             escrow_service.cancel_escrow(int(escrow_id), actor_user_id)
         finally:
             conn.close()
@@ -2372,7 +2391,6 @@ async def watcher_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             degraded.append(f"deposit: {_sanitize_failure_summary(DEPOSIT_ISSUANCE_ERROR or dep_reason or 'not ready')}")
         if not signer_ready:
             degraded.append(f"withdrawals/signer: {_sanitize_failure_summary(signer_reason or 'not ready')}")
-
         signer_state, signer_state_detail = _signer_operator_state(s, signer_ready, signer_reason)
 
         msg = (
@@ -2629,6 +2647,57 @@ async def unfreeze_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _set_frozen_state(update, False)
 
 
+def _support_contact_text() -> str:
+    raw = (Settings.support_handle or "").strip()
+    if not raw:
+        return "Support Team: currently unavailable. Please try again later."
+    normalized = raw if raw.startswith("@") else f"@{raw}"
+    return f"Support Team: {normalized}"
+
+
+
+
+def _clear_interactive_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    _clear_draft_flow(context)
+    for key in ("awaiting_dispute_reason", "dispute_reason", "dispute_escrow_id"):
+        context.user_data.pop(key, None)
+
+
+async def check_user_global(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global /check_user handler that safely resets conflicting flow state."""
+    _clear_interactive_state(context)
+    await deal_check_user(update, context)
+
+
+async def recover_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Rebuild minimal escrow context from DB after restart."""
+    _clear_interactive_state(context)
+    conn, _, tenant, _ = _services()
+    try:
+        try:
+            user_id = _resolve_user_id(conn, update.effective_user.id)
+        except UserResolutionError:
+            user_id = tenant.ensure_user(update.effective_user.id, update.effective_user.username)
+        row = conn.execute(
+            "SELECT id,status FROM escrows WHERE buyer_id=? OR seller_id=? ORDER BY updated_at DESC, id DESC LIMIT 1",
+            (user_id, user_id),
+        ).fetchone()
+        if not row:
+            await update.effective_message.reply_text("No recoverable deal context found.", reply_markup=_start_menu())
+            return
+        if row["status"] not in {"pending", "active", "disputed"}:
+            # WARNING: Non-open deals are intentionally not auto-restored to avoid unsafe state assumptions.
+            # Secure alternative: recover only open deal states directly from authoritative DB rows.
+            await update.effective_message.reply_text("No recoverable open deal context found.", reply_markup=_start_menu())
+            return
+        context.user_data["escrow_id"] = int(row["id"])
+        await update.effective_message.reply_text(
+            f"Recovered deal context for Deal #{int(row['id'])} ({row['status']}).",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 View Deal", callback_data=f"esc_open:{int(row['id'])}")], [InlineKeyboardButton("🏠 Main Menu", callback_data="esc_back_menu")]]),
+        )
+    finally:
+        conn.close()
+
 async def check_user_hint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text("Use /check_user <@username|telegram_id>")
 
@@ -2636,9 +2705,9 @@ async def check_user_hint(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def support_team(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="profile_back")]])
     if update.callback_query:
-        await update.callback_query.edit_message_text("Support Team: @your_support_handle", reply_markup=reply_markup)
+        await update.callback_query.edit_message_text(_support_contact_text(), reply_markup=reply_markup)
     else:
-        await update.effective_message.reply_text("Support Team: @your_support_handle", reply_markup=reply_markup)
+        await update.effective_message.reply_text(_support_contact_text(), reply_markup=reply_markup)
 
 
 async def deal_start_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2737,7 +2806,7 @@ async def escrow_accept_decline(update: Update, context: ContextTypes.DEFAULT_TY
                     parse_mode=ParseMode.HTML,
                 )
         else:  # escrow_decline
-            EscrowService(conn).cancel_escrow(escrow_id, int(row["buyer_id"]))
+            EscrowService(conn).cancel_escrow(escrow_id, int(row["seller_id"]))
             await query.edit_message_text(
                 f"❌ <b>Deal #{escrow_id} declined.</b>",
                 reply_markup=_start_menu(),
@@ -2830,9 +2899,15 @@ async def esc_view_pending_handler(update: Update, context: ContextTypes.DEFAULT
 # ACTIVE DEAL HANDLERS (global, outside conv)
 # ──────────────────────────────────────────────
 
-def _resolve_user_id(conn, telegram_id: int) -> int | None:
+class UserResolutionError(RuntimeError):
+    """Raised when a Telegram user has no internal user row."""
+
+
+def _resolve_user_id(conn, telegram_id: int) -> int:
     row = conn.execute("SELECT id FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
-    return int(row["id"]) if row else None
+    if not row:
+        raise UserResolutionError(f"telegram user {int(telegram_id)} is not registered")
+    return int(row["id"])
 
 
 async def esc_active_profile_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2844,7 +2919,11 @@ async def esc_active_profile_handler(update: Update, context: ContextTypes.DEFAU
     back_cb = parts[2] if len(parts) > 2 else "esc_back_menu"
     conn, _, _, escrow_svc = _services()
     try:
-        user_id = _resolve_user_id(conn, update.effective_user.id)
+        try:
+            user_id = _resolve_user_id(conn, update.effective_user.id)
+        except UserResolutionError:
+            await query.answer("User not registered.", show_alert=True)
+            return
         row = conn.execute("SELECT * FROM escrows WHERE id=?", (escrow_id,)).fetchone()
         if not row:
             await query.edit_message_text("Deal not found.")
@@ -2866,14 +2945,20 @@ async def esc_active_release_handler(update: Update, context: ContextTypes.DEFAU
     query = update.callback_query
     await query.answer()
     escrow_id = int(query.data.split(":")[1])
-    conn, _, _, _ = _services()
+    conn, _, _, escrow_svc = _services()
     try:
         row = conn.execute("SELECT * FROM escrows WHERE id=?", (escrow_id,)).fetchone()
         if not row or row["status"] != "active":
             await query.answer("Deal is no longer active.", show_alert=True)
             return
-        user_id = _resolve_user_id(conn, update.effective_user.id)
+        try:
+            user_id = _resolve_user_id(conn, update.effective_user.id)
+        except UserResolutionError:
+            await query.answer("User not registered.", show_alert=True)
+            return
         if int(row["buyer_id"]) != user_id:
+            # WARNING: Fail closed on crafted callback from non-buyer to prevent unauthorized release flow.
+            # Secure alternative: only allow buyer role to proceed to release confirmation.
             await query.answer("Only the buyer can release funds.", show_alert=True)
             return
         icon = _asset_icon(row["asset"])
@@ -2907,7 +2992,11 @@ async def esc_release_confirm_handler(update: Update, context: ContextTypes.DEFA
     escrow_id = int(query.data.split(":")[1])
     conn, _, tenant, escrow_svc = _services()
     try:
-        user_id = _resolve_user_id(conn, update.effective_user.id)
+        try:
+            user_id = _resolve_user_id(conn, update.effective_user.id)
+        except UserResolutionError:
+            await query.answer("User not registered.", show_alert=True)
+            return
         row = conn.execute("SELECT * FROM escrows WHERE id=?", (escrow_id,)).fetchone()
         if not row or row["status"] != "active":
             await query.edit_message_text("Deal is no longer active.", reply_markup=_start_menu())
@@ -2973,7 +3062,11 @@ async def esc_active_cancel_handler(update: Update, context: ContextTypes.DEFAUL
         if not row or row["status"] != "active":
             await query.answer("Deal is no longer active.", show_alert=True)
             return
-        user_id = _resolve_user_id(conn, update.effective_user.id)
+        try:
+            user_id = _resolve_user_id(conn, update.effective_user.id)
+        except UserResolutionError:
+            await query.answer("User not registered.", show_alert=True)
+            return
         is_buyer = int(row["buyer_id"]) == user_id
         is_seller = int(row["seller_id"]) == user_id
         if not is_buyer and not is_seller:
@@ -2981,12 +3074,28 @@ async def esc_active_cancel_handler(update: Update, context: ContextTypes.DEFAUL
             return
         requester_name = update.effective_user.username or str(update.effective_user.id)
         icon = _asset_icon(row["asset"])
+        requester_id = user_id
+        responder_id = int(row["seller_id"] if is_buyer else row["buyer_id"])
         if is_buyer:
             cp = conn.execute("SELECT username, telegram_id FROM users WHERE id=?", (int(row["seller_id"]),)).fetchone()
         else:
             cp = conn.execute("SELECT username, telegram_id FROM users WHERE id=?", (int(row["buyer_id"]),)).fetchone()
         cp_name = cp["username"] if cp else "counterparty"
         cp_tg = int(cp["telegram_id"]) if cp else None
+        conn.execute(
+            """
+            INSERT INTO active_cancel_requests(escrow_id, requester_user_id, responder_user_id, status, created_at, responded_at)
+            VALUES(?, ?, ?, 'open', CURRENT_TIMESTAMP, NULL)
+            ON CONFLICT(escrow_id) DO UPDATE SET
+              requester_user_id=excluded.requester_user_id,
+              responder_user_id=excluded.responder_user_id,
+              status='open',
+              created_at=CURRENT_TIMESTAMP,
+              responded_at=NULL
+            """,
+            (escrow_id, requester_id, responder_id),
+        )
+        conn.commit()
     finally:
         conn.close()
 
@@ -3009,8 +3118,8 @@ async def esc_active_cancel_handler(update: Update, context: ContextTypes.DEFAUL
             ),
             reply_markup=InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("✅ Accept", callback_data=f"esc_cancel_accept:{escrow_id}:{user_id}"),
-                    InlineKeyboardButton("❌ Decline", callback_data=f"esc_cancel_decline:{escrow_id}:{user_id}"),
+                    InlineKeyboardButton("✅ Accept", callback_data=f"esc_cancel_accept:{escrow_id}"),
+                    InlineKeyboardButton("❌ Decline", callback_data=f"esc_cancel_decline:{escrow_id}"),
                 ]
             ]),
             parse_mode=ParseMode.HTML,
@@ -3018,13 +3127,12 @@ async def esc_active_cancel_handler(update: Update, context: ContextTypes.DEFAUL
 
 
 async def esc_cancel_response_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Seller accepts or declines buyer's cancellation request."""
+    """Counterparty accepts or declines server-side tracked cancellation request."""
     query = update.callback_query
     await query.answer()
     parts = query.data.split(":")
-    action = parts[0]  # esc_cancel_accept or esc_cancel_decline
+    action = parts[0]
     escrow_id = int(parts[1])
-    buyer_internal_id = int(parts[2])
 
     conn, _, _, _ = _services()
     try:
@@ -3032,49 +3140,74 @@ async def esc_cancel_response_handler(update: Update, context: ContextTypes.DEFA
         if not row or row["status"] != "active":
             await query.edit_message_text("This deal is no longer active.")
             return
-        responder_id = _resolve_user_id(conn, update.effective_user.id)
-        # Responder must be a participant but NOT the requester
-        requester_internal_id = int(parts[2])
-        if responder_id == requester_internal_id:
+        try:
+            responder_id = _resolve_user_id(conn, update.effective_user.id)
+        except UserResolutionError:
+            await query.answer("User not registered.", show_alert=True)
+            return
+        req = conn.execute("SELECT * FROM active_cancel_requests WHERE escrow_id=? AND status='open'", (escrow_id,)).fetchone()
+        if not req:
+            # WARNING: Missing/closed cancel request indicates stale or replayed callback; fail closed.
+            # Secure alternative: require a fresh server-side open request before processing response.
+            await query.answer("Cancellation request is no longer valid.", show_alert=True)
+            return
+        requester_internal_id = int(req["requester_user_id"])
+        expected_responder_id = int(req["responder_user_id"])
+        if requester_internal_id == responder_id:
+            # WARNING: Self-response attempt blocked to prevent requester accepting own cancellation.
+            # Secure alternative: enforce opposite participant as responder from server-side state.
             await query.answer("You cannot respond to your own request.", show_alert=True)
             return
-        if responder_id not in (int(row["buyer_id"]), int(row["seller_id"])):
+        participants = {int(row["buyer_id"]), int(row["seller_id"])}
+        if requester_internal_id not in participants or expected_responder_id not in participants:
+            # WARNING: Stored requester/responder must remain participants; otherwise fail closed on tampered state.
+            await query.answer("Cancellation request is invalid.", show_alert=True)
+            return
+        if responder_id != expected_responder_id:
+            # WARNING: Callback responder mismatch blocked to prevent forged cross-user cancellation response.
             await query.answer("Not authorised.", show_alert=True)
             return
-        requester = conn.execute("SELECT username, telegram_id FROM users WHERE id=?", (requester_internal_id,)).fetchone()
-        buyer_tg = int(requester["telegram_id"]) if requester else None
-        buyer_name = requester["username"] if requester else "requester"
+
+        requester = conn.execute("SELECT telegram_id FROM users WHERE id=?", (requester_internal_id,)).fetchone()
+        requester_tg = int(requester["telegram_id"]) if requester else None
         icon = _asset_icon(row["asset"])
 
         if action == "esc_cancel_accept":
-            escrow_svc = EscrowService(conn)
-            escrow_svc.cancel_escrow(escrow_id, requester_internal_id)
+            EscrowService(conn).cancel_escrow(escrow_id, requester_internal_id)
+            conn.execute("UPDATE active_cancel_requests SET status='accepted', responded_at=CURRENT_TIMESTAMP WHERE escrow_id=?", (escrow_id,))
+            conn.commit()
             await query.edit_message_text(
                 f"✅ <b>Cancellation accepted.</b>\nDeal #{escrow_id} has been cancelled.",
                 reply_markup=_start_menu(),
                 parse_mode=ParseMode.HTML,
             )
-            if buyer_tg:
+            if requester_tg:
                 await context.bot.send_message(
-                    chat_id=buyer_tg,
-                    text=f"✅ <b>Cancellation accepted!</b>\n\n"
-                         f"Deal #{escrow_id} has been cancelled.\n"
-                         f"Your <code>{html.escape(str(row['amount']))} {html.escape(str(row['asset']))}</code> {icon} have been unlocked.",
+                    chat_id=requester_tg,
+                    text=(
+                        f"✅ <b>Cancellation accepted!</b>\n\n"
+                        f"Deal #{escrow_id} has been cancelled.\n"
+                        f"Your <code>{html.escape(str(row['amount']))} {html.escape(str(row['asset']))}</code> {icon} have been unlocked."
+                    ),
                     parse_mode=ParseMode.HTML,
                     reply_markup=_start_menu(),
                 )
-        else:  # esc_cancel_decline
+        else:
+            conn.execute("UPDATE active_cancel_requests SET status='declined', responded_at=CURRENT_TIMESTAMP WHERE escrow_id=?", (escrow_id,))
+            conn.commit()
             await query.edit_message_text(
                 f"❌ <b>Cancellation declined.</b>\nDeal #{escrow_id} remains active.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 View Deal", callback_data=f"esc_view_active:{escrow_id}:esc_back_menu"), InlineKeyboardButton("🏠 Main Menu", callback_data="esc_back_menu")]]),
                 parse_mode=ParseMode.HTML,
             )
-            if buyer_tg:
+            if requester_tg:
                 await context.bot.send_message(
-                    chat_id=buyer_tg,
-                    text=f"❌ <b>Cancellation declined.</b>\n\n"
-                         f"@{html.escape(str(update.effective_user.username or 'Seller'))} declined your cancellation request for Deal #{escrow_id}.\n\n"
-                         "You can send another request or open a dispute.",
+                    chat_id=requester_tg,
+                    text=(
+                        f"❌ <b>Cancellation declined.</b>\n\n"
+                        f"@{html.escape(str(update.effective_user.username or 'Counterparty'))} declined your cancellation request for Deal #{escrow_id}.\n\n"
+                        "You can send another request or open a dispute."
+                    ),
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("⚖️ Open Dispute", callback_data=f"esc_active_dispute:{escrow_id}")],
@@ -3110,6 +3243,9 @@ async def esc_dispute_reason_message(update: Update, context: ContextTypes.DEFAU
     if not reason:
         await update.effective_message.reply_text("Please enter a valid reason.")
         return
+    if len(reason) > MAX_DISPUTE_REASON_CHARS:
+        await update.effective_message.reply_text(f"Reason is too long. Maximum is {MAX_DISPUTE_REASON_CHARS} characters.")
+        return
     escrow_id = context.user_data.get("dispute_escrow_id")
     context.user_data["dispute_reason"] = reason
     context.user_data["awaiting_dispute_reason"] = False
@@ -3140,7 +3276,11 @@ async def esc_dispute_submit_handler(update: Update, context: ContextTypes.DEFAU
 
     conn, _, tenant, escrow_svc = _services()
     try:
-        user_id = _resolve_user_id(conn, update.effective_user.id)
+        try:
+            user_id = _resolve_user_id(conn, update.effective_user.id)
+        except UserResolutionError:
+            await query.answer("User not registered.", show_alert=True)
+            return
         row = conn.execute("SELECT * FROM escrows WHERE id=?", (escrow_id,)).fetchone()
         if not row or row["status"] not in ("pending", "active"):
             await query.edit_message_text("Deal is not eligible for dispute.", reply_markup=_start_menu())
@@ -3174,9 +3314,8 @@ async def esc_dispute_submit_handler(update: Update, context: ContextTypes.DEFAU
             except Exception:
                 LOGGER.exception("Failed to notify counterparty of dispute")
 
-        # Notify moderator
-        moderator_id = next(iter(Settings.moderator_ids), None)
-        if moderator_id:
+        # Notify all moderators independently.
+        if Settings.moderator_ids:
             buyer = conn.execute("SELECT username FROM users WHERE id=?", (int(row["buyer_id"]),)).fetchone()
             seller = conn.execute("SELECT username FROM users WHERE id=?", (int(row["seller_id"]),)).fetchone()
             buyer_name = buyer["username"] if buyer else "unknown"
@@ -3189,23 +3328,22 @@ async def esc_dispute_submit_handler(update: Update, context: ContextTypes.DEFAU
                 f"<b>Amount:</b> <code>{html.escape(str(row['amount']))} {html.escape(str(row['asset']))}</code> {icon}\n\n"
                 f"<b>Reason:</b>\n{html.escape(str(reason))}"
             )
-            try:
-                mod_row = {"telegram_id": moderator_id}
-                if mod_row:
-                    mod_kb = InlineKeyboardMarkup([
-                        [InlineKeyboardButton("✅ Release to Seller", callback_data=f"mod_resolve:{escrow_id}:release_seller")],
-                        [InlineKeyboardButton("↩️ Refund Buyer", callback_data=f"mod_resolve:{escrow_id}:refund_buyer")],
-                        [InlineKeyboardButton("👥 Create Group Chat", callback_data=f"mod_group:{escrow_id}")],
-                        [InlineKeyboardButton("⬅️ Back to Menu", callback_data="esc_back_menu")],
-                    ])
+            mod_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Release to Seller", callback_data=f"mod_resolve:{escrow_id}:release_seller")],
+                [InlineKeyboardButton("↩️ Refund Buyer", callback_data=f"mod_resolve:{escrow_id}:refund_buyer")],
+                [InlineKeyboardButton("👥 Create Group Chat", callback_data=f"mod_group:{escrow_id}")],
+                [InlineKeyboardButton("⬅️ Back to Menu", callback_data="esc_back_menu")],
+            ])
+            for moderator_id in sorted(Settings.moderator_ids):
+                try:
                     await context.bot.send_message(
-                        chat_id=int(mod_row["telegram_id"]),
+                        chat_id=int(moderator_id),
                         text=mod_text,
                         reply_markup=mod_kb,
                         parse_mode=ParseMode.HTML,
                     )
-            except Exception:
-                LOGGER.exception("Failed to notify moderator")
+                except Exception as exc:
+                    LOGGER.warning("Failed to notify moderator_id=%s escrow_id=%s reason=%s", int(moderator_id), int(escrow_id), sanitize_runtime_error(str(exc)))
     finally:
         conn.close()
 
@@ -3482,6 +3620,7 @@ def main() -> None:
         raise FatalStartupError("TELEGRAM_BOT_TOKEN is required")
 
     global DEPOSIT_ISSUANCE_READY, DEPOSIT_ISSUANCE_ERROR
+    _validate_role_configuration()
     try:
         preflight = run_startup_preflight("bot")
     except PreflightIntegrityError as exc:
@@ -3559,6 +3698,8 @@ def main() -> None:
     )
 
     app = Application.builder().token(token).build()
+    app.add_handler(CommandHandler("check_user", check_user_global), group=-1)
+    app.add_handler(CommandHandler("recover", recover_command), group=-1)
     app.add_handler(conv)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("profile", profile))
@@ -3589,7 +3730,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(esc_active_release_handler, pattern=r"^esc_active_release:\d+$"))
     app.add_handler(CallbackQueryHandler(esc_release_confirm_handler, pattern=r"^esc_release_confirm:\d+$"))
     app.add_handler(CallbackQueryHandler(esc_active_cancel_handler, pattern=r"^esc_active_cancel:\d+$"))
-    app.add_handler(CallbackQueryHandler(esc_cancel_response_handler, pattern=r"^esc_cancel_(accept|decline):\d+:\d+$"))
+    app.add_handler(CallbackQueryHandler(esc_cancel_response_handler, pattern=r"^esc_cancel_(accept|decline):\d+$"))
     app.add_handler(CallbackQueryHandler(esc_active_dispute_handler, pattern=r"^esc_active_dispute:\d+$"))
     app.add_handler(CallbackQueryHandler(esc_dispute_submit_handler, pattern=r"^esc_dispute_submit:\d+$"))
     app.add_handler(CallbackQueryHandler(esc_view_dispute_handler, pattern=r"^esc_view_dispute:\d+(:.+)?$"))

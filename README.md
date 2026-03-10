@@ -70,3 +70,13 @@ Withdrawal rows persist: `provider_origin`, `provider_ref`, `idempotency_key`, `
 - Signer startup/provider misconfiguration now raises typed fatal startup errors and persists signer watcher health as `fatal_startup_blocked` before hard exit.
 
 - Signer loop state meanings: `fatal startup blocked`, `running: withdrawals disabled`, `running: provider not ready`, `running: healthy`.
+
+## Escrow safety updates
+- Deposit amount minimum is enforced before address issuance: **$40.00 USD**.
+- Active cancellation responses are server-side validated (`active_cancel_requests`) and no longer trust requester identity in callback payloads.
+- Dispute reasons are capped at 1000 characters in the Telegram path.
+- Dispute notifications are attempted for **all** configured moderators, with per-recipient failure isolation.
+- `/check_user` now has an app-level handler that clears conflicting flow state first.
+- `/recover` reconstructs last open escrow context from DB after restart (pending/active/disputed only, fail-closed otherwise).
+- Support contact text is env-driven via `SUPPORT_HANDLE`; if unset, bot returns a safe unavailable message.
+- Admin (`ADMIN_USER_IDS`) and moderator (`MODERATOR_TELEGRAM_IDS`) roles are explicitly distinct surfaces with startup validation/warnings.

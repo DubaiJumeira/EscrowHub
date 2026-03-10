@@ -21,6 +21,15 @@ from watcher_status_service import read_watcher_status, upsert_watcher_status
 from config.settings import Settings
 
 
+class _ConnProxy:
+    def __init__(self, conn):
+        self._conn = conn
+    def close(self):
+        return None
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
 @pytest.fixture
 def conn():
     c = sqlite3.connect(":memory:")
@@ -408,6 +417,7 @@ def test_moderator_auth_uses_telegram_id(monkeypatch):
     from bot import _is_moderator
 
     from config.settings import Settings
+
     monkeypatch.setattr(Settings, "moderator_ids", {777})
     assert asyncio.run(_is_moderator(777)) is True
 
@@ -993,3 +1003,257 @@ def test_watcher_status_distinguishes_signer_health_states(monkeypatch, conn):
     state4, detail4 = bot._signer_operator_state({"health_state": "ok", "last_error": None}, True, None)
     assert state4 == "running: healthy"
     assert detail4 == "ok"
+
+
+
+def test_deal_conditions_input_no_nameerror_on_confirm(monkeypatch, conn):
+    import asyncio
+    import bot
+    from types import SimpleNamespace
+
+    tenant = TenantService(conn)
+    buyer = tenant.ensure_user(5001, "buyer")
+    seller = tenant.ensure_user(5002, "seller")
+    owner = tenant.ensure_user(5003, "owner")
+    tenant.create_or_update_tenant(1, owner, "bot", "bot", "@support", Decimal("1"))
+    WalletService(conn).credit_deposit_if_confirmed(buyer, "USDT", Decimal("100"), "txdc", "txdc:0", "ETHEREUM", 12, True)
+
+    class Msg:
+        text = "terms"
+        replies = []
+        async def reply_text(self, txt, **kwargs):
+            self.replies.append(txt)
+
+    class Bot:
+        async def send_message(self, **kwargs):
+            return None
+
+    upd = SimpleNamespace(effective_message=Msg(), effective_user=SimpleNamespace(id=5001, username="buyer"))
+    ctx = SimpleNamespace(user_data={"buyer_id": buyer, "seller_id": seller, "seller_username": "seller", "amount": Decimal("50"), "asset": "USDT"}, bot=Bot())
+    monkeypatch.setattr(bot, "_enforce_text_rate_limit", lambda *a, **k: asyncio.sleep(0, result=False))
+    monkeypatch.setattr(bot, "_services", lambda: (conn, WalletService(conn), tenant, EscrowService(conn)))
+    result = asyncio.run(bot.deal_conditions_input(upd, ctx))
+    assert result == bot.DEAL_PENDING_VIEW
+
+
+def test_active_release_screen_no_nameerror(monkeypatch, conn):
+    import asyncio
+    import bot
+    tenant, buyer, seller, owner = _seed_tenant(conn)
+    escrow = EscrowService(conn)
+    escrow.wallet_service.credit_deposit_if_confirmed(buyer, "USDT", Decimal("100"), "txar", "txar:0", "ETHEREUM", 12, True)
+    view = escrow.create_escrow(1, buyer, seller, "USDT", Decimal("50"), "deal")
+    escrow.accept_escrow(view.escrow_id, seller)
+
+    class Q:
+        data = f"esc_active_release:{view.escrow_id}"
+        from_user = SimpleNamespace(id=100, username="buyer")
+        text = None
+        async def answer(self, *a, **k): return None
+        async def edit_message_text(self, txt, **kwargs): self.text = txt
+
+    q = Q()
+    upd = SimpleNamespace(callback_query=q, effective_user=SimpleNamespace(id=100, username="buyer"))
+    monkeypatch.setattr(bot, "_services", lambda: (conn, WalletService(conn), tenant, EscrowService(conn)))
+    asyncio.run(bot.esc_active_release_handler(upd, SimpleNamespace(user_data={})))
+    assert "Release Funds" in q.text
+
+
+def test_cancel_response_rejects_forged_and_replay(monkeypatch, conn):
+    import asyncio
+    import bot
+    tenant, buyer, seller, owner = _seed_tenant(conn)
+    escrow = EscrowService(conn)
+    escrow.wallet_service.credit_deposit_if_confirmed(buyer, "USDT", Decimal("100"), "txc1", "txc1:0", "ETHEREUM", 12, True)
+    view = escrow.create_escrow(1, buyer, seller, "USDT", Decimal("50"), "deal")
+    escrow.accept_escrow(view.escrow_id, seller)
+    conn.execute("INSERT INTO active_cancel_requests(escrow_id,requester_user_id,responder_user_id,status) VALUES(?,?,?,?)", (view.escrow_id, buyer, seller, "open"))
+
+    class Q:
+        data = f"esc_cancel_accept:{view.escrow_id}"
+        text = None
+        alerts = []
+        def __init__(self, tg): self.from_user = SimpleNamespace(id=tg, username=str(tg))
+        async def answer(self, txt=None, show_alert=False):
+            if txt: self.alerts.append(txt)
+        async def edit_message_text(self, txt, **kwargs): self.text = txt
+
+    proxy = _ConnProxy(conn)
+    monkeypatch.setattr(bot, "_services", lambda: (proxy, WalletService(proxy), tenant, EscrowService(proxy)))
+    async def _send(**kwargs):
+        return None
+    # requester cannot self-accept
+    q1 = Q(100)
+    asyncio.run(bot.esc_cancel_response_handler(SimpleNamespace(callback_query=q1, effective_user=q1.from_user), SimpleNamespace(user_data={}, bot=SimpleNamespace(send_message=_send))))
+    assert any("cannot respond" in a.lower() for a in q1.alerts)
+    # unrelated rejected
+    tenant.ensure_user(5555, "u")
+    q2 = Q(5555)
+    asyncio.run(bot.esc_cancel_response_handler(SimpleNamespace(callback_query=q2, effective_user=q2.from_user), SimpleNamespace(user_data={}, bot=SimpleNamespace(send_message=_send))))
+    assert any("not authorised" in a.lower() for a in q2.alerts)
+    # stale request rejected
+    conn.execute("UPDATE active_cancel_requests SET status='accepted' WHERE escrow_id=?", (view.escrow_id,))
+    q3 = Q(200)
+    asyncio.run(bot.esc_cancel_response_handler(SimpleNamespace(callback_query=q3, effective_user=q3.from_user), SimpleNamespace(user_data={}, bot=SimpleNamespace(send_message=_send))))
+    assert any("no longer valid" in a.lower() for a in q3.alerts)
+
+
+def test_deposit_minimum_enforced_before_address_issue(monkeypatch, conn):
+    import asyncio
+    import bot
+    class Msg:
+        def __init__(self, t): self.text=t; self.replies=[]
+        async def reply_text(self, txt, **kwargs): self.replies.append(txt)
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=9001, username="u"), effective_message=Msg("39.99"))
+    ctx = SimpleNamespace(user_data={"dep_asset":"BTC"})
+    monkeypatch.setattr(bot, "_enforce_text_rate_limit", lambda *a, **k: asyncio.sleep(0, result=False))
+    result = asyncio.run(bot.deposit_amount_input(upd, ctx))
+    assert result == bot.DEPOSIT_ENTER_AMOUNT
+    assert "Minimum deposit" in upd.effective_message.replies[-1]
+
+
+def test_dispute_reason_limit(conn):
+    import asyncio
+    import bot
+    msg = SimpleNamespace(text="x" * 1001, replies=[])
+    async def _reply(t, **k): msg.replies.append(t)
+    msg.reply_text = _reply
+    upd = SimpleNamespace(effective_message=msg)
+    ctx = SimpleNamespace(user_data={"awaiting_dispute_reason": True, "dispute_escrow_id": 1})
+    asyncio.run(bot.esc_dispute_reason_message(upd, ctx))
+    assert "too long" in msg.replies[-1].lower()
+
+
+def test_seller_decline_records_seller_actor(monkeypatch, conn):
+    import asyncio
+    import bot
+    tenant, buyer, seller, owner = _seed_tenant(conn)
+    escrow = EscrowService(conn)
+    escrow.wallet_service.credit_deposit_if_confirmed(buyer, "USDT", Decimal("100"), "txsd", "txsd:0", "ETHEREUM", 12, True)
+    view = escrow.create_escrow(1, buyer, seller, "USDT", Decimal("50"), "deal")
+
+    class Q:
+        data = f"escrow_decline:{view.escrow_id}"
+        from_user = SimpleNamespace(id=200, username="seller")
+        async def answer(self, *a, **k): return None
+        async def edit_message_text(self, *a, **k): return None
+
+    proxy = _ConnProxy(conn)
+    monkeypatch.setattr(bot, "_services", lambda: (proxy, WalletService(proxy), tenant, EscrowService(proxy)))
+    async def _send(**kwargs):
+        return None
+    asyncio.run(bot.escrow_accept_decline(SimpleNamespace(callback_query=Q(), effective_user=Q.from_user), SimpleNamespace(bot=SimpleNamespace(send_message=_send))))
+    ev = conn.execute("SELECT data_json FROM escrow_events WHERE escrow_id=? AND event_type='cancelled' ORDER BY id DESC LIMIT 1", (view.escrow_id,)).fetchone()
+    assert str(seller) in ev["data_json"]
+
+
+def test_wallet_aead_cached(monkeypatch, conn):
+    import wallet_service
+    calls = {"n": 0}
+    orig = wallet_service.hashlib.pbkdf2_hmac
+    def _count(*a, **k):
+        calls["n"] += 1
+        return orig(*a, **k)
+    monkeypatch.setattr(wallet_service.hashlib, "pbkdf2_hmac", _count)
+    monkeypatch.setattr(Settings, "encryption_key", "k")
+    w = WalletService(conn)
+    w._aead(); w._aead(); w._aead()
+    assert calls["n"] == 1
+
+
+def test_check_user_global_clears_state(monkeypatch):
+    import asyncio
+    import bot
+    called = {"ok": False}
+    async def _fake(update, context):
+        called["ok"] = True
+        return bot.DEAL_SEARCH_INPUT
+    monkeypatch.setattr(bot, "deal_check_user", _fake)
+    ctx = SimpleNamespace(user_data={"dep_asset":"BTC", "wd_asset":"USDT", "awaiting_dispute_reason":True})
+    asyncio.run(bot.check_user_global(SimpleNamespace(), ctx))
+    assert called["ok"] is True
+    assert "dep_asset" not in ctx.user_data
+
+
+def test_recover_command_restores_latest_open_escrow(monkeypatch, conn):
+    import asyncio
+    import bot
+    tenant, buyer, seller, owner = _seed_tenant(conn)
+    escrow = EscrowService(conn)
+    escrow.wallet_service.credit_deposit_if_confirmed(buyer, "USDT", Decimal("100"), "txrc", "txrc:0", "ETHEREUM", 12, True)
+    view = escrow.create_escrow(1, buyer, seller, "USDT", Decimal("50"), "deal")
+
+    class Msg:
+        replies=[]
+        async def reply_text(self, txt, **kwargs): self.replies.append(txt)
+
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=100, username="buyer"), effective_message=Msg())
+    ctx = SimpleNamespace(user_data={})
+    monkeypatch.setattr(bot, "_services", lambda: (conn, WalletService(conn), tenant, EscrowService(conn)))
+    asyncio.run(bot.recover_command(upd, ctx))
+    assert ctx.user_data["escrow_id"] == view.escrow_id
+
+
+def test_resolve_user_id_raises_typed(conn):
+    from bot import _resolve_user_id, UserResolutionError
+    with pytest.raises(UserResolutionError):
+        _resolve_user_id(conn, 123456)
+
+
+
+def test_support_contact_uses_config(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot.Settings, "support_handle", "@desk")
+    assert "@desk" in bot._support_contact_text()
+
+
+def test_dispute_submit_notifies_all_moderators(monkeypatch, conn):
+    import asyncio
+    import bot
+    tenant, buyer, seller, owner = _seed_tenant(conn)
+    escrow = EscrowService(conn)
+    escrow.wallet_service.credit_deposit_if_confirmed(buyer, "USDT", Decimal("100"), "txm", "txm:0", "ETHEREUM", 12, True)
+    view = escrow.create_escrow(1, buyer, seller, "USDT", Decimal("50"), "deal")
+    sent = []
+    class Bot:
+        async def send_message(self, **kwargs):
+            sent.append(kwargs["chat_id"])
+            if kwargs["chat_id"] == 9002:
+                raise RuntimeError("down")
+    monkeypatch.setattr(bot.Settings, "moderator_ids", {9001, 9002, 9003})
+    monkeypatch.setattr(bot, "_services", lambda: (conn, WalletService(conn), tenant, EscrowService(conn)))
+    q = SimpleNamespace(data=f"esc_dispute_submit:{view.escrow_id}", from_user=SimpleNamespace(id=100, username="buyer"), answer=lambda *a, **k: None, edit_message_text=lambda *a, **k: None)
+    async def _answer(*a, **k): return None
+    async def _edit(*a, **k): return None
+    q.answer = _answer
+    q.edit_message_text = _edit
+    upd = SimpleNamespace(callback_query=q, effective_user=SimpleNamespace(id=100, username="buyer"))
+    ctx = SimpleNamespace(user_data={"dispute_reason":"r"}, bot=Bot())
+    asyncio.run(bot.esc_dispute_submit_handler(upd, ctx))
+    assert {9001, 9002, 9003}.issubset(set(sent))
+
+
+
+def test_release_confirm_rejects_non_buyer(monkeypatch, conn):
+    import asyncio
+    import bot
+    tenant, buyer, seller, owner = _seed_tenant(conn)
+    escrow = EscrowService(conn)
+    escrow.wallet_service.credit_deposit_if_confirmed(buyer, "USDT", Decimal("100"), "txrb", "txrb:0", "ETHEREUM", 12, True)
+    view = escrow.create_escrow(1, buyer, seller, "USDT", Decimal("50"), "deal")
+    escrow.accept_escrow(view.escrow_id, seller)
+
+    class Q:
+        data = f"esc_release_confirm:{view.escrow_id}"
+        from_user = SimpleNamespace(id=200, username="seller")
+        alerts=[]
+        async def answer(self, txt=None, show_alert=False):
+            if txt: self.alerts.append(txt)
+        async def edit_message_text(self, *a, **k): return None
+
+    monkeypatch.setattr(bot, "_services", lambda: (conn, WalletService(conn), tenant, EscrowService(conn)))
+    async def _send(**kwargs):
+        return None
+    q = Q()
+    asyncio.run(bot.esc_release_confirm_handler(SimpleNamespace(callback_query=q, effective_user=q.from_user), SimpleNamespace(bot=SimpleNamespace(send_message=_send), user_data={})))
+    assert any("only the buyer" in a.lower() for a in q.alerts)

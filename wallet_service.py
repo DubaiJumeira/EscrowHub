@@ -19,6 +19,8 @@ from ledger_service import LedgerService
 from price_service import CoinGeckoPriceService, StaticPriceService
 from error_sanitizer import sanitize_runtime_error
 
+_AEAD_UNSET = object()
+
 SUPPORTED_ASSETS = set(Settings.supported_assets)
 LOGGER = logging.getLogger(__name__)
 
@@ -47,6 +49,7 @@ class WalletService:
         self.address_provider = build_address_provider()
         self.price_service = CoinGeckoPriceService(ttl_seconds=60)
         self._fallback_price_service = StaticPriceService({"BTC": Decimal("65000"), "ETH": Decimal("3500"), "LTC": Decimal("80"), "USDT": Decimal("1")})
+        self._aead_cached: AESGCM | None | object = _AEAD_UNSET
 
     @staticmethod
     def _asset(asset: str) -> str:
@@ -70,10 +73,15 @@ class WalletService:
 
 
     def _aead(self):
+        if self._aead_cached is not _AEAD_UNSET:
+            return self._aead_cached
         key = (Settings.encryption_key or "").strip()
         if not key:
             if Settings.is_production:
+                # WARNING: Production without ENCRYPTION_KEY is blocked to prevent storing plaintext secrets.
+                # Secure alternative: set a strong ENCRYPTION_KEY via secret manager before startup.
                 raise RuntimeError("ENCRYPTION_KEY is required in production")
+            self._aead_cached = None
             return None
         raw = hashlib.pbkdf2_hmac(
             "sha256",
@@ -82,7 +90,8 @@ class WalletService:
             max(600000, int(Settings.encryption_kdf_iterations)),
             dklen=32,
         )
-        return AESGCM(raw)
+        self._aead_cached = AESGCM(raw)
+        return self._aead_cached
 
     def _legacy_aead(self):
         key = (Settings.encryption_key or "").strip()
