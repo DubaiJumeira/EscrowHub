@@ -93,3 +93,27 @@ Internal statuses: `pending -> submitted -> broadcasted -> confirmed` with fail 
 - Dispute fanout targets all moderators with isolated send attempts and sanitized error logging.
 - Runtime support contact comes from `SUPPORT_HANDLE`; unset values return safe fallback text.
 - `/recover` restores only recoverable open deal context from DB after restart; unsafe reconstruction is rejected.
+
+## Release-readiness architecture
+EscrowHub now includes a dedicated fail-closed readiness assessor (`readiness_service.py`) and operator entrypoints:
+- `scripts/release_readiness_check.py`
+- `scripts/staging_smoke_check.py`
+
+The readiness assessor reuses startup preflight (`run_startup_preflight`) and provider readiness (`WalletService.address_provider.is_ready`, `SignerService.readiness`) rather than duplicating unsafe logic.
+
+### Readiness semantics
+- `READY`: all critical checks healthy.
+- `DEGRADED`: only intentionally tolerated warnings (single-node SQLite posture).
+- `BLOCKED`: launch must stop (non-zero exit).
+
+### Startup-fatal behavior
+Route-integrity and signer configuration failures remain startup-fatal and fail closed. Operator-facing status reasons are sanitized to avoid secret/token/payload leakage.
+
+### `/watcher_status` surface
+`/watcher_status` remains admin-only and minimal, reporting normalized states:
+- `ready`
+- `degraded`
+- `blocked`
+- `disabled`
+
+No stack traces, secrets, or raw provider payloads are exposed.

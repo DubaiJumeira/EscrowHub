@@ -28,7 +28,7 @@ from signer.signer_service import SignerService
 from runtime_preflight import FatalStartupError, PreflightIntegrityError, run_startup_preflight
 from tenant_service import TenantService
 from wallet_service import NETWORK_LABELS, WalletService
-from watcher_status_service import read_watcher_status
+from watcher_status_service import map_operator_health_state, read_watcher_status
 
 LOGGER = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -2354,13 +2354,17 @@ async def deal_back_from_conditions(update: Update, context: ContextTypes.DEFAUL
 
 def _signer_operator_state(signer_row: dict, signer_ready: bool, signer_reason: str | None) -> tuple[str, str]:
     health = str(signer_row.get("health_state") or "ok")
-    if health == "fatal_startup_blocked":
-        return "fatal startup blocked", _sanitize_failure_summary(signer_row.get("last_error") or signer_reason or "fatal startup blocked")
-    if not Settings.withdrawals_enabled:
-        return "running: withdrawals disabled", "WITHDRAWALS_ENABLED=false"
-    if not signer_ready:
-        return "running: provider not ready", _sanitize_failure_summary(signer_reason or signer_row.get("last_error") or "not ready")
-    return "running: healthy", "ok"
+    blocked = health == "fatal_startup_blocked"
+    disabled = not Settings.withdrawals_enabled
+    degraded = (not signer_ready) and (not blocked) and (not disabled)
+    state = map_operator_health_state(ready=signer_ready, blocked=blocked, disabled=disabled, degraded=degraded)
+    if state == "blocked":
+        return "blocked", _sanitize_failure_summary(signer_row.get("last_error") or signer_reason or "fatal startup blocked")
+    if state == "disabled":
+        return "disabled", "WITHDRAWALS_ENABLED=false"
+    if state == "degraded":
+        return "degraded", _sanitize_failure_summary(signer_reason or signer_row.get("last_error") or "not ready")
+    return "ready", "ok"
 
 
 async def watcher_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2373,41 +2377,26 @@ async def watcher_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         b = status["btc_watcher"]
         e = status["eth_watcher"]
         s = status["signer_loop"]
-        retry_rows = conn.execute(
-            "SELECT asset, COALESCE(SUM(CAST(amount AS REAL)),0) AS total_amount, COUNT(*) AS count FROM withdrawals WHERE status='signer_retry' GROUP BY asset ORDER BY asset"
-        ).fetchall()
-        retry_total = conn.execute("SELECT COUNT(*) AS c FROM withdrawals WHERE status='signer_retry'").fetchone()["c"]
-        unresolved_rows = conn.execute("SELECT status, COUNT(*) AS c FROM withdrawals WHERE status IN ('pending','submitted','broadcasted','signer_retry') GROUP BY status ORDER BY status").fetchall()
-        retry_lines = [f"- total in signer_retry: {retry_total}"]
-        for row in retry_rows:
-            retry_lines.append(f"- {row['asset']}: {Decimal(str(row['total_amount'] or 0))} ({row['count']} requests)")
 
         signer_service = SignerService()
         signer_ready, signer_reason = signer_service.readiness()
         wallet = WalletService(conn)
         dep_ready, dep_reason = wallet.address_provider.is_ready()
-        degraded: list[str] = []
-        if not DEPOSIT_ISSUANCE_READY:
-            degraded.append(f"deposit: {_sanitize_failure_summary(DEPOSIT_ISSUANCE_ERROR or dep_reason or 'not ready')}")
-        if not signer_ready:
-            degraded.append(f"withdrawals/signer: {_sanitize_failure_summary(signer_reason or 'not ready')}")
-        signer_state, signer_state_detail = _signer_operator_state(s, signer_ready, signer_reason)
+
+        btc_state = map_operator_health_state(ready=(b.get("health_state") == "ok"), degraded=(b.get("health_state") == "degraded"))
+        eth_state = map_operator_health_state(ready=(e.get("health_state") == "ok"), degraded=(e.get("health_state") == "degraded"))
+        signer_state, signer_detail = _signer_operator_state(s, signer_ready, signer_reason)
+        deposit_state = map_operator_health_state(
+            ready=bool(dep_ready and DEPOSIT_ISSUANCE_READY),
+            degraded=not bool(dep_ready and DEPOSIT_ISSUANCE_READY),
+        )
 
         msg = (
-            f"BTC watcher\n- last run: {b['last_run_at']}\n- last success: {b['last_success_at']}\n"
-            f"- health: {b.get('health_state') or 'ok'}\n- consecutive failures: {b['consecutive_failures']}\n- last error: {_sanitize_failure_summary(b['last_error'])}\n\n"
-            f"ETH watcher\n- last run: {e['last_run_at']}\n- last success: {e['last_success_at']}\n"
-            f"- health: {e.get('health_state') or 'ok'}\n- consecutive failures: {e['consecutive_failures']}\n- last error: {_sanitize_failure_summary(e['last_error'])}\n\n"
-            f"Signer loop\n- last run: {s['last_run_at']}\n- last success: {s['last_success_at']}\n"
-            f"- health: {s.get('health_state') or 'ok'}\n- consecutive failures: {s['consecutive_failures']}\n- last error: {_sanitize_failure_summary(s['last_error'])}\n\n"
-            f"Deposit issuance readiness\n- ready: {'yes' if dep_ready and DEPOSIT_ISSUANCE_READY else 'no'}\n"
-            f"- detail: {_sanitize_failure_summary(DEPOSIT_ISSUANCE_ERROR or dep_reason or 'ok')}\n\n"
-            f"Withdrawal provider\n- ready: {'yes' if signer_ready else 'no'}\n"
-            f"- detail: {_sanitize_failure_summary(signer_reason or 'ok')}\n\n"
-            f"Signer retry backlog\n" + "\n".join(retry_lines) + "\n\n"
-            f"Unresolved withdrawals\n" + ("\n".join([f"- {r['status']}: {r['c']}" for r in unresolved_rows]) if unresolved_rows else "- none") + "\n\n"
-            f"Signer loop health\n- state: {signer_state}\n- detail: {signer_state_detail}\n\n"
-            f"Degraded mode reasons\n- " + ("\n- ".join(degraded) if degraded else "none")
+            "watcher_status\n"
+            f"- btc: {btc_state} (failures={b['consecutive_failures']}, error={_sanitize_failure_summary(b['last_error'])})\n"
+            f"- eth: {eth_state} (failures={e['consecutive_failures']}, error={_sanitize_failure_summary(e['last_error'])})\n"
+            f"- deposit_provider: {deposit_state} (detail={_sanitize_failure_summary(DEPOSIT_ISSUANCE_ERROR or dep_reason or 'ok')})\n"
+            f"- signer: {signer_state} (detail={signer_detail})"
         )
         conn.execute(
             "INSERT INTO admin_actions(admin_user_id,action_type,data_json) VALUES(?,?,?)",
