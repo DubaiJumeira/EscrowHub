@@ -28,7 +28,7 @@ from signer.signer_service import SignerService
 from runtime_preflight import FatalStartupError, PreflightIntegrityError, run_startup_preflight
 from tenant_service import TenantService
 from wallet_service import NETWORK_LABELS, WalletService
-from watcher_status_service import map_operator_health_state, read_watcher_status
+from watcher_status_service import classify_watcher_health_state, map_operator_health_state, read_watcher_status
 
 LOGGER = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -2353,10 +2353,9 @@ async def deal_back_from_conditions(update: Update, context: ContextTypes.DEFAUL
     return DEAL_ENTER_AMOUNT
 
 def _signer_operator_state(signer_row: dict, signer_ready: bool, signer_reason: str | None) -> tuple[str, str]:
-    health = str(signer_row.get("health_state") or "ok")
-    blocked = health == "fatal_startup_blocked"
-    disabled = not Settings.withdrawals_enabled
-    degraded = (not signer_ready) and (not blocked) and (not disabled)
+    blocked, persisted_disabled, persisted_degraded = classify_watcher_health_state(signer_row.get("health_state"))
+    disabled = (not Settings.withdrawals_enabled) or persisted_disabled
+    degraded = ((not signer_ready) or persisted_degraded) and (not blocked) and (not disabled)
     state = map_operator_health_state(ready=signer_ready, blocked=blocked, disabled=disabled, degraded=degraded)
     if state == "blocked":
         return "blocked", _sanitize_failure_summary(signer_row.get("last_error") or signer_reason or "fatal startup blocked")
@@ -2383,8 +2382,20 @@ async def watcher_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         wallet = WalletService(conn)
         dep_ready, dep_reason = wallet.address_provider.is_ready()
 
-        btc_state = map_operator_health_state(ready=(b.get("health_state") == "ok"), degraded=(b.get("health_state") == "degraded"))
-        eth_state = map_operator_health_state(ready=(e.get("health_state") == "ok"), degraded=(e.get("health_state") == "degraded"))
+        btc_blocked, btc_disabled, btc_degraded = classify_watcher_health_state(b.get("health_state"))
+        eth_blocked, eth_disabled, eth_degraded = classify_watcher_health_state(e.get("health_state"))
+        btc_state = map_operator_health_state(
+            ready=(b.get("health_state") == "ok"),
+            blocked=btc_blocked,
+            disabled=btc_disabled,
+            degraded=btc_degraded,
+        )
+        eth_state = map_operator_health_state(
+            ready=(e.get("health_state") == "ok"),
+            blocked=eth_blocked,
+            disabled=eth_disabled,
+            degraded=eth_degraded,
+        )
         signer_state, signer_detail = _signer_operator_state(s, signer_ready, signer_reason)
         deposit_state = map_operator_health_state(
             ready=bool(dep_ready and DEPOSIT_ISSUANCE_READY),

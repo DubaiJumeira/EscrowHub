@@ -85,7 +85,7 @@ Withdrawal rows persist: `provider_origin`, `provider_ref`, `idempotency_key`, `
 Use `python scripts/release_readiness_check.py --json` before launch.
 
 - `READY`: all required checks passed; launch allowed.
-- `DEGRADED`: launch is possible only for explicitly tolerated posture warnings (single-node SQLite warning).
+- `DEGRADED`: launch-critical checks passed, but tolerated degradations/warnings remain.
 - `BLOCKED`: launch is forbidden; readiness check exits non-zero.
 
 The check is fail-closed and evaluates DB connectivity/schema init, route integrity, deposit provider readiness, withdrawal provider/signer readiness, startup-fatal preflight outcomes, required env vars, and single-node SQLite posture warning.
@@ -97,4 +97,4 @@ The check is fail-closed and evaluates DB connectivity/schema init, route integr
 4. Validate withdrawal provider/signer handshake (`python scripts/staging_smoke_check.py`).
 5. Run smoke checks without creating chain transactions.
 
-If readiness is `BLOCKED`, do **not** launch. Fix provider/env/integrity issues, rerun readiness, and only proceed on `READY`/approved `DEGRADED`.
+If readiness is `BLOCKED`, do **not** launch. Fix provider/env/integrity issues, rerun readiness, and only proceed on `READY`/approved `DEGRADED`. `--allow-degraded` affects process exit only; the reported status remains `DEGRADED`.

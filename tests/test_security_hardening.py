@@ -1290,6 +1290,57 @@ def test_release_readiness_degraded_single_node_warning_only(monkeypatch):
     assert report.status == READINESS_DEGRADED
 
 
+
+
+def test_release_readiness_allow_degraded_does_not_relabel_status(monkeypatch):
+    import readiness_service
+    from readiness_service import READINESS_DEGRADED, assess_release_readiness
+
+    monkeypatch.setattr(Settings, "is_production", False)
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("SQLITE_DB_PATH", "/tmp/escrow_degraded.db")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("ADDRESS_PROVIDER", "http")
+    monkeypatch.setenv("WITHDRAWAL_PROVIDER", "http")
+
+    class WalletFake:
+        class P:
+            def is_ready(self):
+                return True, None
+
+        def __init__(self, _conn):
+            self.address_provider = self.P()
+
+    class SignerFake:
+        def readiness(self):
+            return True, None
+
+    monkeypatch.setattr(readiness_service, "WalletService", WalletFake)
+    monkeypatch.setattr(readiness_service, "SignerService", SignerFake)
+
+    report = assess_release_readiness(allow_degraded=True)
+    assert report.status == READINESS_DEGRADED
+
+
+def test_staging_smoke_check_blocks_when_route_integrity_unverified(monkeypatch):
+    import scripts.staging_smoke_check as smoke
+
+    class WalletFake:
+        class P:
+            def is_ready(self):
+                return True, None
+
+        def __init__(self, _conn):
+            self.address_provider = self.P()
+
+    class SignerFake:
+        def readiness(self):
+            return True, None
+
+    monkeypatch.setattr(smoke, "WalletService", WalletFake)
+    monkeypatch.setattr(smoke, "SignerService", SignerFake)
+    monkeypatch.setattr(smoke, "run_startup_preflight", lambda _name: (_ for _ in ()).throw(RuntimeError("route failed")))
+    assert smoke.main() == 2
 def test_deposit_provider_existing_route_returns_stored_value(conn, monkeypatch):
     monkeypatch.setattr(Settings, "is_production", True)
     monkeypatch.setattr(Settings, "encryption_key", "k" * 32)
