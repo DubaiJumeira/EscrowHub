@@ -1215,3 +1215,174 @@ def test_run_bot_main_does_not_restart_on_fatal_startup(monkeypatch):
     with pytest.raises(FatalStartupError):
         run_bot.main()
     assert slept == []
+
+
+def test_release_readiness_blocked_when_provider_unavailable(monkeypatch):
+    from readiness_service import READINESS_BLOCKED, assess_release_readiness
+
+    monkeypatch.setattr(Settings, "is_production", False)
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("SQLITE_DB_PATH", ":memory:")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("ADDRESS_PROVIDER", "http")
+    monkeypatch.setenv("WITHDRAWAL_PROVIDER", "http")
+
+    report = assess_release_readiness()
+    assert report.status == READINESS_BLOCKED
+    assert any("deposit provider unavailable" in reason for reason in report.blocked_reasons)
+
+
+def test_release_readiness_ready_when_dependencies_healthy(monkeypatch):
+    import readiness_service
+    from readiness_service import READINESS_READY, assess_release_readiness
+
+    monkeypatch.setattr(Settings, "is_production", False)
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("SQLITE_DB_PATH", ":memory:")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("ADDRESS_PROVIDER", "http")
+    monkeypatch.setenv("WITHDRAWAL_PROVIDER", "http")
+
+    class WalletFake:
+        class P:
+            def is_ready(self):
+                return True, None
+        def __init__(self, _conn):
+            self.address_provider = self.P()
+
+    class SignerFake:
+        def readiness(self):
+            return True, None
+
+    monkeypatch.setattr(readiness_service, "WalletService", WalletFake)
+    monkeypatch.setattr(readiness_service, "SignerService", SignerFake)
+
+    report = assess_release_readiness(allow_degraded=True)
+    assert report.status == READINESS_READY
+
+
+def test_release_readiness_degraded_single_node_warning_only(monkeypatch):
+    import readiness_service
+    from readiness_service import READINESS_DEGRADED, assess_release_readiness
+
+    monkeypatch.setattr(Settings, "is_production", False)
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("SQLITE_DB_PATH", "/tmp/escrow.db")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("ADDRESS_PROVIDER", "http")
+    monkeypatch.setenv("WITHDRAWAL_PROVIDER", "http")
+
+    class WalletFake:
+        class P:
+            def is_ready(self):
+                return True, None
+        def __init__(self, _conn):
+            self.address_provider = self.P()
+
+    class SignerFake:
+        def readiness(self):
+            return True, None
+
+    monkeypatch.setattr(readiness_service, "WalletService", WalletFake)
+    monkeypatch.setattr(readiness_service, "SignerService", SignerFake)
+
+    report = assess_release_readiness()
+    assert report.status == READINESS_DEGRADED
+
+
+def test_deposit_provider_existing_route_returns_stored_value(conn, monkeypatch):
+    monkeypatch.setattr(Settings, "is_production", True)
+    monkeypatch.setattr(Settings, "encryption_key", "k" * 32)
+
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(8811)
+    existing_plain = "0x" + "8" * 40
+    existing = wallet._encrypt_field(existing_plain)
+    conn.execute(
+        "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,address_fingerprint,provider_origin,provider_ref) VALUES(?,?,?,?,?,?,?)",
+        (uid, "USDT", "ETHEREUM", existing, _fp("ETHEREUM", existing_plain), "external_http", "route:old"),
+    )
+
+    route = wallet.get_or_create_deposit_address(8811, "USDT")
+    assert route.address == existing_plain
+
+
+def test_withdrawal_lifecycle_ambiguous_to_targeted_reconcile_confirmed(conn, monkeypatch):
+    monkeypatch.setattr(Settings, "withdrawals_enabled", True)
+    monkeypatch.setattr(Settings, "withdrawal_min_interval_seconds", 0)
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(99101)
+    wallet.ledger.add_entry("USER", uid, uid, "USDT", Decimal("30"), "DEPOSIT", "deposit", 102)
+    req = wallet.request_withdrawal(uid, "USDT", Decimal("3"), "0x1111111111111111111111111111111111111111")
+
+    class Provider:
+        provider_origin = "external_http"
+
+        def is_ready(self):
+            return True, None
+
+        def execute_withdrawal(self, _req):
+            from signer.withdrawal_provider import WithdrawalExecutionResult
+
+            return WithdrawalExecutionResult(status="ambiguous", provider_ref="r-amb", asset="USDT", message="pending provider consensus")
+
+        def reconcile_withdrawal(self, _req):
+            from signer.withdrawal_provider import WithdrawalReconciliationResult
+
+            return WithdrawalReconciliationResult(status="confirmed", provider_ref="r-amb", txid="0x" + "b" * 64, asset="USDT", external_status="confirmed")
+
+    svc = SignerService()
+    svc.provider = Provider()
+    svc.process_withdrawals(wallet)
+    before = conn.execute("SELECT status FROM withdrawals WHERE id=?", (req["id"],)).fetchone()
+    assert before["status"] == "signer_retry"
+
+    processed = svc.reconcile_withdrawal_by_id(wallet, req["id"], force=True)
+    after = conn.execute("SELECT status,txid FROM withdrawals WHERE id=?", (req["id"],)).fetchone()
+    assert processed == 1
+    assert after["status"] == "confirmed"
+    assert str(after["txid"]).startswith("0x")
+
+
+def test_withdrawal_lifecycle_pending_submitted_broadcasted_confirmed(conn, monkeypatch):
+    monkeypatch.setattr(Settings, "withdrawals_enabled", True)
+    monkeypatch.setattr(Settings, "withdrawal_min_interval_seconds", 0)
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(99102)
+    wallet.ledger.add_entry("USER", uid, uid, "USDT", Decimal("40"), "DEPOSIT", "deposit", 103)
+    req = wallet.request_withdrawal(uid, "USDT", Decimal("4"), "0x1111111111111111111111111111111111111111")
+
+    class Provider:
+        provider_origin = "external_http"
+
+        def __init__(self):
+            self.stage = 0
+
+        def is_ready(self):
+            return True, None
+
+        def execute_withdrawal(self, _req):
+            from signer.withdrawal_provider import WithdrawalExecutionResult
+
+            return WithdrawalExecutionResult(status="submitted", provider_ref="r-seq", asset="USDT", external_status="submitted")
+
+        def reconcile_withdrawal(self, _req):
+            from signer.withdrawal_provider import WithdrawalReconciliationResult
+
+            self.stage += 1
+            if self.stage == 1:
+                return WithdrawalReconciliationResult(status="broadcasted", provider_ref="r-seq", txid="0x" + "c" * 64, asset="USDT", external_status="broadcasted")
+            return WithdrawalReconciliationResult(status="confirmed", provider_ref="r-seq", txid="0x" + "c" * 64, asset="USDT", external_status="confirmed")
+
+    svc = SignerService()
+    svc.provider = Provider()
+    svc.process_withdrawals(wallet)
+    conn.execute("UPDATE withdrawals SET submitted_at=datetime('now','-600 seconds') WHERE id=?", (req["id"],))
+    svc.process_withdrawals(wallet)
+    row_mid = conn.execute("SELECT status,txid FROM withdrawals WHERE id=?", (req["id"],)).fetchone()
+    assert row_mid["status"] == "broadcasted"
+    conn.execute("UPDATE withdrawals SET broadcasted_at=datetime('now','-600 seconds') WHERE id=?", (req["id"],))
+    svc.process_withdrawals(wallet)
+    row_end = conn.execute("SELECT status,txid FROM withdrawals WHERE id=?", (req["id"],)).fetchone()
+    assert row_end["status"] == "confirmed"
+    assert str(row_end["txid"]).startswith("0x")

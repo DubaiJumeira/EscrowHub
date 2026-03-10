@@ -8,6 +8,22 @@ from error_sanitizer import sanitize_runtime_error
 VALID_HEALTH = {"ok", "degraded", "fatal_startup_blocked", "transient_failure"}
 
 
+def map_operator_health_state(
+    *,
+    ready: bool,
+    blocked: bool = False,
+    disabled: bool = False,
+    degraded: bool = False,
+) -> str:
+    if blocked:
+        return "blocked"
+    if disabled:
+        return "disabled"
+    if ready and not degraded:
+        return "ready"
+    return "degraded"
+
+
 def upsert_watcher_status(
     conn,
     watcher_name: str,

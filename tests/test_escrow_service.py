@@ -819,10 +819,10 @@ def test_watcher_status_command_includes_signer_and_backlog(monkeypatch, conn):
     allowed = SimpleNamespace(effective_user=SimpleNamespace(id=999), effective_message=allowed_msg)
     asyncio.run(bot.watcher_status(allowed, None))
     text = allowed_msg.replies[-1]
-    assert "Signer loop" in text
-    assert "Deposit issuance readiness" in text
-    assert "Signer retry backlog" in text
-    assert "total in signer_retry: 1" in text
+    assert "watcher_status" in text
+    assert "- signer:" in text
+    assert "- deposit_provider:" in text
+    assert "- btc:" in text
 
 
 def test_withdrawal_idempotency_key_persisted_on_request(conn):
@@ -987,21 +987,21 @@ def test_watcher_status_distinguishes_signer_health_states(monkeypatch, conn):
 
     monkeypatch.setattr(bot.Settings, "withdrawals_enabled", True)
     state, detail = bot._signer_operator_state({"health_state": "fatal_startup_blocked", "last_error": "fatal"}, True, None)
-    assert state == "fatal startup blocked"
+    assert state == "blocked"
     assert "fatal" in detail
 
     monkeypatch.setattr(bot.Settings, "withdrawals_enabled", False)
     state2, detail2 = bot._signer_operator_state({"health_state": "ok", "last_error": None}, True, None)
-    assert state2 == "running: withdrawals disabled"
+    assert state2 == "disabled"
     assert detail2 == "WITHDRAWALS_ENABLED=false"
 
     monkeypatch.setattr(bot.Settings, "withdrawals_enabled", True)
     state3, detail3 = bot._signer_operator_state({"health_state": "ok", "last_error": None}, False, "provider unavailable")
-    assert state3 == "running: provider not ready"
+    assert state3 == "degraded"
     assert "provider unavailable" in detail3
 
     state4, detail4 = bot._signer_operator_state({"health_state": "ok", "last_error": None}, True, None)
-    assert state4 == "running: healthy"
+    assert state4 == "ready"
     assert detail4 == "ok"
 
 

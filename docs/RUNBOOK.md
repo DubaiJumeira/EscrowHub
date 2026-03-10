@@ -110,3 +110,47 @@ Withdrawals remain disabled by default. If enabled for controlled testing, ambig
 ## Operator configuration
 - Set `SUPPORT_HANDLE` (e.g. `@escrow_support`) to expose support contact in bot UI.
 - `ADMIN_USER_IDS` and `MODERATOR_TELEGRAM_IDS` are separate role surfaces; configure both intentionally.
+
+## Release go/no-go readiness check
+Run before every production start:
+
+```bash
+python scripts/release_readiness_check.py
+python scripts/release_readiness_check.py --json
+```
+
+Readiness states:
+- `READY`: all launch-critical checks passed.
+- `DEGRADED`: only allowed degradations are present (currently single-node SQLite posture warning).
+- `BLOCKED`: fail-closed hard stop; command exits non-zero.
+
+Covered checks: DB connectivity, schema init, route integrity, deposit provider readiness, withdrawal provider readiness, signer readiness, startup-fatal conditions, required production env vars, and single-node SQLite posture.
+
+## Staging smoke harness (non-destructive)
+Use this to verify route/provider handshakes without chain transactions:
+
+```bash
+python scripts/staging_smoke_check.py
+```
+
+This harness is fail-closed on uncertainty and only validates service handshakes.
+
+## Supported production assets and posture
+- Assets: **BTC, LTC, ETH, USDT only**.
+- Current production target: **single-node SQLite only**.
+- External deposit and withdrawal providers are mandatory for production.
+
+## Staged go-live procedure
+1. Migrate on a DB copy.
+2. Execute release readiness check.
+3. Validate deposit issuance handshake.
+4. Validate withdrawal provider/signer health.
+5. Execute staging smoke checks.
+6. Start services.
+
+## No-go / rollback guidance
+If readiness is `BLOCKED` or smoke checks fail:
+- Do not launch.
+- Roll back config/provider changes to last known-good values.
+- Restore DB snapshot only if migration/data integrity is uncertain.
+- Re-run readiness + smoke checks before any relaunch.

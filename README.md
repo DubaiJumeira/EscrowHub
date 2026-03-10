@@ -80,3 +80,21 @@ Withdrawal rows persist: `provider_origin`, `provider_ref`, `idempotency_key`, `
 - `/recover` reconstructs last open escrow context from DB after restart (pending/active/disputed only, fail-closed otherwise).
 - Support contact text is env-driven via `SUPPORT_HANDLE`; if unset, bot returns a safe unavailable message.
 - Admin (`ADMIN_USER_IDS`) and moderator (`MODERATOR_TELEGRAM_IDS`) roles are explicitly distinct surfaces with startup validation/warnings.
+
+## Final release readiness states
+Use `python scripts/release_readiness_check.py --json` before launch.
+
+- `READY`: all required checks passed; launch allowed.
+- `DEGRADED`: launch is possible only for explicitly tolerated posture warnings (single-node SQLite warning).
+- `BLOCKED`: launch is forbidden; readiness check exits non-zero.
+
+The check is fail-closed and evaluates DB connectivity/schema init, route integrity, deposit provider readiness, withdrawal provider/signer readiness, startup-fatal preflight outcomes, required env vars, and single-node SQLite posture warning.
+
+## Pre-launch go/no-go checklist
+1. Restore/clone a DB copy and run migrations.
+2. Run `python scripts/release_readiness_check.py` (must not return `BLOCKED`).
+3. Validate deposit issuance handshake (`python scripts/staging_smoke_check.py`).
+4. Validate withdrawal provider/signer handshake (`python scripts/staging_smoke_check.py`).
+5. Run smoke checks without creating chain transactions.
+
+If readiness is `BLOCKED`, do **not** launch. Fix provider/env/integrity issues, rerun readiness, and only proceed on `READY`/approved `DEGRADED`.
