@@ -28,7 +28,13 @@ from signer.signer_service import SignerService
 from runtime_preflight import FatalStartupError, PreflightIntegrityError, run_startup_preflight
 from tenant_service import TenantService
 from wallet_service import NETWORK_LABELS, WalletService
-from watcher_status_service import classify_watcher_health_state, map_operator_health_state, read_watcher_status
+from watcher_status_service import (
+    classify_watcher_health_state,
+    env_flag_enabled,
+    map_operator_health_state,
+    normalize_deposit_provider_state,
+    read_watcher_status,
+)
 
 LOGGER = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -2384,29 +2390,36 @@ async def watcher_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         btc_blocked, btc_disabled, btc_degraded = classify_watcher_health_state(b.get("health_state"))
         eth_blocked, eth_disabled, eth_degraded = classify_watcher_health_state(e.get("health_state"))
+        btc_cfg_disabled = not env_flag_enabled("BTC_WATCHER_ENABLED", True)
+        eth_cfg_disabled = not env_flag_enabled("ETH_WATCHER_ENABLED", True)
+        # WARNING: watcher disabled config is enforced at status render to fail closed against stale persisted rows.
+        # Secure alternative: persist explicit disabled rows at startup and derive disabled from config as defense in depth.
         btc_state = map_operator_health_state(
-            ready=(b.get("health_state") == "ok"),
+            ready=(b.get("health_state") == "ok") and (not btc_cfg_disabled),
             blocked=btc_blocked,
-            disabled=btc_disabled,
+            disabled=btc_disabled or btc_cfg_disabled,
             degraded=btc_degraded,
         )
         eth_state = map_operator_health_state(
-            ready=(e.get("health_state") == "ok"),
+            ready=(e.get("health_state") == "ok") and (not eth_cfg_disabled),
             blocked=eth_blocked,
-            disabled=eth_disabled,
+            disabled=eth_disabled or eth_cfg_disabled,
             degraded=eth_degraded,
         )
         signer_state, signer_detail = _signer_operator_state(s, signer_ready, signer_reason)
-        deposit_state = map_operator_health_state(
-            ready=bool(dep_ready and DEPOSIT_ISSUANCE_READY),
-            degraded=not bool(dep_ready and DEPOSIT_ISSUANCE_READY),
+        deposit_state, deposit_detail = normalize_deposit_provider_state(
+            provider_ready=bool(dep_ready),
+            issuance_ready=bool(DEPOSIT_ISSUANCE_READY),
+            provider_kind=os.getenv("ADDRESS_PROVIDER", "disabled"),
+            startup_error=DEPOSIT_ISSUANCE_ERROR,
+            provider_reason=dep_reason,
         )
 
         msg = (
             "watcher_status\n"
             f"- btc: {btc_state} (failures={b['consecutive_failures']}, error={_sanitize_failure_summary(b['last_error'])})\n"
             f"- eth: {eth_state} (failures={e['consecutive_failures']}, error={_sanitize_failure_summary(e['last_error'])})\n"
-            f"- deposit_provider: {deposit_state} (detail={_sanitize_failure_summary(DEPOSIT_ISSUANCE_ERROR or dep_reason or 'ok')})\n"
+            f"- deposit_provider: {deposit_state} (detail={_sanitize_failure_summary(deposit_detail)})\n"
             f"- signer: {signer_state} (detail={signer_detail})"
         )
         conn.execute(

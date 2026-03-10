@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime
 
 from error_sanitizer import sanitize_runtime_error
@@ -30,6 +31,54 @@ def map_operator_health_state(
     if ready and not degraded:
         return "ready"
     return "degraded"
+
+
+def env_flag_enabled(name: str, default: bool = True) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def normalize_deposit_provider_state(
+    *,
+    provider_ready: bool,
+    issuance_ready: bool,
+    provider_kind: str,
+    startup_error: str | None,
+    provider_reason: str | None,
+) -> tuple[str, str]:
+    kind = str(provider_kind or "").strip().lower()
+    reason = sanitize_runtime_error(startup_error or provider_reason or "ok")
+
+    disabled = kind != "http"
+    blocked = False
+    degraded = False
+
+    if disabled:
+        state = map_operator_health_state(ready=False, disabled=True)
+        return state, "ADDRESS_PROVIDER disabled by configuration"
+
+    if startup_error and any(
+        marker in startup_error.lower()
+        for marker in (
+            "address_provider_url is missing",
+            "address_provider_token is required",
+            "must use https://",
+            "production deposit issuance unavailable",
+        )
+    ):
+        blocked = True
+    elif not provider_ready and any(
+        marker in (provider_reason or "").lower()
+        for marker in ("address_provider_url is missing", "address_provider_token", "must use https://")
+    ):
+        blocked = True
+
+    if not blocked:
+        degraded = not bool(provider_ready and issuance_ready)
+    state = map_operator_health_state(ready=bool(provider_ready and issuance_ready), blocked=blocked, degraded=degraded)
+    return state, reason
 
 
 def upsert_watcher_status(

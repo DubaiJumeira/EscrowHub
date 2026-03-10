@@ -17,7 +17,7 @@ from tenant_service import TenantService
 from wallet_service import WalletService
 from watchers.eth_watcher import run_once as run_eth_once
 from watchers.notify import notify_deposit_credited
-from watcher_status_service import read_watcher_status, upsert_watcher_status
+from watcher_status_service import normalize_deposit_provider_state, read_watcher_status, upsert_watcher_status
 from config.settings import Settings
 
 
@@ -1300,3 +1300,85 @@ def test_release_confirm_rejects_non_buyer(monkeypatch, conn):
     q = Q()
     asyncio.run(bot.esc_release_confirm_handler(SimpleNamespace(callback_query=q, effective_user=q.from_user), SimpleNamespace(bot=SimpleNamespace(send_message=_send), user_data={})))
     assert any("only the buyer" in a.lower() for a in q.alerts)
+
+
+def test_deposit_provider_state_mapping_truth_table():
+    state, detail = normalize_deposit_provider_state(
+        provider_ready=True,
+        issuance_ready=True,
+        provider_kind="http",
+        startup_error=None,
+        provider_reason=None,
+    )
+    assert state == "ready"
+    assert detail == "ok"
+
+    state, detail = normalize_deposit_provider_state(
+        provider_ready=False,
+        issuance_ready=False,
+        provider_kind="disabled",
+        startup_error="Production deposit issuance unavailable: no approved external address provider configured",
+        provider_reason="no approved external address provider configured",
+    )
+    assert state == "disabled"
+    assert "disabled by configuration" in detail
+
+    state, detail = normalize_deposit_provider_state(
+        provider_ready=False,
+        issuance_ready=False,
+        provider_kind="http",
+        startup_error="Production deposit issuance unavailable: ADDRESS_PROVIDER_URL is missing",
+        provider_reason="ADDRESS_PROVIDER_URL is missing",
+    )
+    assert state == "blocked"
+    assert "ADDRESS_PROVIDER_URL" in detail
+
+    state, detail = normalize_deposit_provider_state(
+        provider_ready=False,
+        issuance_ready=False,
+        provider_kind="http",
+        startup_error=None,
+        provider_reason="provider healthcheck failed: timeout",
+    )
+    assert state == "degraded"
+    assert "healthcheck" in detail
+
+
+def test_watcher_status_config_disabled_overrides_stale_ready(monkeypatch, conn):
+    import asyncio
+    import bot
+
+    upsert_watcher_status(conn, "btc_watcher", success=True, health="ok")
+
+    monkeypatch.setenv("BTC_WATCHER_ENABLED", "false")
+    monkeypatch.setattr(bot, "ADMIN_IDS", {999})
+    monkeypatch.setattr(bot, "_services", lambda: (conn, None, None, None))
+    monkeypatch.setattr(bot, "DEPOSIT_ISSUANCE_READY", True)
+    monkeypatch.setattr(bot, "DEPOSIT_ISSUANCE_ERROR", None)
+
+    class SignerFake:
+        def readiness(self):
+            return True, None
+
+    class WalletFake:
+        class P:
+            def is_ready(self):
+                return True, None
+
+        def __init__(self, _conn):
+            self.address_provider = self.P()
+
+    monkeypatch.setattr(bot, "SignerService", SignerFake)
+    monkeypatch.setattr(bot, "WalletService", WalletFake)
+
+    class Msg:
+        def __init__(self):
+            self.replies = []
+
+        async def reply_text(self, txt, **kwargs):
+            self.replies.append(txt)
+
+    allowed_msg = Msg()
+    allowed = SimpleNamespace(effective_user=SimpleNamespace(id=999), effective_message=allowed_msg)
+    asyncio.run(bot.watcher_status(allowed, None))
+    assert "- btc: disabled" in allowed_msg.replies[-1]

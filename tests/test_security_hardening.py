@@ -1437,3 +1437,45 @@ def test_withdrawal_lifecycle_pending_submitted_broadcasted_confirmed(conn, monk
     row_end = conn.execute("SELECT status,txid FROM withdrawals WHERE id=?", (req["id"],)).fetchone()
     assert row_end["status"] == "confirmed"
     assert str(row_end["txid"]).startswith("0x")
+
+
+def test_btc_watcher_disabled_persists_disabled_health(monkeypatch):
+    calls = []
+    monkeypatch.setenv("BTC_WATCHER_ENABLED", "false")
+
+    class Conn:
+        def commit(self):
+            return None
+        def close(self):
+            return None
+
+    monkeypatch.setattr(run_btc_watcher, "get_connection", lambda: Conn())
+    monkeypatch.setattr(run_btc_watcher, "init_db", lambda _conn: None)
+
+    def _upsert(_conn, watcher_name, success, error=None, health=None):
+        calls.append((watcher_name, success, error, health))
+
+    monkeypatch.setattr(run_btc_watcher, "upsert_watcher_status", _upsert)
+    run_btc_watcher.main()
+    assert calls == [("btc_watcher", False, "disabled by config", "disabled")]
+
+
+def test_eth_watcher_disabled_persists_disabled_health(monkeypatch):
+    calls = []
+    monkeypatch.setenv("ETH_WATCHER_ENABLED", "false")
+
+    class Conn:
+        def commit(self):
+            return None
+        def close(self):
+            return None
+
+    monkeypatch.setattr(run_eth_watcher, "get_connection", lambda: Conn())
+    monkeypatch.setattr(run_eth_watcher, "init_db", lambda _conn: None)
+
+    def _upsert(_conn, watcher_name, success, error=None, health=None):
+        calls.append((watcher_name, success, error, health))
+
+    monkeypatch.setattr(run_eth_watcher, "upsert_watcher_status", _upsert)
+    run_eth_watcher.main()
+    assert calls == [("eth_watcher", False, "disabled by config", "disabled")]

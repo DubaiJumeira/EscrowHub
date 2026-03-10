@@ -31,6 +31,15 @@ def main() -> None:
     enabled = os.getenv("ETH_WATCHER_ENABLED", "true").lower() == "true"
     if not enabled:
         LOGGER.info("ETH watcher disabled by config")
+        conn = get_connection()
+        init_db(conn)
+        try:
+            # WARNING: persist disabled state before exit to fail closed and prevent stale ready rows.
+            # Secure alternative: derive disabled from config at status render and persist explicit disabled markers at startup.
+            upsert_watcher_status(conn, "eth_watcher", success=False, error="disabled by config", health="disabled")
+            conn.commit()
+        finally:
+            conn.close()
         return
     interval = int(os.getenv("WATCHER_POLL_INTERVAL_SECONDS", "30"))
     LOGGER.info("starting ETH watcher loop with interval=%ss", interval)

@@ -117,3 +117,10 @@ Route-integrity and signer configuration failures remain startup-fatal and fail 
 - `disabled`
 
 No stack traces, secrets, or raw provider payloads are exposed.
+
+Deposit provider state normalization uses shared helper logic and truthfully distinguishes `ready|degraded|blocked|disabled` (including config-disabled and startup-fatal blocked conditions).
+
+
+### Watcher disabled-state hardening
+BTC/ETH watcher entrypoints persist `health_state=disabled` before exiting when disabled by config.
+`/watcher_status` also derives disabled directly from watcher-enable config flags as defense in depth, so stale persisted `ok` rows cannot surface false `ready`.
