@@ -4,7 +4,7 @@ import json
 import os
 import time
 from decimal import Decimal
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from infra.chain_adapters.base import ChainAdapter, ChainDeposit
@@ -22,7 +22,10 @@ class BlockstreamUtxoAdapter(ChainAdapter):
         asset = self.asset.upper()
         if asset == "BTC":
             if primary:
-                return os.getenv("BLOCKSTREAM_BASE_URL", os.getenv("BTC_RPC_URL", "https://blockstream.info/api")).rstrip("/")
+                return os.getenv(
+                    "BLOCKSTREAM_BASE_URL",
+                    os.getenv("BTC_RPC_URL", "https://blockstream.info/api"),
+                ).rstrip("/")
             return os.getenv("BLOCKSTREAM_SECONDARY_BASE_URL", "").strip().rstrip("/")
         if asset == "LTC":
             if primary:
@@ -30,15 +33,32 @@ class BlockstreamUtxoAdapter(ChainAdapter):
             return os.getenv("LTC_SECONDARY_RPC_URL", "").strip().rstrip("/")
         raise RuntimeError(f"unsupported UTXO adapter asset: {asset}")
 
+    def _headers(self) -> dict[str, str]:
+        return {
+            "User-Agent": os.getenv(
+                "ESCROWHUB_HTTP_USER_AGENT",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 EscrowHub/1.0",
+            ),
+            "Accept": "application/json, text/plain, */*",
+            "Connection": "close",
+        }
+
     def _fetch_json(self, url: str) -> list[dict]:
         last_exc = None
         for attempt in range(3):
             try:
-                with urlopen(url, timeout=20) as resp:
+                req = Request(url, headers=self._headers())
+                with urlopen(req, timeout=20) as resp:
                     return json.loads(resp.read().decode())
+            except HTTPError as exc:
+                last_exc = exc
+                if exc.code not in (403, 408, 409, 425, 429, 500, 502, 503, 504):
+                    break
+                time.sleep(0.5 * (2**attempt))
             except (URLError, TimeoutError, json.JSONDecodeError) as exc:
                 last_exc = exc
-                time.sleep(0.25 * (2**attempt))
+                time.sleep(0.5 * (2**attempt))
         raise RuntimeError(f"{self.asset} adapter request failed url={url}") from last_exc
 
     def fetch_deposits(self) -> list[ChainDeposit]:
@@ -72,6 +92,14 @@ class BlockstreamUtxoAdapter(ChainAdapter):
         return out
 
     def broadcast_raw_transaction(self, asset: str, raw_tx_hex: str) -> str:
-        req = Request(f"{self.base}/tx", method="POST", data=raw_tx_hex.encode())
+        req = Request(
+            f"{self.base}/tx",
+            method="POST",
+            data=raw_tx_hex.encode(),
+            headers={
+                **self._headers(),
+                "Content-Type": "text/plain",
+            },
+        )
         with urlopen(req, timeout=20) as resp:
             return resp.read().decode().strip()
