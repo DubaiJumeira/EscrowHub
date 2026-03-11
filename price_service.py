@@ -19,6 +19,16 @@ ASSET_TO_COINGECKO_ID = {
     "USDT": "tether",
 }
 
+ASSET_TO_COINBASE_PRODUCT = {
+    "BTC": "BTC-USD",
+    "ETH": "ETH-USD",
+    "LTC": "LTC-USD",
+}
+
+STATIC_FALLBACK_PRICES = {
+    "USDT": Decimal("1"),
+}
+
 
 class PriceService(ABC):
     @abstractmethod
@@ -51,13 +61,31 @@ class CoinGeckoPriceService(PriceService):
             "Connection": "close",
         }
 
-    def get_usd_price(self, asset: str) -> Decimal:
-        symbol = asset.upper()
-        now = time.time()
+    def _cache_get_fresh(self, symbol: str) -> Decimal | None:
         hit = self._cache.get(symbol)
-        if hit and now - hit[0] < self.ttl_seconds:
-            return hit[1]
+        if not hit:
+            return None
+        ts, price = hit
+        if time.time() - ts < self.ttl_seconds:
+            return price
+        return None
 
+    def _cache_get_any(self, symbol: str) -> Decimal | None:
+        hit = self._cache.get(symbol)
+        if not hit:
+            return None
+        return hit[1]
+
+    def _cache_set(self, symbol: str, price: Decimal) -> Decimal:
+        self._cache[symbol] = (time.time(), price)
+        return price
+
+    def _fetch_json(self, url: str) -> dict:
+        req = Request(url, headers=self._headers())
+        with urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode())
+
+    def _fetch_coingecko_price(self, symbol: str) -> Decimal:
         coin_id = ASSET_TO_COINGECKO_ID[symbol]
         url = "https://api.coingecko.com/api/v3/simple/price"
         query = urlencode({"ids": coin_id, "vs_currencies": "usd"})
@@ -65,24 +93,66 @@ class CoinGeckoPriceService(PriceService):
         last_exc = None
         for attempt in range(3):
             try:
-                req = Request(f"{url}?{query}", headers=self._headers())
-                with urlopen(req, timeout=10) as resp:
-                    data = json.loads(resp.read().decode())
-                price = Decimal(str(data[coin_id]["usd"]))
-                self._cache[symbol] = (time.time(), price)
-                return price
+                data = self._fetch_json(f"{url}?{query}")
+                return Decimal(str(data[coin_id]["usd"]))
             except HTTPError as exc:
                 last_exc = exc
-                if hit:
-                    return hit[1]
                 if exc.code not in (408, 425, 429, 500, 502, 503, 504):
                     break
                 time.sleep(0.5 * (2 ** attempt))
             except (URLError, TimeoutError, json.JSONDecodeError, KeyError) as exc:
                 last_exc = exc
-                if hit:
-                    return hit[1]
                 time.sleep(0.5 * (2 ** attempt))
+        raise RuntimeError(f"coingecko price lookup failed for {symbol}") from last_exc
+
+    def _fetch_coinbase_price(self, symbol: str) -> Decimal:
+        product_id = ASSET_TO_COINBASE_PRODUCT.get(symbol)
+        if not product_id:
+            raise RuntimeError(f"coinbase fallback not configured for {symbol}")
+
+        # NOTE: Coinbase Exchange path is case-sensitive; keep lowercase /ticker.
+        url = f"https://api.exchange.coinbase.com/products/{product_id}/ticker"
+
+        last_exc = None
+        for attempt in range(3):
+            try:
+                data = self._fetch_json(url)
+                return Decimal(str(data["price"]))
+            except HTTPError as exc:
+                last_exc = exc
+                if exc.code not in (408, 425, 429, 500, 502, 503, 504):
+                    break
+                time.sleep(0.5 * (2 ** attempt))
+            except (URLError, TimeoutError, json.JSONDecodeError, KeyError) as exc:
+                last_exc = exc
+                time.sleep(0.5 * (2 ** attempt))
+        raise RuntimeError(f"coinbase price lookup failed for {symbol}") from last_exc
+
+    def get_usd_price(self, asset: str) -> Decimal:
+        symbol = asset.upper()
+
+        fresh = self._cache_get_fresh(symbol)
+        if fresh is not None:
+            return fresh
+
+        if symbol in STATIC_FALLBACK_PRICES:
+            return self._cache_set(symbol, STATIC_FALLBACK_PRICES[symbol])
+
+        last_exc = None
+
+        try:
+            return self._cache_set(symbol, self._fetch_coingecko_price(symbol))
+        except Exception as exc:
+            last_exc = exc
+
+        try:
+            return self._cache_set(symbol, self._fetch_coinbase_price(symbol))
+        except Exception as exc:
+            last_exc = exc
+
+        stale = self._cache_get_any(symbol)
+        if stale is not None:
+            return stale
 
         raise RuntimeError(f"price lookup failed for {symbol}") from last_exc
 
