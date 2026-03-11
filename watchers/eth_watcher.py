@@ -6,7 +6,7 @@ from infra.chain_adapters.eth_rpc import EthRpcAdapter
 from infra.db.database import get_connection, init_db
 from wallet_service import WalletService
 from watcher_status_service import write_watcher_cursor
-from watchers.notify import notify_deposit_credited
+from watchers.notify import notify_deposit_credited, notify_deposit_detected
 
 LOGGER = logging.getLogger(__name__)
 
@@ -19,8 +19,14 @@ def run_once(address_user_map: dict[str, int]) -> int:
         adapter = EthRpcAdapter(address_user_map, conn=conn)
         credited = 0
         deposits, finalized = adapter.fetch_deposits()
+
         for dep in deposits:
             try:
+                was_known = conn.execute(
+                    "SELECT 1 FROM deposits WHERE unique_key=?",
+                    (dep.unique_key,),
+                ).fetchone() is not None
+
                 did_credit = wallet.credit_deposit_if_confirmed(
                     dep.user_id,
                     dep.asset,
@@ -31,13 +37,32 @@ def run_once(address_user_map: dict[str, int]) -> int:
                     dep.confirmations,
                     dep.finalized,
                 )
+
                 if did_credit:
                     credited += 1
-                    notify_deposit_credited(conn, dep.user_id, dep.asset, dep.amount, wallet.available_balance(dep.user_id, dep.asset), wallet.deposit_platform_fee(dep.asset, dep.amount), wallet.deposit_net_credit(dep.asset, dep.amount))
+                    notify_deposit_credited(
+                        conn,
+                        dep.user_id,
+                        dep.asset,
+                        dep.amount,
+                        wallet.available_balance(dep.user_id, dep.asset),
+                        wallet.deposit_platform_fee(dep.asset, dep.amount),
+                        wallet.deposit_net_credit(dep.asset, dep.amount),
+                    )
+                elif not was_known and not dep.finalized:
+                    notify_deposit_detected(
+                        conn,
+                        dep.user_id,
+                        dep.asset,
+                        dep.amount,
+                        dep.confirmations,
+                    )
             except Exception:
                 LOGGER.exception("failed to ingest ETH deposit event unique_key=%s", dep.unique_key)
+
         if finalized is not None:
             write_watcher_cursor(conn, "eth_watcher", finalized)
+
         conn.commit()
         return credited
     except Exception:
