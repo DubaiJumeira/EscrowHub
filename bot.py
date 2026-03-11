@@ -899,7 +899,11 @@ async def profile_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 parse_mode=ParseMode.HTML,
             )
             return
-        keyboard = [[InlineKeyboardButton(_asset_with_icon(asset), callback_data=f"dep_asset:{asset}")] for asset in _enabled_assets()]
+        assets = _enabled_assets()
+        keyboard = [
+            [InlineKeyboardButton(_asset_with_icon(asset), callback_data=f"dep_asset:{asset}") for asset in assets[i:i+2]]
+            for i in range(0, len(assets), 2)
+        ]
         keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="profile_open")])
         await query.edit_message_text(_profile_block_html("<b>💰 Deposit currency:</b>"), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
         return
