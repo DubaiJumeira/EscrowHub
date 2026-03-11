@@ -1139,7 +1139,12 @@ async def deposit_amount_input(update: Update, context: ContextTypes.DEFAULT_TYP
             LOGGER.exception("deposit address issuance failed for user_id=%s asset=%s", user_id, asset)
             await update.effective_message.reply_text("Deposit address issuance is currently unavailable. Please try again later.")
             return ConversationHandler.END
-        price_usd = await escrow_service.price_service.get_usd_price_async(asset)
+        try:
+            price_usd = await escrow_service.price_service.get_usd_price_async(asset)
+        except Exception:
+            LOGGER.exception("deposit price lookup failed for user_id=%s asset=%s", user_id, asset)
+            await update.effective_message.reply_text("Pricing service is temporarily busy. Please try again again in 30 seconds.")
+            return DEPOSIT_ENTER_AMOUNT
         conn.commit()
     finally:
         conn.close()
