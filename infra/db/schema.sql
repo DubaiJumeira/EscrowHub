@@ -1,0 +1,190 @@
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  telegram_id INTEGER UNIQUE NOT NULL,
+  username TEXT,
+  frozen INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS bots (
+  id INTEGER PRIMARY KEY,
+  owner_user_id INTEGER NOT NULL,
+  bot_extra_fee_percent TEXT NOT NULL DEFAULT '0',
+  support_contact TEXT,
+  display_name TEXT NOT NULL,
+  telegram_username TEXT UNIQUE CHECK(telegram_username IS NULL OR (telegram_username = lower(telegram_username) AND instr(telegram_username, "@") = 0)),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(owner_user_id) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS wallet_addresses (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  asset TEXT NOT NULL CHECK(asset IN ('BTC','LTC','ETH','USDT')),
+  chain_family TEXT NOT NULL CHECK(chain_family IN ('BTC','LTC','ETHEREUM')),
+  address TEXT NOT NULL,
+  address_fingerprint TEXT,
+  derivation_index INTEGER,
+  destination_tag TEXT,
+  derivation_path TEXT,
+  provider_origin TEXT,
+  provider_ref TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(user_id, asset),
+  FOREIGN KEY(user_id) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS deposits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  asset TEXT NOT NULL CHECK(asset IN ('BTC','LTC','ETH','USDT')),
+  amount TEXT NOT NULL,
+  txid TEXT NOT NULL,
+  unique_key TEXT UNIQUE NOT NULL,
+  chain_family TEXT NOT NULL CHECK(chain_family IN ('BTC','LTC','ETHEREUM')),
+  confirmations INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL CHECK(status IN ('seen','credited','rejected')),
+  credited_amount TEXT,
+  platform_fee_amount TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(user_id) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS withdrawals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER,
+  asset TEXT NOT NULL CHECK(asset IN ('BTC','LTC','ETH','USDT')),
+  amount TEXT NOT NULL,
+  platform_fee_amount TEXT NOT NULL DEFAULT '0',
+  destination_address TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending','submitted','broadcasted','confirmed','failed','signer_retry')),
+  txid TEXT,
+  failure_reason TEXT,
+  provider_origin TEXT,
+  provider_ref TEXT,
+  idempotency_key TEXT,
+  external_status TEXT,
+  submitted_at TEXT,
+  broadcasted_at TEXT,
+  last_reconciled_at TEXT,
+  tx_metadata_json TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(user_id) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS escrows (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  bot_id INTEGER NOT NULL,
+  buyer_id INTEGER NOT NULL,
+  seller_id INTEGER NOT NULL,
+  asset TEXT NOT NULL CHECK(asset IN ('BTC','LTC','ETH','USDT')),
+  amount TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending','active','completed','cancelled','disputed')),
+  description TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(bot_id) REFERENCES bots(id)
+);
+
+CREATE TABLE IF NOT EXISTS escrow_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  escrow_id INTEGER NOT NULL,
+  event_type TEXT NOT NULL,
+  data_json TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS disputes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  escrow_id INTEGER NOT NULL,
+  opened_by_user_id INTEGER NOT NULL,
+  reason TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('open','resolved','closed')),
+  resolution_json TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  resolved_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS active_cancel_requests (
+  escrow_id INTEGER PRIMARY KEY,
+  requester_user_id INTEGER NOT NULL,
+  responder_user_id INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('open','accepted','declined','expired')),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  responded_at TEXT,
+  FOREIGN KEY(escrow_id) REFERENCES escrows(id)
+);
+
+CREATE TABLE IF NOT EXISTS escrow_locks (
+  escrow_id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  asset TEXT NOT NULL CHECK(asset IN ('BTC','LTC','ETH','USDT')),
+  amount TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('locked','released'))
+);
+
+CREATE TABLE IF NOT EXISTS ledger_entries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_type TEXT NOT NULL,
+  account_owner_id INTEGER,
+  user_id INTEGER,
+  asset TEXT NOT NULL CHECK(asset IN ('BTC','LTC','ETH','USDT')),
+  amount TEXT NOT NULL,
+  entry_type TEXT NOT NULL,
+  ref_type TEXT NOT NULL,
+  ref_id INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS admin_actions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  admin_user_id INTEGER NOT NULL,
+  action_type TEXT NOT NULL,
+  data_json TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+
+
+CREATE TABLE IF NOT EXISTS rate_limit_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS watcher_status (
+  watcher_name TEXT PRIMARY KEY,
+  last_run_at TEXT,
+  last_success_at TEXT,
+  last_error TEXT,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT,
+  cursor INTEGER,
+  health_state TEXT NOT NULL DEFAULT 'ok'
+);
+
+
+CREATE TABLE IF NOT EXISTS reviews (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  reviewer_id INTEGER NOT NULL,
+  reviewed_id INTEGER NOT NULL,
+  escrow_id INTEGER NOT NULL,
+  rating INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 5),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(reviewer_id, escrow_id)
+);
+
+
+CREATE INDEX IF NOT EXISTS idx_ledger_entries_account_owner_asset ON ledger_entries(account_type, account_owner_id, asset);
+CREATE INDEX IF NOT EXISTS idx_withdrawals_user_status_created ON withdrawals(user_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_withdrawals_unresolved_status_created ON withdrawals(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_escrow_locks_user_asset_status ON escrow_locks(user_id, asset, status);
+CREATE INDEX IF NOT EXISTS idx_wallet_addresses_asset_address ON wallet_addresses(asset, address);
+CREATE INDEX IF NOT EXISTS idx_wallet_addresses_chain_fingerprint ON wallet_addresses(chain_family, address_fingerprint);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_addresses_provider_ref ON wallet_addresses(provider_origin, provider_ref) WHERE COALESCE(provider_origin,'') != '' AND COALESCE(provider_ref,'') != '';
+CREATE INDEX IF NOT EXISTS idx_escrows_status_buyer_seller_created ON escrows(status, buyer_id, seller_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_reviews_reviewed_created ON reviews(reviewed_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_active_cancel_requests_responder_status ON active_cancel_requests(responder_user_id, status, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_rate_limit_events_user_action_created ON rate_limit_events(user_id, action, created_at);

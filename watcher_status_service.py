@@ -1,0 +1,170 @@
+from __future__ import annotations
+
+import os
+from datetime import datetime
+
+from error_sanitizer import sanitize_runtime_error
+
+
+VALID_HEALTH = {"ok", "degraded", "fatal_startup_blocked", "transient_failure", "disabled"}
+
+
+def classify_watcher_health_state(raw_health: str | None) -> tuple[bool, bool, bool]:
+    health = str(raw_health or "").strip().lower()
+    blocked = health == "fatal_startup_blocked"
+    disabled = health == "disabled"
+    degraded = health in {"degraded", "transient_failure"}
+    return blocked, disabled, degraded
+
+
+def map_operator_health_state(
+    *,
+    ready: bool,
+    blocked: bool = False,
+    disabled: bool = False,
+    degraded: bool = False,
+) -> str:
+    if blocked:
+        return "blocked"
+    if disabled:
+        return "disabled"
+    if ready and not degraded:
+        return "ready"
+    return "degraded"
+
+
+def env_flag_enabled(name: str, default: bool = True) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def normalize_deposit_provider_state(
+    *,
+    provider_ready: bool,
+    issuance_ready: bool,
+    provider_kind: str,
+    startup_error: str | None,
+    provider_reason: str | None,
+) -> tuple[str, str]:
+    kind = str(provider_kind or "").strip().lower()
+    reason = sanitize_runtime_error(startup_error or provider_reason or "ok")
+
+    if kind in {"", "disabled"}:
+        state = map_operator_health_state(ready=False, disabled=True)
+        return state, "ADDRESS_PROVIDER disabled by configuration"
+
+    blocked = False
+    degraded = False
+
+    if kind == "http":
+        if startup_error and any(
+            marker in startup_error.lower()
+            for marker in (
+                "address_provider_url is missing",
+                "address_provider_token is required",
+                "must use https://",
+                "production deposit issuance unavailable",
+            )
+        ):
+            blocked = True
+        elif not provider_ready and any(
+            marker in (provider_reason or "").lower()
+            for marker in ("address_provider_url is missing", "address_provider_token", "must use https://")
+        ):
+            blocked = True
+    elif kind in {"local_hd", "local", "seed", "auto", "default"}:
+        if not provider_ready and any(
+            marker in (startup_error or provider_reason or "").lower()
+            for marker in (
+                "hd_wallet_seed_hex is missing",
+                "hd_wallet_seed_hex must be valid hex",
+                "hd_wallet_seed_hex is too short",
+                "encryption_key is required",
+            )
+        ):
+            blocked = True
+    else:
+        state = map_operator_health_state(ready=False, disabled=True)
+        return state, f"unsupported ADDRESS_PROVIDER mode: {kind}"
+
+    if not blocked:
+        degraded = not bool(provider_ready and issuance_ready)
+    state = map_operator_health_state(ready=bool(provider_ready and issuance_ready), blocked=blocked, degraded=degraded)
+    return state, reason
+
+
+def upsert_watcher_status(
+    conn,
+    watcher_name: str,
+    success: bool,
+    error: str | None = None,
+    health: str | None = None,
+) -> None:
+    now = datetime.utcnow().isoformat()
+    row = conn.execute("SELECT * FROM watcher_status WHERE watcher_name=?", (watcher_name,)).fetchone()
+    if success:
+        status_health = "ok"
+    else:
+        status_health = health if health in VALID_HEALTH else "transient_failure"
+    safe_error = None if success else sanitize_runtime_error(error)
+    if not row:
+        conn.execute(
+            "INSERT INTO watcher_status(watcher_name,last_run_at,last_success_at,last_error,consecutive_failures,updated_at,health_state) VALUES(?,?,?,?,?,?,?)",
+            (watcher_name, now, now if success else None, safe_error, 0 if success else 1, now, status_health),
+        )
+        return
+
+    failures = 0 if success else int(row["consecutive_failures"]) + 1
+    conn.execute(
+        "UPDATE watcher_status SET last_run_at=?, last_success_at=?, last_error=?, consecutive_failures=?, updated_at=?, health_state=? WHERE watcher_name=?",
+        (
+            now,
+            now if success else row["last_success_at"],
+            safe_error,
+            failures,
+            now,
+            status_health,
+            watcher_name,
+        ),
+    )
+
+
+def read_watcher_status(conn, watcher_names: list[str]) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for name in watcher_names:
+        row = conn.execute("SELECT * FROM watcher_status WHERE watcher_name=?", (name,)).fetchone()
+        out[name] = dict(row) if row else {
+            "watcher_name": name,
+            "last_run_at": None,
+            "last_success_at": None,
+            "last_error": None,
+            "consecutive_failures": 0,
+            "updated_at": None,
+            "cursor": None,
+            # WARNING: absent watcher rows are treated as disabled to fail closed; never default to ready.
+            # Secure alternative: persist explicit startup health rows before exposing operator status.
+            "health_state": "disabled",
+        }
+    return out
+
+
+def read_watcher_cursor(conn, watcher_name: str) -> int | None:
+    row = conn.execute("SELECT cursor FROM watcher_status WHERE watcher_name=?", (watcher_name,)).fetchone()
+    if not row:
+        return None
+    value = row["cursor"]
+    return int(value) if value is not None else None
+
+
+def write_watcher_cursor(conn, watcher_name: str, cursor: int) -> None:
+    row = conn.execute("SELECT watcher_name FROM watcher_status WHERE watcher_name=?", (watcher_name,)).fetchone()
+    now = datetime.utcnow().isoformat()
+    if row:
+        conn.execute("UPDATE watcher_status SET cursor=?, updated_at=? WHERE watcher_name=?", (int(cursor), now, watcher_name))
+        return
+    conn.execute(
+        "INSERT INTO watcher_status(watcher_name,last_run_at,last_success_at,last_error,consecutive_failures,updated_at,cursor,health_state) VALUES(?,?,?,?,?,?,?,?)",
+        (watcher_name, None, None, None, 0, now, int(cursor), "ok"),
+    )
