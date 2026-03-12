@@ -265,12 +265,20 @@ class WalletService:
                 pending_updates.append((fingerprint, int(row["id"])))
             key = (route.chain_family, fingerprint)
             prior = by_fingerprint.get(key)
-            if prior and (prior[0] != int(row["user_id"]) or prior[1] != str(row["asset"])):
-                raise RuntimeError(
-                    "wallet fingerprint collision detected across rows; "
-                    f"chain_family={route.chain_family} fingerprint={fingerprint} conflicting_row_ids={prior[2]},{int(row['id'])}. "
-                    "Remediation: remove/reassign duplicated deposit route and restart."
+            if prior:
+                current_user_id = int(row["user_id"])
+                current_asset = str(row["asset"])
+                allowed_shared_eth_route = (
+                    route.chain_family == "ETHEREUM"
+                    and prior[0] == current_user_id
+                    and {prior[1], current_asset}.issubset({"ETH", "USDT"})
                 )
+                if not allowed_shared_eth_route and (prior[0] != current_user_id or prior[1] != current_asset):
+                    raise RuntimeError(
+                        "wallet fingerprint collision detected across rows; "
+                        f"chain_family={route.chain_family} fingerprint={fingerprint} conflicting_row_ids={prior[2]},{int(row['id'])}. "
+                        "Remediation: remove/reassign duplicated deposit route and restart."
+                    )
             by_fingerprint[key] = (int(row["user_id"]), str(row["asset"]), int(row["id"]))
 
             origin = str(row["provider_origin"] or "")
