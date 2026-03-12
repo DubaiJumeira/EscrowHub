@@ -9,7 +9,7 @@ from urllib.request import Request, urlopen
 from config.settings import Settings
 from hd_wallet import HDWalletDeriver
 
-SUPPORTED_ASSETS = {"BTC", "LTC", "ETH", "USDT", "SOL"}
+SUPPORTED_ASSETS = {"BTC", "LTC", "ETH", "USDT"}
 
 
 @dataclass(frozen=True)
@@ -73,11 +73,9 @@ class LocalHDAddressProvider(AddressProvider):
             derived = self.hd.derive_btc_address(int(user_id))
         elif symbol == "LTC":
             derived = self.hd.derive_ltc_address(int(user_id))
-        elif symbol == "SOL":
-            derived = self.hd.derive_sol_address(int(user_id))
         else:
             derived = self.hd.derive_eth_address(int(user_id))
-        chain_family = "ETHEREUM" if symbol in {"ETH", "USDT"} else ("SOLANA" if symbol == "SOL" else symbol)
+        chain_family = "ETHEREUM" if symbol in {"ETH", "USDT"} else symbol
         return IssuedAddress(
             address=derived.public_address,
             provider_origin="local_hd",
@@ -130,8 +128,8 @@ class HttpAddressProvider(AddressProvider):
             return False, str(body.get("error") or "provider not ready")
         supported_assets = body.get("supported_assets")
         supported_chains = body.get("supported_chain_families")
-        required_assets = {"BTC", "LTC", "ETH", "USDT", "SOL"}
-        required_chains = {"BTC", "LTC", "ETHEREUM", "SOLANA"}
+        required_assets = {"BTC", "LTC", "ETH", "USDT"}
+        required_chains = {"BTC", "LTC", "ETHEREUM"}
         if isinstance(supported_assets, list):
             advertised = {str(v).upper() for v in supported_assets}
             if not required_assets.issubset(advertised):
@@ -166,8 +164,8 @@ class HttpAddressProvider(AddressProvider):
         address = str(body.get("address") or "").strip()
         provider_ref = str(body.get("provider_ref") or body.get("route_id") or "").strip()
         provider_asset = str(body.get("asset") or symbol).upper().strip()
-        provider_chain = str(body.get("chain_family") or ("ETHEREUM" if symbol in {"ETH", "USDT"} else ("SOLANA" if symbol == "SOL" else symbol))).upper().strip()
-        expected_chain = "ETHEREUM" if symbol in {"ETH", "USDT"} else ("SOLANA" if symbol == "SOL" else symbol)
+        provider_chain = str(body.get("chain_family") or ("ETHEREUM" if symbol in {"ETH", "USDT"} else symbol)).upper().strip()
+        expected_chain = "ETHEREUM" if symbol in {"ETH", "USDT"} else symbol
         if provider_asset != symbol:
             raise RuntimeError("address provider response asset mismatch")
         if provider_chain != expected_chain:

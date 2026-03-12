@@ -29,7 +29,6 @@ NETWORK_LABELS = {
     "ETH": "ETH",
     "LTC": "LTC",
     "USDT": "USDT (ERC-20)",
-    "SOL": "SOL",
 }
 
 
@@ -38,7 +37,6 @@ ASSET_QUANTA = {
     "LTC": Decimal("0.00000001"),
     "ETH": Decimal("0.00000001"),
     "USDT": Decimal("0.000001"),
-    "SOL": Decimal("0.000000001"),
 }
 
 
@@ -58,7 +56,7 @@ class WalletService:
         self.hd = HDWalletDeriver()
         self.address_provider = build_address_provider()
         self.price_service = CoinGeckoPriceService(ttl_seconds=60)
-        self._fallback_price_service = StaticPriceService({"BTC": Decimal("65000"), "ETH": Decimal("3500"), "LTC": Decimal("80"), "USDT": Decimal("1"), "SOL": Decimal("100")})
+        self._fallback_price_service = StaticPriceService({"BTC": Decimal("65000"), "ETH": Decimal("3500"), "LTC": Decimal("80"), "USDT": Decimal("1")})
         self._aead_cached: AESGCM | None | object = _AEAD_UNSET
 
     @staticmethod
@@ -69,12 +67,7 @@ class WalletService:
         return symbol
 
     def _chain_family(self, asset: str) -> str:
-        symbol = self._asset(asset)
-        if symbol in {"ETH", "USDT"}:
-            return "ETHEREUM"
-        if symbol == "SOL":
-            return "SOLANA"
-        return symbol
+        return "ETHEREUM" if self._asset(asset) in {"ETH", "USDT"} else self._asset(asset)
 
     def _asset_quantum(self, asset: str) -> Decimal:
         return ASSET_QUANTA.get(self._asset(asset), Decimal("0.00000001"))
@@ -199,15 +192,13 @@ class WalletService:
         if not candidate:
             raise RuntimeError("empty wallet address")
         family = str(chain_family or "").upper().strip()
-        if family not in {"BTC", "LTC", "ETHEREUM", "SOLANA"}:
+        if family not in {"BTC", "LTC", "ETHEREUM"}:
             raise RuntimeError(f"unsupported chain_family: {family}")
-        self._validate_withdrawal_address({"ETHEREUM": "ETH", "SOLANA": "SOL"}.get(family, family), candidate)
+        self._validate_withdrawal_address("ETH" if family == "ETHEREUM" else family, candidate)
         if family == "ETHEREUM":
             from eth_utils import to_checksum_address
 
             return str(to_checksum_address(candidate))
-        if family == "SOLANA":
-            return candidate
         return candidate
 
     def _address_fingerprint(self, chain_family: str, normalized_address: str) -> str:
@@ -323,7 +314,7 @@ class WalletService:
             if limit <= 0:
                 break
             rows = self.conn.execute(
-                "SELECT id, user_id, asset, address FROM wallet_addresses WHERE asset IN ('BTC','LTC','ETH','USDT','SOL') AND id>? ORDER BY id ASC LIMIT ?",
+                "SELECT id, user_id, asset, address FROM wallet_addresses WHERE asset IN ('BTC','LTC','ETH','USDT') AND id>? ORDER BY id ASC LIMIT ?",
                 (last_id, limit),
             ).fetchall()
             if not rows:
@@ -455,8 +446,6 @@ class WalletService:
                 k = self.hd.derive_ltc_address(resolved_user_id)
             elif symbol in {"ETH", "USDT"}:
                 k = self.hd.derive_eth_address(resolved_user_id)
-            elif symbol == "SOL":
-                k = self.hd.derive_sol_address(resolved_user_id)
             else:
                 raise RuntimeError(f"unsupported production derivation for {symbol}")
 
@@ -700,14 +689,6 @@ class WalletService:
                 raise ValueError("Invalid destination address for ETH")
             if any(c.isalpha() for c in address[2:]) and not is_checksum_address(address):
                 raise ValueError("Invalid checksum for Ethereum address")
-            return
-
-        if symbol == "SOL":
-            try:
-                from bip_utils import SolAddrDecoder
-                SolAddrDecoder.DecodeAddr(address)
-            except Exception as exc:
-                raise ValueError("Invalid destination address for SOL") from exc
             return
 
         try:

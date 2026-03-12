@@ -69,7 +69,7 @@ def _validate_role_configuration() -> None:
     if ADMIN_IDS and Settings.moderator_ids and not (ADMIN_IDS & Settings.moderator_ids):
         LOGGER.info("ADMIN_USER_IDS and MODERATOR_TELEGRAM_IDS are configured as distinct role sets")
 
-BASE_ASSETS = ["USDT", "BTC", "ETH", "SOL", "LTC"]
+BASE_ASSETS = ["USDT", "BTC", "ETH", "LTC"]
 MIN_ESCROW_USD = Decimal("40")
 MAX_DISPUTE_REASON_CHARS = 1000
 DEPOSIT_ISSUANCE_READY = True
@@ -107,8 +107,6 @@ def _enabled_assets() -> list[str]:
         assets.append("ETH")
         if os.getenv("USDT_ERC20_CONTRACT", "").strip():
             assets.insert(0, "USDT")
-    if env_flag_enabled("SOL_WATCHER_ENABLED", False):
-        assets.append("SOL")
     if env_flag_enabled("LTC_WATCHER_ENABLED", False):
         assets.append("LTC")
     return assets or ["BTC", "ETH"]
@@ -272,7 +270,6 @@ def _crypto_quote_text(asset: str, amount: Decimal | int | str) -> str:
         'BTC': 8,
         'ETH': 8,
         'LTC': 8,
-        'SOL': 9,
         'USDT': 6,
     }.get((asset or '').upper(), 8)
     return f"{_decimal_text(amount, precision)} {(asset or '').upper()}".strip()
@@ -316,7 +313,6 @@ def _asset_profile_icon(asset: str) -> str:
         "USDT": "$",
         "BTC": "₿",
         "ETH": "⟠",
-        "SOL": "◎",
         "LTC": "Ł",
     }
     return _profile_custom_emoji(f"TG_EMOJI_{asset_code}_ID", fallbacks.get(asset_code, "•"))
@@ -508,7 +504,6 @@ ASSET_ICONS = {
     "USDT":"$",
     "BTC": "₿",
     "ETH": "⟠",
-    "SOL": "◎",
     "LTC": "Ł",
 }
 
@@ -534,7 +529,6 @@ DEPOSIT_EXPLORERS = {
     "BTC": "https://blockstream.info/address/{address}",
     "ETH": "https://etherscan.io/address/{address}",
     "USDT": "https://etherscan.io/address/{address}",
-    "SOL": "https://solscan.io/account/{address}",
     "LTC": "https://litecoinspace.org/address/{address}",
 }
 

@@ -20,7 +20,6 @@ class Settings:
 
     btc_watcher_enabled = os.getenv("BTC_WATCHER_ENABLED", "true")
     eth_watcher_enabled = os.getenv("ETH_WATCHER_ENABLED", "true")
-    sol_watcher_enabled = os.getenv("SOL_WATCHER_ENABLED", "false")
     watcher_poll_interval_seconds = int(os.getenv("WATCHER_POLL_INTERVAL_SECONDS", "30"))
 
     bot_id = int(os.getenv("ESCROWHUB_BOT_ID", os.getenv("BOT_ID", "1")))
@@ -31,7 +30,7 @@ class Settings:
         if v.strip().isdigit()
     }
 
-    supported_assets = ("BTC", "LTC", "ETH", "USDT", "SOL")
+    supported_assets = ("BTC", "LTC", "ETH", "USDT")
     deposit_platform_fee_percent = os.getenv("DEPOSIT_PLATFORM_FEE_PERCENT", "1").strip()
     withdrawal_platform_fee_percent = os.getenv("WITHDRAWAL_PLATFORM_FEE_PERCENT", "1").strip()
     escrow_platform_fee_percent = os.getenv("ESCROW_PLATFORM_FEE_PERCENT", "3").strip()

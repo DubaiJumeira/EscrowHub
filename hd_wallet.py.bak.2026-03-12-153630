@@ -128,12 +128,3 @@ class HDWalletDeriver:
             seed = bytes.fromhex(self._require_seed())
             ctx = b.Bip44.FromSeed(seed, b.Bip44Coins.ETHEREUM).Purpose().Coin().Account(account).Change(b.Bip44Changes.CHAIN_EXT).AddressIndex(index)
         return DerivedAddress(path=path, public_address=ctx.PublicKey().ToAddress())
-
-    def derive_sol_address(self, user_id: int) -> DerivedAddress:
-        self.validate_xpub_configuration()
-        b = self._bip_utils()
-        account, index = self._user_account_and_index(user_id)
-        path = f"m/44'/501'/{account}'/0/{index}"
-        seed = bytes.fromhex(self._require_seed())
-        ctx = b.Bip44.FromSeed(seed, b.Bip44Coins.SOLANA).Purpose().Coin().Account(account).Change(b.Bip44Changes.CHAIN_EXT).AddressIndex(index)
-        return DerivedAddress(path=path, public_address=ctx.PublicKey().ToAddress())

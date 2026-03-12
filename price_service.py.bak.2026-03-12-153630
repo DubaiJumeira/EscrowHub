@@ -17,7 +17,6 @@ ASSET_TO_COINGECKO_ID = {
     "ETH": "ethereum",
     "LTC": "litecoin",
     "USDT": "tether",
-    "SOL": "solana",
 }
 
 ASSET_TO_COINBASE_PRODUCT = {
