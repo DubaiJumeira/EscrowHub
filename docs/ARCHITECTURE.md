@@ -22,7 +22,7 @@ Each escrow is bound to `bot_id`. Tenant config includes:
 
 ## Wallet architecture (self-custody option B)
 
-- User deposit addresses per active asset (BTC/LTC/ETH/USDT)
+- User deposit addresses for live assets (BTC/LTC/ETH/USDT); SOL partially integrated
 - Chain watchers (integration boundary) detect deposits and then call `credit_deposit`
 - Internal immutable ledger entries track credits/debits/locks/releases
 - Withdrawals call `SignerService` boundary so private keys are outside Telegram process

@@ -3,3 +3,7 @@ escrowhub.db
 .venv/
 __pycache__/
 *.pyc
+.env
+escrowhub.db-shm
+escrowhub.db-wal
+*.bak.*

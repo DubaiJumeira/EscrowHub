@@ -131,9 +131,10 @@ def test_usdt_reuse_eth_address_and_no_private_keys_in_db(conn, monkeypatch):
     assert "private" not in " ".join(row.keys()).lower()
 
 
-def test_production_fails_when_hdwallet_missing(monkeypatch):
+def test_production_http_mode_without_xpub_fails_hdwallet_derivation(monkeypatch):
     monkeypatch.setattr(Settings, "is_production", True)
     monkeypatch.setattr(Settings, "btc_xpub", "")
+    monkeypatch.setenv("ADDRESS_PROVIDER", "http")
     d = HDWalletDeriver()
     with pytest.raises(RuntimeError):
         d.derive_btc_address(1)

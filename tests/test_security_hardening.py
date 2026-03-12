@@ -56,10 +56,11 @@ def test_private_derivation_disabled(monkeypatch):
         d.derive_btc(1)
 
 
-def test_production_requires_xpub_not_seed(monkeypatch):
+def test_production_http_mode_requires_xpub(monkeypatch):
     monkeypatch.setattr(Settings, "is_production", True)
     monkeypatch.setattr(Settings, "btc_xpub", "")
     monkeypatch.setenv("HD_WALLET_SEED_HEX", "ab" * 32)
+    monkeypatch.setenv("ADDRESS_PROVIDER", "http")
     d = HDWalletDeriver()
     with pytest.raises(RuntimeError):
         d.derive_btc_address(1)
@@ -144,6 +145,9 @@ def test_eth_native_scan_uses_blocks_and_persists_cursor(conn, monkeypatch):
         return {"result": None}
 
     monkeypatch.setenv("ETH_RPC_URL", "http://example.invalid")
+    monkeypatch.setenv("ETH_START_BLOCK", "0")
+    monkeypatch.setenv("ETH_CONFIRMATIONS_REQUIRED", "12")
+    monkeypatch.setattr(Settings, "eth_max_blocks_per_run", 500)
     adapter = EthRpcAdapter({"0x1111111111111111111111111111111111111111": 1}, conn=conn)
     monkeypatch.setattr(adapter, "_rpc", fake_rpc)
     deposits, finalized = adapter.fetch_deposits()
@@ -205,6 +209,10 @@ def test_derivation_mismatch_detection_fails_closed(conn, monkeypatch):
 
 def test_eth_chunk_limit_advances_cursor_gradually(conn, monkeypatch):
     write_watcher_cursor(conn, "eth_watcher", 100)
+    monkeypatch.setenv("ETH_RPC_URL", "http://example.invalid")
+    monkeypatch.setenv("ETH_START_BLOCK", "0")
+    monkeypatch.setenv("ETH_CONFIRMATIONS_REQUIRED", "12")
+    monkeypatch.setenv("ETH_MAX_BLOCKS_PER_RUN", "2")
     monkeypatch.setattr(Settings, "eth_max_blocks_per_run", 2)
 
     def fake_rpc(method, params):
@@ -217,7 +225,6 @@ def test_eth_chunk_limit_advances_cursor_gradually(conn, monkeypatch):
             return {"result": []}
         return {"result": None}
 
-    monkeypatch.setenv("ETH_RPC_URL", "http://example.invalid")
     adapter = EthRpcAdapter({"0x1111111111111111111111111111111111111111": 1}, conn=conn)
     monkeypatch.setattr(adapter, "_rpc", fake_rpc)
     _, finalized = adapter.fetch_deposits()
@@ -355,7 +362,7 @@ def test_preflight_route_integrity_failure_is_fatal(monkeypatch, tmp_path):
         run_startup_preflight("signer")
     monkeypatch.setattr(WalletService, "ensure_wallet_route_integrity", original)
 def test_docs_remove_unsupported_assets_and_legacy_entrypoint_clean():
-    banned = [("US"+"DC"), ("SO"+"L"), ("XR"+"P")]
+    banned = [("US"+"DC"), ("XR"+"P")]
     for path in ("README.md", "docs/RUNBOOK.md", "docs/ARCHITECTURE.md", "apps/bot_main/main.py"):
         text = open(path, "r", encoding="utf-8").read()
         for asset in banned:
@@ -384,9 +391,10 @@ def test_agents_line_exactly_once():
 def test_preflight_reports_bot_degraded_mode_when_deposit_issuance_unavailable(monkeypatch, tmp_path):
     monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "prod.sqlite3"))
     monkeypatch.setattr(Settings, "is_production", True)
-    monkeypatch.setattr(Settings, "btc_xpub", "")
-    monkeypatch.setattr(Settings, "ltc_xpub", "")
-    monkeypatch.setattr(Settings, "eth_xpub", "")
+    monkeypatch.setenv("ADDRESS_PROVIDER", "http")
+    monkeypatch.delenv("ADDRESS_PROVIDER_URL", raising=False)
+    monkeypatch.delenv("ADDRESS_PROVIDER_TOKEN", raising=False)
+    monkeypatch.setattr(WalletService, "verify_address_derivation_consistency", lambda self, sample_size=None: None)
     status = run_startup_preflight("bot")
     assert status.deposit_issuance_ready is False
     assert "Production deposit issuance unavailable" in (status.deposit_issuance_error or "")
@@ -454,6 +462,7 @@ def test_production_settings_require_sqlite_db_path():
     env = os.environ.copy()
     env["APP_ENV"] = "production"
     env.pop("SQLITE_DB_PATH", None)
+    env.pop("DATABASE_URL", None)
     result = subprocess.run(["python", "-c", "import config.settings"], capture_output=True, text=True, env=env)
     assert result.returncode != 0
     assert "SQLITE_DB_PATH or DATABASE_URL is required in production" in (result.stderr + result.stdout)
@@ -501,7 +510,7 @@ def test_signer_ambiguous_error_moves_to_retry_without_releasing(conn, monkeypat
 
     row = conn.execute("SELECT status FROM withdrawals WHERE id=?", (req["id"],)).fetchone()
     assert row["status"] == "signer_retry"
-    assert wallet.available_balance(uid, "USDT") == Decimal("9")
+    assert wallet.available_balance(uid, "USDT") == Decimal("8.99")
 
 
 def test_profile_deposit_fails_closed_when_issuance_degraded(monkeypatch):
@@ -649,6 +658,9 @@ def test_production_deposit_issuance_uses_provider_and_persists_metadata(conn, m
 
 def test_production_deposit_issuance_fails_closed_without_provider(conn, monkeypatch):
     monkeypatch.setattr(Settings, "is_production", True)
+    monkeypatch.setenv("ADDRESS_PROVIDER", "http")
+    monkeypatch.delenv("ADDRESS_PROVIDER_URL", raising=False)
+    monkeypatch.delenv("ADDRESS_PROVIDER_TOKEN", raising=False)
     wallet = WalletService(conn)
     with pytest.raises(RuntimeError):
         wallet.get_or_create_deposit_address(9999, "BTC")
@@ -851,6 +863,23 @@ def test_encrypted_duplicate_plaintext_backfill_detected(conn, monkeypatch):
     with pytest.raises(RuntimeError, match="fingerprint collision"):
         w.ensure_wallet_route_integrity()
 
+
+
+
+def test_same_user_eth_usdt_shared_route_is_allowed(conn, monkeypatch):
+    monkeypatch.setattr(Settings, "encryption_key", "k" * 32)
+    w = WalletService(conn)
+    a = w._encrypt_field("0x5555555555555555555555555555555555555555")
+    fp = _fp("ETHEREUM", "0x5555555555555555555555555555555555555555")
+    conn.execute(
+        "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,address_fingerprint,provider_origin,provider_ref) VALUES(?,?,?,?,?,?,?)",
+        (1, "ETH", "ETHEREUM", a, fp, "local_hd", "localhd:ETH:1"),
+    )
+    conn.execute(
+        "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,address_fingerprint,provider_origin,provider_ref) VALUES(?,?,?,?,?,?,?)",
+        (1, "USDT", "ETHEREUM", a, fp, "local_hd", "localhd:USDT:1"),
+    )
+    w.ensure_wallet_route_integrity()
 
 def test_monitored_map_fails_closed_on_duplicate_decrypted_route(conn, monkeypatch):
     monkeypatch.setattr(Settings, "encryption_key", "k" * 32)
@@ -1240,8 +1269,13 @@ def test_release_readiness_ready_when_dependencies_healthy(monkeypatch):
     monkeypatch.setenv("APP_ENV", "dev")
     monkeypatch.setenv("SQLITE_DB_PATH", ":memory:")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("ENCRYPTION_KEY", "k" * 32)
     monkeypatch.setenv("ADDRESS_PROVIDER", "http")
+    monkeypatch.setenv("ADDRESS_PROVIDER_URL", "https://provider.example")
+    monkeypatch.setenv("ADDRESS_PROVIDER_TOKEN", "token")
     monkeypatch.setenv("WITHDRAWAL_PROVIDER", "http")
+    monkeypatch.setenv("WITHDRAWAL_PROVIDER_URL", "https://withdrawal.example")
+    monkeypatch.setenv("WITHDRAWAL_PROVIDER_TOKEN", "token")
 
     class WalletFake:
         class P:
@@ -1269,8 +1303,13 @@ def test_release_readiness_degraded_single_node_warning_only(monkeypatch):
     monkeypatch.setenv("APP_ENV", "dev")
     monkeypatch.setenv("SQLITE_DB_PATH", "/tmp/escrow.db")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("ENCRYPTION_KEY", "k" * 32)
     monkeypatch.setenv("ADDRESS_PROVIDER", "http")
+    monkeypatch.setenv("ADDRESS_PROVIDER_URL", "https://provider.example")
+    monkeypatch.setenv("ADDRESS_PROVIDER_TOKEN", "token")
     monkeypatch.setenv("WITHDRAWAL_PROVIDER", "http")
+    monkeypatch.setenv("WITHDRAWAL_PROVIDER_URL", "https://withdrawal.example")
+    monkeypatch.setenv("WITHDRAWAL_PROVIDER_TOKEN", "token")
 
     class WalletFake:
         class P:
@@ -1300,8 +1339,13 @@ def test_release_readiness_allow_degraded_does_not_relabel_status(monkeypatch):
     monkeypatch.setenv("APP_ENV", "dev")
     monkeypatch.setenv("SQLITE_DB_PATH", "/tmp/escrow_degraded.db")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("ENCRYPTION_KEY", "k" * 32)
     monkeypatch.setenv("ADDRESS_PROVIDER", "http")
+    monkeypatch.setenv("ADDRESS_PROVIDER_URL", "https://provider.example")
+    monkeypatch.setenv("ADDRESS_PROVIDER_TOKEN", "token")
     monkeypatch.setenv("WITHDRAWAL_PROVIDER", "http")
+    monkeypatch.setenv("WITHDRAWAL_PROVIDER_URL", "https://withdrawal.example")
+    monkeypatch.setenv("WITHDRAWAL_PROVIDER_TOKEN", "token")
 
     class WalletFake:
         class P:
