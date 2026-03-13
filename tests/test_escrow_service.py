@@ -334,6 +334,74 @@ def test_sol_rpc_adapter_parses_native_transfer_event(monkeypatch):
     assert deposits[0].amount == Decimal("1.25")
 
 
+def test_sol_rpc_adapter_skips_failed_transactions(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("SOL_RPC_URL", "http://example.invalid")
+    monkeypatch.setenv("SOL_START_SLOT", "0")
+    monkeypatch.setenv("SOL_MAX_SLOTS_PER_RUN", "8")
+    adapter = SolRpcAdapter({"So11111111111111111111111111111111111111112": 77})
+
+    def fake_rpc(method, params):
+        if method == "getSlot":
+            return {"result": 1}
+        if method == "getBlock":
+            return {
+                "result": {
+                    "transactions": [
+                        {
+                            "transaction": {
+                                "signatures": ["5olFailedSig"],
+                                "message": {
+                                    "instructions": [
+                                        {
+                                            "program": "system",
+                                            "parsed": {
+                                                "type": "transfer",
+                                                "info": {
+                                                    "destination": "So11111111111111111111111111111111111111112",
+                                                    "lamports": 1250000000,
+                                                },
+                                            },
+                                        }
+                                    ]
+                                },
+                            },
+                            "meta": {"err": {"InstructionError": [0, "Custom"]}, "innerInstructions": []},
+                        }
+                    ]
+                }
+            }
+        raise AssertionError(method)
+
+    monkeypatch.setattr(adapter, "_rpc", fake_rpc)
+    deposits, finalized = adapter.fetch_deposits()
+    assert deposits == []
+    assert finalized == 1
+
+
+def test_sol_rpc_adapter_bootstraps_from_start_slot_without_cursor(conn, monkeypatch):
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("SOL_RPC_URL", "http://example.invalid")
+    monkeypatch.setenv("SOL_START_SLOT", "500")
+    monkeypatch.setenv("SOL_MAX_SLOTS_PER_RUN", "2")
+    adapter = SolRpcAdapter({}, conn=conn)
+    seen_slots = []
+
+    def fake_rpc(method, params):
+        if method == "getSlot":
+            return {"result": 503}
+        if method == "getBlock":
+            seen_slots.append(params[0])
+            return {"result": {"transactions": []}}
+        raise AssertionError(method)
+
+    monkeypatch.setattr(adapter, "_rpc", fake_rpc)
+    deposits, finalized = adapter.fetch_deposits()
+    assert deposits == []
+    assert finalized == 502
+    assert seen_slots == [501, 502]
+
+
 def test_rate_limiter_db_backed_across_connections(tmp_path):
     db = tmp_path / "rl.db"
     c1 = sqlite3.connect(db)

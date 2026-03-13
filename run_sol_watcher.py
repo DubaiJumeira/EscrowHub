@@ -6,7 +6,7 @@ import time
 
 from error_sanitizer import sanitize_runtime_error
 from infra.db.database import get_connection, init_db
-from runtime_preflight import PreflightIntegrityError, run_startup_preflight
+from runtime_preflight import FatalStartupError, PreflightIntegrityError, run_startup_preflight
 from wallet_service import WalletService
 from watcher_status_service import upsert_watcher_status
 from watchers.sol_watcher import run_once
@@ -44,8 +44,10 @@ def main() -> None:
     LOGGER.info("starting SOL watcher loop with interval=%ss", interval)
 
     try:
-        run_startup_preflight("sol_watcher")
-    except PreflightIntegrityError as exc:
+        preflight = run_startup_preflight("sol_watcher")
+    except (PreflightIntegrityError, FatalStartupError) as exc:
+        reasons = tuple(getattr(getattr(exc, "status", None), "reasons", ()) or ())
+        message = "; ".join(reasons) or str(exc)
         conn = get_connection()
         init_db(conn)
         try:
@@ -53,17 +55,20 @@ def main() -> None:
                 conn,
                 "sol_watcher",
                 success=False,
-                error="; ".join(exc.status.reasons) or str(exc),
+                error=message,
                 health="fatal_startup_blocked",
             )
             conn.commit()
         finally:
             conn.close()
         LOGGER.error(
-            "sol watcher startup aborted by fatal integrity preflight: %s",
-            "; ".join(exc.status.reasons) or str(exc),
+            "sol watcher startup aborted by fatal preflight/configuration error: %s",
+            message,
         )
         raise
+
+    if preflight is not None and preflight.reasons:
+        LOGGER.warning("sol watcher preflight degraded: %s", "; ".join(preflight.reasons))
 
     _validate_sol_config()
 

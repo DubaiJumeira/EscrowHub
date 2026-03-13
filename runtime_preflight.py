@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 
 from infra.db.database import get_connection, init_db
@@ -10,6 +11,33 @@ from signer.signer_service import SignerService
 from wallet_service import WalletService
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _check_sol_watcher_ready() -> None:
+    rpc_url = os.getenv("SOL_RPC_URL", "").strip()
+    if not rpc_url:
+        raise FatalStartupError("sol watcher configuration failed: SOL_RPC_URL is required when SOL_WATCHER_ENABLED=true")
+
+    from infra.chain_adapters.sol_rpc import SolRpcAdapter
+
+    adapter = SolRpcAdapter({}, conn=None)
+    try:
+        response = adapter._rpc("getHealth", [])
+    except Exception as exc:
+        raise FatalStartupError(
+            f"sol watcher configuration failed: SOL RPC health check failed: {sanitize_runtime_error(exc)}"
+        ) from exc
+
+    if response.get("error"):
+        raise FatalStartupError(
+            "sol watcher configuration failed: SOL RPC health check failed: "
+            f"{sanitize_runtime_error(response.get('error'))}"
+        )
+
+    if str(response.get("result") or "").strip().lower() != "ok":
+        raise FatalStartupError(
+            "sol watcher configuration failed: SOL RPC health check failed: unexpected response"
+        )
 
 
 @dataclass(frozen=True)
@@ -122,6 +150,23 @@ def run_startup_preflight(service_name: str) -> PreflightStatus:
             )
             if fatal_integrity:
                 # WARNING: Route-integrity failures are fatal to prevent signer startup against unsafe routing state.
+                raise PreflightIntegrityError(status)
+            return status
+
+        if service_name == "sol_watcher":
+            _check_sol_watcher_ready()
+            status = PreflightStatus(
+                service_name=service_name,
+                ok=True,
+                deposit_issuance_ready=False,
+                withdrawal_provider_ready=False,
+                signer_ready=False,
+                reasons=tuple(reasons),
+                route_integrity_ready=route_integrity_ready,
+                signer_loop_degraded=bool(reasons),
+            )
+            if fatal_integrity:
+                # WARNING: Route-integrity failures are fatal for SOL watcher startup against unsafe routing state.
                 raise PreflightIntegrityError(status)
             return status
 

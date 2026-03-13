@@ -152,9 +152,24 @@ This harness is fail-closed on uncertainty and only validates service handshakes
 
 ## Supported production assets and posture
 - Assets: **BTC, LTC, ETH, USDT only**.
+- SOL runtime scaffolding exists, but **SOL must remain disabled and unadvertised** until the first-enable checklist below is completed.
 - Current production target: **single-node SQLite only**.
 - Deposit issuance may use `ADDRESS_PROVIDER=local_hd` or `ADDRESS_PROVIDER=http`.
 - Withdrawals still require an external withdrawal provider and should remain disabled unless that provider exists.
+
+## Future SOL enable checklist (do not turn on yet)
+Prepare these variables in `/etc/escrowhub/escrowhub.env` before any future SOL go-live:
+- `SOL_WATCHER_ENABLED=false` until the final enable step.
+- `SOL_RPC_URL=https://...` pointing at the production RPC endpoint.
+- `SOL_CONFIRMATIONS_REQUIRED=32` (or your approved finality target).
+- `SOL_MAX_SLOTS_PER_RUN=64` (tune only if backfill lag requires it).
+- `SOL_START_SLOT=<recent finalized slot>` for the first production enable when no `sol_watcher` cursor exists yet.
+
+First-enable bootstrap notes:
+- The current SOL watcher loads its initial cursor from `max(SOL_START_SLOT, stored sol_watcher cursor)`.
+- If no cursor exists, leaving `SOL_START_SLOT=0` will backfill from genesis, which is not acceptable for production enablement.
+- Seed `SOL_START_SLOT` to a recent finalized slot immediately before first enable, verify readiness, then enable the watcher.
+- After the watcher writes its first `sol_watcher` cursor, keep `SOL_START_SLOT` as a floor or remove it once operator policy is documented.
 
 ## Staged go-live procedure
 1. Migrate on a DB copy.

@@ -23,7 +23,7 @@ import run_btc_watcher
 import run_eth_watcher
 import run_sol_watcher
 import run_bot
-from runtime_preflight import PreflightIntegrityError, PreflightStatus, run_startup_preflight
+from runtime_preflight import FatalStartupError, PreflightIntegrityError, PreflightStatus, run_startup_preflight
 from watchers.sweep_job import run_once as run_sweep_once
 
 
@@ -208,6 +208,23 @@ def test_derivation_mismatch_detection_fails_closed(conn, monkeypatch):
         wallet.verify_address_derivation_consistency()
 
 
+def test_sol_derivation_consistency_uses_sol_deriver(conn, monkeypatch):
+    wallet = WalletService(conn)
+    uid = wallet._ensure_user_row(199)
+    conn.execute(
+        "INSERT INTO wallet_addresses(user_id,asset,chain_family,address,derivation_index,destination_tag,derivation_path) VALUES(?,?,?,?,?,?,?)",
+        (uid, "SOL", "SOLANA", wallet._encrypt_field("So11111111111111111111111111111111111111112"), uid, None, wallet._encrypt_field("m/44'/501'/199'/0/0")),
+    )
+
+    class S:
+        public_address = "So11111111111111111111111111111111111111112"
+
+    monkeypatch.setattr(wallet.hd, "derive_sol_address", lambda _uid: S())
+    monkeypatch.setattr(wallet.hd, "derive_eth_address", lambda _uid: (_ for _ in ()).throw(AssertionError("SOL rows must not use ETH derivation")))
+
+    wallet.verify_address_derivation_consistency(sample_size=None)
+
+
 def test_eth_chunk_limit_advances_cursor_gradually(conn, monkeypatch):
     write_watcher_cursor(conn, "eth_watcher", 100)
     monkeypatch.setenv("ETH_RPC_URL", "http://example.invalid")
@@ -327,6 +344,41 @@ def test_run_signer_persists_fatal_startup_blocked_for_typed_fatal(monkeypatch):
         run_signer.main()
 
     assert calls == [("signer_loop", False, "signer configuration failed: bad provider", "fatal_startup_blocked")]
+
+
+def test_run_startup_preflight_sol_watcher_requires_rpc(monkeypatch, tmp_path):
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "sol-preflight.sqlite3"))
+    monkeypatch.delenv("SOL_RPC_URL", raising=False)
+    monkeypatch.setattr(WalletService, "ensure_wallet_route_integrity", lambda self: None)
+    monkeypatch.setattr(WalletService, "verify_address_derivation_consistency", lambda self, sample_size=None: None)
+
+    with pytest.raises(FatalStartupError, match="SOL_RPC_URL is required"):
+        run_startup_preflight("sol_watcher")
+
+
+def test_run_sol_watcher_persists_fatal_startup_blocked_for_typed_fatal(monkeypatch):
+    calls = []
+
+    class DummyConn:
+        def commit(self):
+            return None
+        def close(self):
+            return None
+
+    monkeypatch.setattr(run_sol_watcher, "run_startup_preflight", lambda _s: (_ for _ in ()).throw(FatalStartupError("sol watcher configuration failed: missing rpc")))
+    monkeypatch.setattr(run_sol_watcher, "get_connection", lambda: DummyConn())
+    monkeypatch.setattr(run_sol_watcher, "init_db", lambda _c: None)
+    monkeypatch.setenv("SOL_WATCHER_ENABLED", "true")
+
+    def _upsert(_conn, watcher_name, success, error=None, health=None):
+        calls.append((watcher_name, success, error, health))
+
+    monkeypatch.setattr(run_sol_watcher, "upsert_watcher_status", _upsert)
+
+    with pytest.raises(FatalStartupError):
+        run_sol_watcher.main()
+
+    assert calls == [("sol_watcher", False, "sol watcher configuration failed: missing rpc", "fatal_startup_blocked")]
 
 
 def test_preflight_initializes_db_and_runs_consistency(monkeypatch, tmp_path):
@@ -1403,6 +1455,51 @@ def test_release_readiness_skips_sol_when_disabled(monkeypatch):
     sol_check = next(c for c in report.checks if c[0] == "sol_watcher")
     assert sol_check[1] == "skip"
     assert sol_check[2] == "SOL_WATCHER_ENABLED=false"
+
+
+def test_release_readiness_blocks_sol_when_enabled_but_preflight_fails(monkeypatch):
+    import readiness_service
+    from readiness_service import READINESS_BLOCKED, assess_release_readiness
+    from runtime_preflight import PreflightStatus
+
+    monkeypatch.setattr(Settings, "is_production", False)
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("SQLITE_DB_PATH", ":memory:")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("ENCRYPTION_KEY", "k" * 32)
+    monkeypatch.setenv("ADDRESS_PROVIDER", "http")
+    monkeypatch.setenv("ADDRESS_PROVIDER_URL", "https://provider.example")
+    monkeypatch.setenv("ADDRESS_PROVIDER_TOKEN", "token")
+    monkeypatch.setenv("WITHDRAWAL_PROVIDER", "http")
+    monkeypatch.setenv("WITHDRAWAL_PROVIDER_URL", "https://withdrawal.example")
+    monkeypatch.setenv("WITHDRAWAL_PROVIDER_TOKEN", "token")
+    monkeypatch.setenv("SOL_WATCHER_ENABLED", "true")
+
+    class WalletFake:
+        class P:
+            def is_ready(self):
+                return True, None
+        def __init__(self, _conn):
+            self.address_provider = self.P()
+
+    class SignerFake:
+        def readiness(self):
+            return True, None
+
+    def fake_run_preflight(name):
+        if name == "sol_watcher":
+            return None, "sol watcher configuration failed: SOL_RPC_URL is required when SOL_WATCHER_ENABLED=true"
+        return PreflightStatus(service_name=name, ok=True, route_integrity_ready=True), None
+
+    monkeypatch.setattr(readiness_service, "WalletService", WalletFake)
+    monkeypatch.setattr(readiness_service, "SignerService", SignerFake)
+    monkeypatch.setattr(readiness_service, "_run_preflight", fake_run_preflight)
+
+    report = assess_release_readiness(allow_degraded=True)
+    assert report.status == READINESS_BLOCKED
+    sol_check = next(c for c in report.checks if c[0] == "sol_watcher")
+    assert sol_check[1] == "fail"
+    assert "SOL_RPC_URL is required" in sol_check[2]
 
 
 def test_release_readiness_checks_sol_when_enabled(monkeypatch):

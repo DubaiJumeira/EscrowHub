@@ -343,6 +343,8 @@ class WalletService:
                     derived = self.hd.derive_btc_address(user_id).public_address
                 elif asset == "LTC":
                     derived = self.hd.derive_ltc_address(user_id).public_address
+                elif asset == "SOL":
+                    derived = self.hd.derive_sol_address(user_id).public_address
                 else:
                     derived = self.hd.derive_eth_address(user_id).public_address
                 if stored and stored != derived:

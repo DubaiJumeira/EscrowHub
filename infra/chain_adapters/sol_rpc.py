@@ -169,6 +169,10 @@ class SolRpcAdapter(ChainAdapter):
                 continue
 
             for tx in block.get("transactions") or []:
+                meta = tx.get("meta") or {}
+                if meta.get("err") is not None:
+                    continue
+
                 transaction = tx.get("transaction") or {}
                 signatures = transaction.get("signatures") or []
                 txid = str(signatures[0] or "").strip() if signatures else ""
