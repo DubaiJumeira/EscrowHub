@@ -9,6 +9,7 @@ from infra.db.database import get_connection, init_db
 from runtime_preflight import FatalStartupError, PreflightIntegrityError, PreflightStatus, run_startup_preflight
 from signer.signer_service import SignerService
 from wallet_service import WalletService
+from watcher_status_service import env_flag_enabled
 
 
 READINESS_READY = "READY"
@@ -139,6 +140,16 @@ def assess_release_readiness(allow_degraded: bool = False) -> ReadinessReport:
     watcher_status, watcher_error = _run_preflight("watcher")
     if watcher_status is None:
         blocked.append(f"watcher startup preflight failed: {watcher_error or 'unknown'}")
+
+    if env_flag_enabled("SOL_WATCHER_ENABLED", False):
+        sol_status, sol_error = _run_preflight("sol_watcher")
+        if sol_status is None:
+            blocked.append(f"sol watcher startup preflight failed: {sol_error or 'unknown'}")
+            checks.append(("sol_watcher", "fail", sol_error or "sol watcher preflight failed"))
+        else:
+            checks.append(("sol_watcher", "pass", "ok"))
+    else:
+        checks.append(("sol_watcher", "skip", "SOL_WATCHER_ENABLED=false"))
 
     env_issues = _check_required_env_vars()
     if env_issues:

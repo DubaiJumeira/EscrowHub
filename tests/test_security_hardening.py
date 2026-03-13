@@ -1367,6 +1367,87 @@ def test_release_readiness_allow_degraded_does_not_relabel_status(monkeypatch):
     assert report.status == READINESS_DEGRADED
 
 
+def test_release_readiness_skips_sol_when_disabled(monkeypatch):
+    import readiness_service
+    from readiness_service import READINESS_READY, assess_release_readiness
+
+    monkeypatch.setattr(Settings, "is_production", False)
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("SQLITE_DB_PATH", ":memory:")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("ENCRYPTION_KEY", "k" * 32)
+    monkeypatch.setenv("ADDRESS_PROVIDER", "http")
+    monkeypatch.setenv("ADDRESS_PROVIDER_URL", "https://provider.example")
+    monkeypatch.setenv("ADDRESS_PROVIDER_TOKEN", "token")
+    monkeypatch.setenv("WITHDRAWAL_PROVIDER", "http")
+    monkeypatch.setenv("WITHDRAWAL_PROVIDER_URL", "https://withdrawal.example")
+    monkeypatch.setenv("WITHDRAWAL_PROVIDER_TOKEN", "token")
+    monkeypatch.setenv("SOL_WATCHER_ENABLED", "false")
+
+    class WalletFake:
+        class P:
+            def is_ready(self):
+                return True, None
+        def __init__(self, _conn):
+            self.address_provider = self.P()
+
+    class SignerFake:
+        def readiness(self):
+            return True, None
+
+    monkeypatch.setattr(readiness_service, "WalletService", WalletFake)
+    monkeypatch.setattr(readiness_service, "SignerService", SignerFake)
+
+    report = assess_release_readiness(allow_degraded=True)
+    assert report.status == READINESS_READY
+    sol_check = next(c for c in report.checks if c[0] == "sol_watcher")
+    assert sol_check[1] == "skip"
+    assert sol_check[2] == "SOL_WATCHER_ENABLED=false"
+
+
+def test_release_readiness_checks_sol_when_enabled(monkeypatch):
+    import readiness_service
+    from readiness_service import READINESS_READY, assess_release_readiness
+    from runtime_preflight import PreflightStatus
+
+    monkeypatch.setattr(Settings, "is_production", False)
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("SQLITE_DB_PATH", ":memory:")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("ENCRYPTION_KEY", "k" * 32)
+    monkeypatch.setenv("ADDRESS_PROVIDER", "http")
+    monkeypatch.setenv("ADDRESS_PROVIDER_URL", "https://provider.example")
+    monkeypatch.setenv("ADDRESS_PROVIDER_TOKEN", "token")
+    monkeypatch.setenv("WITHDRAWAL_PROVIDER", "http")
+    monkeypatch.setenv("WITHDRAWAL_PROVIDER_URL", "https://withdrawal.example")
+    monkeypatch.setenv("WITHDRAWAL_PROVIDER_TOKEN", "token")
+    monkeypatch.setenv("SOL_WATCHER_ENABLED", "true")
+
+    class WalletFake:
+        class P:
+            def is_ready(self):
+                return True, None
+        def __init__(self, _conn):
+            self.address_provider = self.P()
+
+    class SignerFake:
+        def readiness(self):
+            return True, None
+
+    def fake_run_preflight(name):
+        return PreflightStatus(service_name=name, ok=True, route_integrity_ready=True), None
+
+    monkeypatch.setattr(readiness_service, "WalletService", WalletFake)
+    monkeypatch.setattr(readiness_service, "SignerService", SignerFake)
+    monkeypatch.setattr(readiness_service, "_run_preflight", fake_run_preflight)
+
+    report = assess_release_readiness(allow_degraded=True)
+    assert report.status == READINESS_READY
+    sol_check = next(c for c in report.checks if c[0] == "sol_watcher")
+    assert sol_check[1] == "pass"
+    assert sol_check[2] == "ok"
+
+
 def test_staging_smoke_check_blocks_when_route_integrity_unverified(monkeypatch):
     import scripts.staging_smoke_check as smoke
 
