@@ -2406,9 +2406,10 @@ async def watcher_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     conn, _, _, _ = _services()
     try:
-        status = read_watcher_status(conn, ["btc_watcher", "eth_watcher", "signer_loop"])
+        status = read_watcher_status(conn, ["btc_watcher", "eth_watcher", "sol_watcher", "signer_loop"])
         b = status["btc_watcher"]
         e = status["eth_watcher"]
+        sol = status["sol_watcher"]
         s = status["signer_loop"]
 
         signer_service = SignerService()
@@ -2420,6 +2421,7 @@ async def watcher_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         eth_blocked, eth_disabled, eth_degraded = classify_watcher_health_state(e.get("health_state"))
         btc_cfg_disabled = not env_flag_enabled("BTC_WATCHER_ENABLED", True)
         eth_cfg_disabled = not env_flag_enabled("ETH_WATCHER_ENABLED", True)
+        sol_cfg_disabled = not env_flag_enabled("SOL_WATCHER_ENABLED", False)
         # WARNING: watcher disabled config is enforced at status render to fail closed against stale persisted rows.
         # Secure alternative: persist explicit disabled rows at startup and derive disabled from config as defense in depth.
         btc_state = map_operator_health_state(
@@ -2434,6 +2436,13 @@ async def watcher_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             disabled=eth_disabled or eth_cfg_disabled,
             degraded=eth_degraded,
         )
+        sol_blocked, sol_disabled, sol_degraded = classify_watcher_health_state(sol.get("health_state"))
+        sol_state = map_operator_health_state(
+            ready=(sol.get("health_state") == "ok") and (not sol_cfg_disabled),
+            blocked=sol_blocked,
+            disabled=sol_disabled or sol_cfg_disabled,
+            degraded=sol_degraded,
+        )
         signer_state, signer_detail = _signer_operator_state(s, signer_ready, signer_reason)
         deposit_state, deposit_detail = normalize_deposit_provider_state(
             provider_ready=bool(dep_ready),
@@ -2447,12 +2456,13 @@ async def watcher_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "watcher_status\n"
             f"- btc: {btc_state} (failures={b['consecutive_failures']}, error={_sanitize_failure_summary(b['last_error'])})\n"
             f"- eth: {eth_state} (failures={e['consecutive_failures']}, error={_sanitize_failure_summary(e['last_error'])})\n"
+            f"- sol: {sol_state} (failures={sol['consecutive_failures']}, error={_sanitize_failure_summary(sol['last_error'])})\n"
             f"- deposit_provider: {deposit_state} (detail={_sanitize_failure_summary(deposit_detail)})\n"
             f"- signer: {signer_state} (detail={signer_detail})"
         )
         conn.execute(
             "INSERT INTO admin_actions(admin_user_id,action_type,data_json) VALUES(?,?,?)",
-            (update.effective_user.id, "view_watcher_status", json.dumps({"watchers": ["btc_watcher", "eth_watcher", "signer_loop"]})),
+            (update.effective_user.id, "view_watcher_status", json.dumps({"watchers": ["btc_watcher", "eth_watcher", "sol_watcher", "signer_loop"]})),
         )
         conn.commit()
         await update.effective_message.reply_text(msg)

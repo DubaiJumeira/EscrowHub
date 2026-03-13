@@ -10,12 +10,14 @@ from escrow_service import EscrowService
 from fee_service import FeeService
 from hd_wallet import HDWalletDeriver
 from infra.chain_adapters.eth_rpc import TRANSFER_TOPIC, EthRpcAdapter
+from infra.chain_adapters.sol_rpc import SolRpcAdapter
 from infra.db.database import init_db
 from price_service import StaticPriceService, validate_minimum_escrow_usd
 from signer.signer_service import DisabledSignerProvider
 from tenant_service import TenantService
 from wallet_service import WalletService
 from watchers.eth_watcher import run_once as run_eth_once
+from watchers.sol_watcher import run_once as run_sol_once
 from watchers.notify import notify_deposit_credited
 from watcher_status_service import normalize_deposit_provider_state, read_watcher_status, upsert_watcher_status
 from config.settings import Settings
@@ -86,6 +88,11 @@ def test_dispute_resolution_outcomes(conn):
 def test_eth_watcher_entrypoint_no_rpc(monkeypatch):
     monkeypatch.setenv("APP_ENV", "test")
     assert run_eth_once({}) == 0
+
+
+def test_sol_watcher_entrypoint_no_rpc(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "test")
+    assert run_sol_once({}) == 0
 
 
 def test_deterministic_derivation_and_paths(monkeypatch):
@@ -313,6 +320,18 @@ def test_eth_rpc_adapter_parses_erc20_transfer_event(monkeypatch):
     assert deposits[0].asset == "USDT"
     assert deposits[0].user_id == 99
     assert deposits[0].amount == Decimal("1.5")
+
+
+def test_sol_rpc_adapter_parses_native_transfer_event(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.setenv("SOL_DEPOSIT_EVENTS_JSON", json.dumps([
+        {"to": "So11111111111111111111111111111111111111112", "asset": "SOL", "amount": "1.25", "txid": "5olSig"}
+    ]))
+    adapter = SolRpcAdapter({"So11111111111111111111111111111111111111112": 77})
+    deposits, _ = adapter.fetch_deposits()
+    assert deposits[0].asset == "SOL"
+    assert deposits[0].user_id == 77
+    assert deposits[0].amount == Decimal("1.25")
 
 
 def test_rate_limiter_db_backed_across_connections(tmp_path):
@@ -826,6 +845,7 @@ def test_watcher_status_command_includes_signer_and_backlog(monkeypatch, conn):
     assert "- signer:" in text
     assert "- deposit_provider:" in text
     assert "- btc:" in text
+    assert "- sol:" in text
 
 
 
@@ -1385,3 +1405,43 @@ def test_watcher_status_config_disabled_overrides_stale_ready(monkeypatch, conn)
     allowed = SimpleNamespace(effective_user=SimpleNamespace(id=999), effective_message=allowed_msg)
     asyncio.run(bot.watcher_status(allowed, None))
     assert "- btc: disabled" in allowed_msg.replies[-1]
+
+
+def test_watcher_status_sol_config_disabled_overrides_stale_ready(monkeypatch, conn):
+    import asyncio
+    import bot
+
+    upsert_watcher_status(conn, "sol_watcher", success=True, health="ok")
+
+    monkeypatch.setenv("SOL_WATCHER_ENABLED", "false")
+    monkeypatch.setattr(bot, "ADMIN_IDS", {999})
+    monkeypatch.setattr(bot, "_services", lambda: (conn, None, None, None))
+    monkeypatch.setattr(bot, "DEPOSIT_ISSUANCE_READY", True)
+    monkeypatch.setattr(bot, "DEPOSIT_ISSUANCE_ERROR", None)
+
+    class SignerFake:
+        def readiness(self):
+            return True, None
+
+    class WalletFake:
+        class P:
+            def is_ready(self):
+                return True, None
+
+        def __init__(self, _conn):
+            self.address_provider = self.P()
+
+    monkeypatch.setattr(bot, "SignerService", SignerFake)
+    monkeypatch.setattr(bot, "WalletService", WalletFake)
+
+    class Msg:
+        def __init__(self):
+            self.replies = []
+
+        async def reply_text(self, txt, **kwargs):
+            self.replies.append(txt)
+
+    allowed_msg = Msg()
+    allowed = SimpleNamespace(effective_user=SimpleNamespace(id=999), effective_message=allowed_msg)
+    asyncio.run(bot.watcher_status(allowed, None))
+    assert "- sol: disabled" in allowed_msg.replies[-1]

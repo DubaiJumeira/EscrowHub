@@ -1,0 +1,17 @@
+[Unit]
+Description=EscrowHub SOL Watcher
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/escrowhub
+EnvironmentFile=/etc/escrowhub/escrowhub.env
+Environment=PYTHONPATH=/opt/escrowhub
+ExecStart=/opt/escrowhub/.venv/bin/python /opt/escrowhub/run_sol_watcher.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

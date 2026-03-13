@@ -21,6 +21,7 @@ import bot
 import run_signer
 import run_btc_watcher
 import run_eth_watcher
+import run_sol_watcher
 import run_bot
 from runtime_preflight import PreflightIntegrityError, PreflightStatus, run_startup_preflight
 from watchers.sweep_job import run_once as run_sweep_once
@@ -1523,3 +1524,24 @@ def test_eth_watcher_disabled_persists_disabled_health(monkeypatch):
     monkeypatch.setattr(run_eth_watcher, "upsert_watcher_status", _upsert)
     run_eth_watcher.main()
     assert calls == [("eth_watcher", False, "disabled by config", "disabled")]
+
+
+def test_sol_watcher_disabled_persists_disabled_health(monkeypatch):
+    calls = []
+    monkeypatch.setenv("SOL_WATCHER_ENABLED", "false")
+
+    class Conn:
+        def commit(self):
+            return None
+        def close(self):
+            return None
+
+    monkeypatch.setattr(run_sol_watcher, "get_connection", lambda: Conn())
+    monkeypatch.setattr(run_sol_watcher, "init_db", lambda _conn: None)
+
+    def _upsert(_conn, watcher_name, success, error=None, health=None):
+        calls.append((watcher_name, success, error, health))
+
+    monkeypatch.setattr(run_sol_watcher, "upsert_watcher_status", _upsert)
+    run_sol_watcher.main()
+    assert calls == [("sol_watcher", False, "disabled by config", "disabled")]
