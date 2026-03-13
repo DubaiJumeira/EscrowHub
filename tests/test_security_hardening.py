@@ -1626,3 +1626,17 @@ def test_sol_watcher_disabled_persists_disabled_health(monkeypatch):
     monkeypatch.setattr(run_sol_watcher, "upsert_watcher_status", _upsert)
     run_sol_watcher.main()
     assert calls == [("sol_watcher", False, "disabled by config", "disabled")]
+
+
+def test_run_bot_clean_exit_does_not_restart(monkeypatch):
+    calls = []
+
+    def fake_bot_main():
+        calls.append("run")
+        return None
+
+    monkeypatch.setattr(run_bot, "bot_main", fake_bot_main)
+    monkeypatch.setattr(run_bot.time, "sleep", lambda _s: (_ for _ in ()).throw(AssertionError("sleep should not be called on clean exit")))
+
+    run_bot.main()
+    assert calls == ["run"]

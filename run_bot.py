@@ -22,17 +22,20 @@ def main() -> None:
     while True:
         try:
             bot_main()
-            startup_complete = True
-            LOGGER.warning("bot exited unexpectedly; restarting in 5s")
-            time.sleep(5)
+            LOGGER.info("telegram bot service stopped cleanly")
+            return
         except KeyboardInterrupt:
             LOGGER.info("bot interrupted; shutting down")
-            raise
+            return
+        except SystemExit:
+            LOGGER.info("bot received system exit; shutting down")
+            return
         except Exception as exc:
             if not startup_complete and _is_fatal_startup_error(exc):
                 # WARNING: Fatal startup integrity/configuration errors intentionally stop restart loops to fail closed.
                 LOGGER.error("fatal startup error; refusing restart loop: %s", exc)
                 raise
+            startup_complete = True
             LOGGER.exception("bot crashed; restarting in 5s")
             time.sleep(5)
 
