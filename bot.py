@@ -690,7 +690,7 @@ async def _seller_lookup_and_render(update: Update, context: ContextTypes.DEFAUL
         conn.close()
 
 
-WITHDRAWAL_SUPPORTED_ASSETS = ("BTC", "LTC", "ETH", "USDT")
+WITHDRAWAL_SUPPORTED_ASSETS = ("BTC", "LTC", "ETH", "USDT", "SOL")
 
 
 def _withdrawal_network_label(asset: str) -> str:

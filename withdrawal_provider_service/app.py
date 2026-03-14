@@ -11,7 +11,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-SUPPORTED_ASSETS = ("BTC", "LTC", "ETH", "USDT")
+SUPPORTED_ASSETS = ("BTC", "LTC", "ETH", "USDT", "SOL")
 SUCCESS_STATUSES = {"submitted", "broadcasted", "confirmed"}
 FAILURE_STATUSES = {"rejected", "permanent_failure", "retryable", "ambiguous", "unknown"}
 ALL_STATUSES = SUCCESS_STATUSES | FAILURE_STATUSES
@@ -427,16 +427,20 @@ class _B58Decode:
     alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
     @classmethod
-    def decode(cls, raw: str) -> bytes:
+    def decode_raw(cls, raw: str, *, error_message: str = "invalid base58 value") -> bytes:
         num = 0
         for ch in raw:
             idx = cls.alphabet.find(ch)
             if idx < 0:
-                raise ValidationError("invalid base58 address")
+                raise ValidationError(error_message)
             num = num * 58 + idx
         out = num.to_bytes((num.bit_length() + 7) // 8, "big") if num else b""
         pad = len(raw) - len(raw.lstrip("1"))
-        full = b"\x00" * pad + out
+        return b"\x00" * pad + out
+
+    @classmethod
+    def decode(cls, raw: str) -> bytes:
+        full = cls.decode_raw(raw, error_message="invalid base58 address")
         if len(full) < 4:
             raise ValidationError("base58 payload too short")
         payload, checksum = full[:-4], full[-4:]
@@ -520,6 +524,11 @@ def _validate_destination_address(asset: str, address: str) -> None:
             raise ValidationError("invalid destination address for Ethereum")
         if any(c.isalpha() for c in address[2:]) and not is_checksum_address(address):
             raise ValidationError("invalid checksum for Ethereum address")
+        return
+    if asset == "SOL":
+        raw = _B58Decode.decode_raw(address, error_message="invalid base58 address")
+        if len(raw) != 32:
+            raise ValidationError("invalid destination address for SOL")
         return
     _validate_utxo_address(asset, address)
 
@@ -606,6 +615,11 @@ def _txid_sane_for_asset(asset: str, txid: str | None) -> bool:
     if asset in {"ETH", "USDT"}:
         low = value.lower()
         return low.startswith("0x") and len(low) == 66 and all(c in "0123456789abcdef" for c in low[2:])
+    if asset == "SOL":
+        try:
+            return len(_B58Decode.decode_raw(value, error_message="invalid base58 signature")) == 64
+        except ValidationError:
+            return False
     return False
 
 

@@ -10,7 +10,7 @@ from config.settings import Settings
 from error_sanitizer import sanitize_runtime_error
 from signer.errors import RetryableSignerError, SignerConfigurationError
 
-SUPPORTED_WITHDRAWAL_ASSETS = {"BTC", "LTC", "ETH", "USDT"}
+SUPPORTED_WITHDRAWAL_ASSETS = {"BTC", "LTC", "ETH", "USDT", "SOL"}
 
 
 @dataclass(frozen=True)
