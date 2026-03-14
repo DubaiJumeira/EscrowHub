@@ -94,8 +94,8 @@ def _check_required_env_vars() -> list[str]:
         if provider == "http":
             if not os.getenv("WITHDRAWAL_PROVIDER_URL", "").strip():
                 missing.append("WITHDRAWAL_PROVIDER_URL is missing")
-            if Settings.is_production and not os.getenv("WITHDRAWAL_PROVIDER_URL", "").strip().startswith("https://"):
-                missing.append("WITHDRAWAL_PROVIDER_URL must use https:// in production")
+            if Settings.is_production and not (os.getenv("WITHDRAWAL_PROVIDER_URL", "").strip().startswith("https://") or os.getenv("WITHDRAWAL_PROVIDER_URL", "").strip().startswith("http://127.0.0.1") or os.getenv("WITHDRAWAL_PROVIDER_URL", "").strip().startswith("http://localhost")):
+                missing.append("WITHDRAWAL_PROVIDER_URL must use https:// in production unless it is loopback http://127.0.0.1 or http://localhost")
             if Settings.is_production and not os.getenv("WITHDRAWAL_PROVIDER_TOKEN", "").strip():
                 missing.append("WITHDRAWAL_PROVIDER_TOKEN is missing")
     return missing

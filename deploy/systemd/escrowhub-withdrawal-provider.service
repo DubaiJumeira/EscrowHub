@@ -1,0 +1,21 @@
+[Unit]
+Description=EscrowHub Withdrawal Provider
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=escrowhub
+Group=escrowhub
+WorkingDirectory=/opt/escrowhub
+EnvironmentFile=/etc/escrowhub/escrowhub.env
+ExecStart=/usr/bin/python3 /opt/escrowhub/run_withdrawal_provider.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/escrowhub-withdrawal-provider
+
+[Install]
+WantedBy=multi-user.target

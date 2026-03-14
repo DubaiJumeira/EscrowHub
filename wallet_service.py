@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, ROUND_UP
 import base64
 import hashlib
 import json
@@ -25,11 +25,11 @@ SUPPORTED_ASSETS = set(Settings.supported_assets)
 LOGGER = logging.getLogger(__name__)
 
 NETWORK_LABELS = {
-    "BTC": "BTC",
-    "ETH": "ETH",
-    "LTC": "LTC",
-    "USDT": "USDT (ERC-20)",
-    "SOL": "SOL",
+    "BTC": "Bitcoin",
+    "ETH": "Ethereum",
+    "LTC": "Litecoin",
+    "USDT": "Ethereum (ERC-20)",
+    "SOL": "Solana",
 }
 
 
@@ -81,6 +81,30 @@ class WalletService:
 
     def _quantize_asset(self, asset: str, amount: Decimal) -> Decimal:
         return Decimal(amount).quantize(self._asset_quantum(asset), rounding=ROUND_HALF_UP)
+
+    def asset_network_label(self, asset: str) -> str:
+        return NETWORK_LABELS.get(self._asset(asset), self._asset(asset))
+
+    def withdrawal_minimum_usd(self) -> Decimal:
+        value = Decimal(str(Settings.withdrawal_minimum_usd or "10"))
+        if value <= Decimal("0"):
+            raise ValueError("WITHDRAWAL_MINIMUM_USD must be positive")
+        return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    def _usd_price(self, asset: str) -> Decimal:
+        symbol = self._asset(asset)
+        try:
+            return self.price_service.get_usd_price(symbol)
+        except Exception:
+            return self._fallback_price_service.get_usd_price(symbol)
+
+    def withdrawal_minimum_asset_amount(self, asset: str) -> Decimal:
+        symbol = self._asset(asset)
+        price_usd = self._usd_price(symbol)
+        if price_usd <= Decimal("0"):
+            raise RuntimeError(f"price unavailable for {symbol}")
+        raw_amount = self.withdrawal_minimum_usd() / price_usd
+        return Decimal(raw_amount).quantize(self._asset_quantum(symbol), rounding=ROUND_UP)
 
     def deposit_platform_fee(self, asset: str, gross_amount: Decimal) -> Decimal:
         symbol = self._asset(asset)
@@ -790,6 +814,9 @@ class WalletService:
                 request_usd = self.price_service.get_usd_value(symbol, amt)
             except Exception:
                 request_usd = self._fallback_price_service.get_usd_value(symbol, amt)
+            minimum_usd = self.withdrawal_minimum_usd()
+            if request_usd < minimum_usd:
+                raise ValueError(f"minimum withdrawal is ${minimum_usd} USD equivalent")
             if self._withdrawn_usd_last_24h(resolved_user_id) + request_usd > daily_limit:
                 raise ValueError("daily withdrawal limit exceeded")
 

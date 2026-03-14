@@ -690,12 +690,29 @@ async def _seller_lookup_and_render(update: Update, context: ContextTypes.DEFAUL
         conn.close()
 
 
-WITHDRAW_MINIMUMS = {
-    "USDT": Decimal("100"),
-    "BTC": Decimal("0.001"),
-    "ETH": Decimal("1"),
-    "LTC": Decimal("1"),
-}
+WITHDRAWAL_SUPPORTED_ASSETS = ("BTC", "LTC", "ETH", "USDT")
+
+
+def _withdrawal_network_label(asset: str) -> str:
+    conn, wallet, _, _ = _services()
+    try:
+        return wallet.asset_network_label(asset)
+    finally:
+        conn.close()
+
+
+def _withdrawal_minimum_context(asset: str) -> dict[str, Decimal | str]:
+    conn, wallet, _, _ = _services()
+    try:
+        minimum_usd = wallet.withdrawal_minimum_usd()
+        minimum_asset = wallet.withdrawal_minimum_asset_amount(asset)
+        return {
+            "minimum_usd": minimum_usd,
+            "minimum_asset": minimum_asset,
+            "network": wallet.asset_network_label(asset),
+        }
+    finally:
+        conn.close()
 
 (
     WD_SELECT_ASSET,
@@ -1049,6 +1066,7 @@ async def profile_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             status_label = WITHDRAWAL_STATUS_LABELS.get(wd_status, "Awaiting reconciliation")
             if r["destination_address"]:
                 addr = wallet._decrypt_field(r["destination_address"])
+                lines.append(f"<b>Network:</b> {html.escape(wallet.asset_network_label(str(r['asset'])))}")
                 lines.append(f"<b>Address:</b> <code>{html.escape(str(addr))}</code>")
             lines.append(f"<b>Status:</b> {html.escape(status_label)}")
             if wd_status == "broadcasted" and r["txid"]:
@@ -1104,6 +1122,7 @@ async def deposit_select_asset(update: Update, context: ContextTypes.DEFAULT_TYP
         _profile_block_html(
             "<b>💰 Enter the amount in USD to deposit</b>\n"
             "Max: $10000.00\n\n"
+            f"Network: {html.escape(_withdrawal_network_label(asset))}\n"
             f"Platform fee: {html.escape(str(platform_fee_pct))}%\n\n"
             f"Example request: $100.00 USD\n"
             f"Estimated to send: {_asset_profile_icon(asset)} {html.escape(_crypto_quote_text(asset, example['crypto_amount']))}"
@@ -1174,12 +1193,13 @@ async def deposit_amount_input(update: Update, context: ContextTypes.DEFAULT_TYP
         f"Requested wallet credit: {_profile_block('$' + _usd_text(quote['requested_credit_usd']) + ' USD')}",
         f"Estimated crypto to send: {_profile_block_html(estimated_crypto_html)}",
         f"Platform fee ({Settings.deposit_platform_fee_percent or '1'}%): {_profile_block(f'${platform_fee_text} USD')}",
+        f"Network: {_profile_block(wallet.asset_network_label(asset))}",
         f"Address: {_profile_block(route.address)}",
         f"Rate: {_profile_block_html(f'1 {asset_label_html} ≈ ${html.escape(_usd_text(price_usd))}')}",
     ]
     if route.destination_tag:
         details.append(f"Destination tag: {_profile_block(route.destination_tag)}")
-    details.append(f"Send only {asset_label_html} to this address.")
+    details.append(f"Send only {asset_label_html} using the {html.escape(wallet.asset_network_label(asset))} network.")
     await update.effective_message.reply_text(
         "\n".join(details),
         reply_markup=InlineKeyboardMarkup(buttons),
@@ -1210,7 +1230,17 @@ async def withdraw_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if _is_user_frozen(conn, query.from_user.id):
             await _show_frozen_callback(query)
             return ConversationHandler.END
-        available_assets = [a for a, minimum in WITHDRAW_MINIMUMS.items() if a in _enabled_assets() and wallet.available_balance(user_id, a) >= minimum]
+        available_assets = []
+        for asset in WITHDRAWAL_SUPPORTED_ASSETS:
+            if asset not in _enabled_assets():
+                continue
+            try:
+                minimum_asset = wallet.withdrawal_minimum_asset_amount(asset)
+                minimum_total = wallet.withdrawal_total_debit(asset, minimum_asset)
+            except Exception:
+                continue
+            if wallet.available_balance(user_id, asset) >= minimum_total:
+                available_assets.append(asset)
     finally:
         conn.close()
 
@@ -1225,11 +1255,10 @@ async def withdraw_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 [
                     "You don't have sufficient balance in any currency for withdrawal.",
                     "",
-                    "Minimum amounts:",
-                    f"{usdt_icon} 100 USDT",
-                    f"{btc_icon} 0.001 BTC",
-                    f"{eth_icon} 1 ETH",
-                    f"{ltc_icon} 1 LTC",
+                    f"Minimum withdrawal: ${html.escape(_usd_text(Settings.withdrawal_minimum_usd or '10'))} USD equivalent on every supported asset.",
+                    "",
+                    f"Supported withdrawal networks: {btc_icon} Bitcoin, {eth_icon} Ethereum, {usdt_icon} Ethereum (ERC-20), {ltc_icon} Litecoin.",
+                    "Users also pay the 1% withdrawal fee. Blockchain fee policy must be enforced by the withdrawal provider.",
                     "",
                     "Please deposit funds to your account before attempting a withdrawal.",
                 ],
@@ -1252,12 +1281,19 @@ async def withdraw_select_asset(update: Update, context: ContextTypes.DEFAULT_TY
         await profile_actions(update, context)
         return ConversationHandler.END
     asset = query.data.split(":", 1)[1]
-    if asset not in _enabled_assets():
+    if asset not in _enabled_assets() or asset not in WITHDRAWAL_SUPPORTED_ASSETS:
         await query.edit_message_text(_profile_section("<b>🏦 Withdraw</b>", ["Unsupported withdrawal currency."]), reply_markup=_profile_menu(), parse_mode=ParseMode.HTML)
         return ConversationHandler.END
     context.user_data["wd_asset"] = asset
     await query.edit_message_text(
-        _profile_section("<b>🏦 Withdraw</b>", [f"Enter {html.escape(str(context.user_data['wd_asset']))} withdrawal amount:"]),
+        _profile_section(
+            "<b>🏦 Withdraw</b>",
+            [
+                f"Network: {html.escape(_withdrawal_network_label(str(context.user_data['wd_asset'])))}",
+                f"Minimum: ${html.escape(_usd_text(Settings.withdrawal_minimum_usd or '10'))} USD equivalent",
+                f"Enter {html.escape(str(context.user_data['wd_asset']))} withdrawal amount:",
+            ],
+        ),
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="wd_back_assets")]]),
         parse_mode=ParseMode.HTML,
     )
@@ -1279,20 +1315,39 @@ async def withdraw_amount_input(update: Update, context: ContextTypes.DEFAULT_TY
     if amount <= 0:
         await update.effective_message.reply_text(_profile_section("<b>🏦 Withdraw</b>", ["Amount must be positive."]), parse_mode=ParseMode.HTML)
         return WD_ENTER_AMOUNT
-    if amount < WITHDRAW_MINIMUMS[asset]:
-        await update.effective_message.reply_text(_profile_section("<b>🏦 Withdraw</b>", [f"Minimum withdrawal for {html.escape(str(asset))} is {html.escape(str(WITHDRAW_MINIMUMS[asset]))}."]), parse_mode=ParseMode.HTML)
+    minimum_ctx = _withdrawal_minimum_context(asset)
+    minimum_asset = Decimal(str(minimum_ctx["minimum_asset"]))
+    if amount < minimum_asset:
+        await update.effective_message.reply_text(
+            _profile_section(
+                "<b>🏦 Withdraw</b>",
+                [
+                    f"Minimum withdrawal is ${html.escape(_usd_text(minimum_ctx['minimum_usd']))} USD equivalent for all supported assets.",
+                    f"Approximate {html.escape(str(asset))} minimum right now: {html.escape(_crypto_quote_text(asset, minimum_asset))}.",
+                    f"Network: {html.escape(str(minimum_ctx['network']))}",
+                ],
+            ),
+            parse_mode=ParseMode.HTML,
+        )
         return WD_ENTER_AMOUNT
     conn, wallet, tenant, _ = _services()
     try:
         user_id = tenant.ensure_user(update.effective_user.id, update.effective_user.username)
-        if wallet.available_balance(user_id, asset) < amount:
-            await update.effective_message.reply_text(_profile_section("<b>🏦 Withdraw</b>", ["Insufficient available balance."]), parse_mode=ParseMode.HTML)
+        total_debit = wallet.withdrawal_total_debit(asset, amount)
+        if wallet.available_balance(user_id, asset) < total_debit:
+            await update.effective_message.reply_text(_profile_section("<b>🏦 Withdraw</b>", [f"Insufficient available balance including the {Settings.withdrawal_platform_fee_percent or '1'}% withdrawal fee."]), parse_mode=ParseMode.HTML)
             return WD_ENTER_AMOUNT
     finally:
         conn.close()
     context.user_data["wd_amount"] = amount
     await update.effective_message.reply_text(
-        _profile_section("<b>🏦 Withdraw</b>", [f"Enter your {html.escape(str(asset))} withdrawal address:"]),
+        _profile_section(
+            "<b>🏦 Withdraw</b>",
+            [
+                f"Network: {html.escape(_withdrawal_network_label(str(asset)))}",
+                f"Enter your {html.escape(str(asset))} withdrawal address:",
+            ],
+        ),
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="wd_back_amount")]]),
         parse_mode=ParseMode.HTML,
     )
@@ -1315,8 +1370,20 @@ async def withdraw_address_input(update: Update, context: ContextTypes.DEFAULT_T
     finally:
         conn.close()
     context.user_data["wd_address"] = address
+    quote = _withdraw_quote_amounts(asset, Decimal(context.user_data["wd_amount"]))
     await update.effective_message.reply_text(
-        _profile_section("<b>🏦 Confirm withdrawal</b>", [f"Address: {html.escape(address)}", "", "Is this address correct?"]),
+        _profile_section(
+            "<b>🏦 Confirm withdrawal</b>",
+            [
+                f"Network: {html.escape(_withdrawal_network_label(str(asset)))}",
+                f"Address: {html.escape(address)}",
+                f"Withdrawal amount: {html.escape(_crypto_quote_text(str(asset), context.user_data['wd_amount']))}",
+                f"Platform fee ({html.escape(str(Settings.withdrawal_platform_fee_percent or '1'))}%): {html.escape(_crypto_quote_text(str(asset), quote['platform_fee_amount']))}",
+                f"Total debit before blockchain fee handling: {html.escape(_crypto_quote_text(str(asset), quote['total_debit']))}",
+                "",
+                "Is this address correct?",
+            ],
+        ),
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Confirm", callback_data="wd_confirm"), InlineKeyboardButton("Cancel", callback_data="wd_cancel_addr")]]),
         parse_mode=ParseMode.HTML,
     )

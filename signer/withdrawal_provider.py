@@ -80,8 +80,8 @@ class HttpWithdrawalProvider(WithdrawalProvider):
     def is_ready(self) -> tuple[bool, str | None]:
         if not self.base_url:
             return False, "WITHDRAWAL_PROVIDER_URL is missing"
-        if Settings.is_production and not self.base_url.startswith("https://"):
-            return False, "WITHDRAWAL_PROVIDER_URL must use https:// in production"
+        if Settings.is_production and not (self.base_url.startswith("https://") or self.base_url.startswith("http://127.0.0.1") or self.base_url.startswith("http://localhost")):
+            return False, "WITHDRAWAL_PROVIDER_URL must use https:// in production unless it is loopback http://127.0.0.1 or http://localhost"
         if Settings.is_production and not self.auth_token:
             return False, "WITHDRAWAL_PROVIDER_TOKEN is required in production"
         try:

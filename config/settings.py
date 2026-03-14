@@ -34,6 +34,7 @@ class Settings:
     supported_assets = ("BTC", "LTC", "ETH", "USDT", "SOL")
     deposit_platform_fee_percent = os.getenv("DEPOSIT_PLATFORM_FEE_PERCENT", "1").strip()
     withdrawal_platform_fee_percent = os.getenv("WITHDRAWAL_PLATFORM_FEE_PERCENT", "1").strip()
+    withdrawal_minimum_usd = os.getenv("WITHDRAWAL_MINIMUM_USD", "10").strip()
     escrow_platform_fee_percent = os.getenv("ESCROW_PLATFORM_FEE_PERCENT", "3").strip()
     provider_fee_enabled = _as_bool("PROVIDER_FEE_ENABLED", "false")
     withdrawal_daily_limit_usd = os.getenv("WITHDRAWAL_DAILY_LIMIT_USD", "5000").strip()
