@@ -297,10 +297,11 @@ def _withdraw_quote_amounts(asset: str, amount: Decimal) -> dict[str, Decimal]:
     conn, wallet, _, _ = _services()
     try:
         platform_fee = wallet.withdrawal_platform_fee(asset, amount)
+        network_fee = wallet.withdrawal_network_fee(asset)
         total_debit = wallet.withdrawal_total_debit(asset, amount)
     finally:
         conn.close()
-    return {"platform_fee_amount": platform_fee, "total_debit": total_debit}
+    return {"platform_fee_amount": platform_fee, "network_fee_amount": network_fee, "total_debit": total_debit}
 
 
 def _profile_custom_emoji(env_key: str, fallback: str) -> str:
@@ -1335,7 +1336,7 @@ async def withdraw_amount_input(update: Update, context: ContextTypes.DEFAULT_TY
         user_id = tenant.ensure_user(update.effective_user.id, update.effective_user.username)
         total_debit = wallet.withdrawal_total_debit(asset, amount)
         if wallet.available_balance(user_id, asset) < total_debit:
-            await update.effective_message.reply_text(_profile_section("<b>🏦 Withdraw</b>", [f"Insufficient available balance including the {Settings.withdrawal_platform_fee_percent or '1'}% withdrawal fee."]), parse_mode=ParseMode.HTML)
+            await update.effective_message.reply_text(_profile_section("<b>🏦 Withdraw</b>", [f"Insufficient available balance including the {Settings.withdrawal_platform_fee_percent or '1'}% withdrawal fee and blockchain fee."]), parse_mode=ParseMode.HTML)
             return WD_ENTER_AMOUNT
     finally:
         conn.close()
@@ -1379,7 +1380,8 @@ async def withdraw_address_input(update: Update, context: ContextTypes.DEFAULT_T
                 f"Address: {html.escape(address)}",
                 f"Withdrawal amount: {html.escape(_crypto_quote_text(str(asset), context.user_data['wd_amount']))}",
                 f"Platform fee ({html.escape(str(Settings.withdrawal_platform_fee_percent or '1'))}%): {html.escape(_crypto_quote_text(str(asset), quote['platform_fee_amount']))}",
-                f"Total debit before blockchain fee handling: {html.escape(_crypto_quote_text(str(asset), quote['total_debit']))}",
+                f"Blockchain fee: {html.escape(_crypto_quote_text(str(asset), quote['network_fee_amount']))}",
+                f"Total debit: {html.escape(_crypto_quote_text(str(asset), quote['total_debit']))}",
                 "",
                 "Is this address correct?",
             ],

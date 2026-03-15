@@ -224,6 +224,8 @@ def init_db(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE withdrawals ADD COLUMN tx_metadata_json TEXT")
     if "platform_fee_amount" not in withdrawal_cols:
         conn.execute("ALTER TABLE withdrawals ADD COLUMN platform_fee_amount TEXT NOT NULL DEFAULT '0'")
+    if "network_fee_amount" not in withdrawal_cols:
+        conn.execute("ALTER TABLE withdrawals ADD COLUMN network_fee_amount TEXT NOT NULL DEFAULT '0'")
 
     table_sql_row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='withdrawals'").fetchone()
     table_sql = str(table_sql_row["sql"] or "") if table_sql_row else ""
@@ -236,6 +238,7 @@ def init_db(conn: sqlite3.Connection) -> None:
               asset TEXT NOT NULL CHECK(asset IN ('BTC','LTC','ETH','USDT','SOL')),
               amount TEXT NOT NULL,
               platform_fee_amount TEXT NOT NULL DEFAULT '0',
+              network_fee_amount TEXT NOT NULL DEFAULT '0',
               destination_address TEXT NOT NULL,
               status TEXT NOT NULL CHECK(status IN ('pending','submitted','broadcasted','confirmed','failed','signer_retry')),
               txid TEXT,
@@ -255,8 +258,8 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
         conn.execute(
             """
-            INSERT INTO withdrawals_new(id,user_id,asset,amount,platform_fee_amount,destination_address,status,txid,failure_reason,provider_origin,provider_ref,idempotency_key,external_status,submitted_at,broadcasted_at,last_reconciled_at,tx_metadata_json,created_at)
-            SELECT id,user_id,asset,amount,COALESCE(platform_fee_amount,'0'),destination_address,
+            INSERT INTO withdrawals_new(id,user_id,asset,amount,platform_fee_amount,network_fee_amount,destination_address,status,txid,failure_reason,provider_origin,provider_ref,idempotency_key,external_status,submitted_at,broadcasted_at,last_reconciled_at,tx_metadata_json,created_at)
+            SELECT id,user_id,asset,amount,COALESCE(platform_fee_amount,'0'),COALESCE(network_fee_amount,'0'),destination_address,
                    CASE WHEN status='pending' THEN 'pending'
                         WHEN status='broadcasted' THEN 'broadcasted'
                         WHEN status='failed' THEN 'failed'

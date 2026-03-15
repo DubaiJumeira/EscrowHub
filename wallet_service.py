@@ -133,9 +133,23 @@ class WalletService:
             fee = Decimal("0")
         return fee
 
+    def withdrawal_network_fee(self, asset: str) -> Decimal:
+        symbol = self._asset(asset)
+        mapping = {
+            "BTC": Settings.withdrawal_network_fee_btc,
+            "LTC": Settings.withdrawal_network_fee_ltc,
+            "ETH": Settings.withdrawal_network_fee_eth,
+            "USDT": Settings.withdrawal_network_fee_usdt,
+            "SOL": Settings.withdrawal_network_fee_sol,
+        }
+        raw = Decimal(str(mapping.get(symbol, "0") or "0"))
+        if raw < Decimal("0"):
+            raw = Decimal("0")
+        return self._quantize_asset(symbol, raw)
+
     def withdrawal_total_debit(self, asset: str, amount: Decimal) -> Decimal:
         symbol = self._asset(asset)
-        return self._quantize_asset(symbol, Decimal(amount) + self.withdrawal_platform_fee(symbol, amount))
+        return self._quantize_asset(symbol, Decimal(amount) + self.withdrawal_platform_fee(symbol, amount) + self.withdrawal_network_fee(symbol))
 
     def _withdrawal_fee_booked(self, withdrawal_id: int) -> bool:
         row = self.conn.execute(
@@ -157,6 +171,27 @@ class WalletService:
         if fee <= Decimal("0"):
             return
         self.ledger.add_entry("PLATFORM_REVENUE", None, None, row["asset"], fee, "WITHDRAWAL_PLATFORM_FEE", "withdrawal", int(withdrawal_id))
+
+    def _withdrawal_network_fee_booked(self, withdrawal_id: int) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM ledger_entries WHERE account_type='PLATFORM_REVENUE' AND ref_type='withdrawal' AND ref_id=? AND entry_type='WITHDRAWAL_NETWORK_FEE' LIMIT 1",
+            (int(withdrawal_id),),
+        ).fetchone()
+        return bool(row)
+
+    def _book_withdrawal_network_fee_if_needed(self, withdrawal_id: int) -> None:
+        if self._withdrawal_network_fee_booked(withdrawal_id):
+            return
+        row = self.conn.execute(
+            "SELECT asset, network_fee_amount FROM withdrawals WHERE id=?",
+            (int(withdrawal_id),),
+        ).fetchone()
+        if not row:
+            return
+        fee = Decimal(str(row["network_fee_amount"] if "network_fee_amount" in row.keys() else None or "0"))
+        if fee <= Decimal("0"):
+            return
+        self.ledger.add_entry("PLATFORM_REVENUE", None, None, row["asset"], fee, "WITHDRAWAL_NETWORK_FEE", "withdrawal", int(withdrawal_id))
 
     def _ensure_user_row(self, user_ref: int) -> int:
         by_id = self.conn.execute("SELECT id FROM users WHERE id=?", (user_ref,)).fetchone()
@@ -821,14 +856,15 @@ class WalletService:
                 raise ValueError("daily withdrawal limit exceeded")
 
             fee_amount = self.withdrawal_platform_fee(symbol, amt)
+            network_fee_amount = self.withdrawal_network_fee(symbol)
             total_debit = self.withdrawal_total_debit(symbol, amt)
             if self.ledger.available_balance(resolved_user_id, symbol) < total_debit:
-                raise ValueError(f"insufficient available balance including the {Settings.withdrawal_platform_fee_percent}% withdrawal fee")
+                raise ValueError(f"insufficient available balance including the {Settings.withdrawal_platform_fee_percent}% withdrawal fee and blockchain fee")
             encrypted_destination = self._encrypt_field(destination_address)
 
             cur = self.conn.execute(
-                "INSERT INTO withdrawals(user_id,asset,amount,platform_fee_amount,destination_address,status,idempotency_key) VALUES(?,?,?,?,?,?,?)",
-                (resolved_user_id, symbol, str(amt), str(fee_amount), encrypted_destination, "pending", ""),
+                "INSERT INTO withdrawals(user_id,asset,amount,platform_fee_amount,network_fee_amount,destination_address,status,idempotency_key) VALUES(?,?,?,?,?,?,?,?)",
+                (resolved_user_id, symbol, str(amt), str(fee_amount), str(network_fee_amount), encrypted_destination, "pending", ""),
             )
             wid = int(cur.lastrowid)
             # Bind a deterministic row-specific idempotency key once the row ID exists.
@@ -842,7 +878,7 @@ class WalletService:
                 self.conn.commit()
             else:
                 self.conn.execute("RELEASE SAVEPOINT withdrawal_request")
-            return {"id": wid, "asset": symbol, "amount": amt, "platform_fee_amount": fee_amount, "total_debit": total_debit, "destination_address": destination_address}
+            return {"id": wid, "asset": symbol, "amount": amt, "platform_fee_amount": fee_amount, "network_fee_amount": network_fee_amount, "total_debit": total_debit, "destination_address": destination_address}
         except Exception:
             if managed_tx:
                 self.conn.rollback()
@@ -992,6 +1028,8 @@ class WalletService:
 
     def mark_withdrawal_broadcasted(self, withdrawal_id: int, txid: str, provider_ref: str | None = None, external_status: str | None = None, broadcasted_at: str | None = None) -> None:
         self._book_withdrawal_platform_fee_if_needed(int(withdrawal_id))
+        self._book_withdrawal_network_fee_if_needed(int(withdrawal_id))
+        self._book_withdrawal_network_fee_if_needed(int(withdrawal_id))
         self.conn.execute(
             "UPDATE withdrawals SET status='broadcasted', txid=?, provider_ref=COALESCE(provider_ref,?), external_status=COALESCE(?, external_status), broadcasted_at=COALESCE(?,broadcasted_at,CURRENT_TIMESTAMP), last_reconciled_at=NULL WHERE id=?",
             (txid, provider_ref, (external_status or 'broadcasted')[:64], broadcasted_at, withdrawal_id),
@@ -1030,7 +1068,7 @@ class WalletService:
             "UPDATE withdrawals SET status=?, txid=NULL, external_status='failed', failure_reason=? WHERE id=?",
             ("failed", sanitize_runtime_error(reason, max_len=220), withdrawal_id),
         )
-        release_total = Decimal(str(row["amount"] or "0")) + Decimal(str(row["platform_fee_amount"] if "platform_fee_amount" in row.keys() else None or "0"))
+        release_total = Decimal(str(row["amount"] or "0")) + Decimal(str(row["platform_fee_amount"] if "platform_fee_amount" in row.keys() else None or "0")) + Decimal(str(row["network_fee_amount"] if "network_fee_amount" in row.keys() else None or "0"))
         self.ledger.add_entry("USER", row["user_id"], row["user_id"], row["asset"], release_total, "WITHDRAWAL_RELEASE", "withdrawal", withdrawal_id)
 
     def persist_withdrawal_idempotency(self, withdrawal_id: int, idempotency_key: str) -> None:

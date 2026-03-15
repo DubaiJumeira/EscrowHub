@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS withdrawals (
   asset TEXT NOT NULL CHECK(asset IN ('BTC','LTC','ETH','USDT','SOL')),
   amount TEXT NOT NULL,
   platform_fee_amount TEXT NOT NULL DEFAULT '0',
+  network_fee_amount TEXT NOT NULL DEFAULT '0',
   destination_address TEXT NOT NULL,
   status TEXT NOT NULL CHECK(status IN ('pending','submitted','broadcasted','confirmed','failed','signer_retry')),
   txid TEXT,
