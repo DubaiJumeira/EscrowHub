@@ -1259,7 +1259,7 @@ async def withdraw_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     f"Minimum withdrawal: ${html.escape(_usd_text(Settings.withdrawal_minimum_usd or '10'))} USD equivalent on every supported asset.",
                     "",
                     f"Supported withdrawal networks: {btc_icon} Bitcoin, {eth_icon} Ethereum, {usdt_icon} Ethereum (ERC-20), {ltc_icon} Litecoin.",
-                    "Users also pay the 1% withdrawal fee. Blockchain fee policy must be enforced by the withdrawal provider.",
+                    "Users also pay the 1% withdrawal fee and the configured blockchain fee estimate. If the provider reports an actual blockchain fee, the difference is settled automatically.",
                     "",
                     "Please deposit funds to your account before attempting a withdrawal.",
                 ],

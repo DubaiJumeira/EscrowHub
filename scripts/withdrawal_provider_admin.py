@@ -16,6 +16,7 @@ def main() -> None:
     parser.add_argument("--message", help="operator message")
     parser.add_argument("--external-status", help="external status label")
     parser.add_argument("--metadata-json", help="optional metadata JSON object")
+    parser.add_argument("--actual-network-fee", help="actual blockchain fee amount charged on-chain in the withdrawal asset")
     parser.add_argument("--filter-status", help="list only one status")
     parser.add_argument("--limit", type=int, default=20, help="row limit")
     parser.add_argument("--db-path", default=os.getenv("WITHDRAWAL_PROVIDER_DB_PATH", "/var/lib/escrowhub-withdrawal-provider/provider.db"))
@@ -38,6 +39,7 @@ def main() -> None:
                         "message": row.message,
                         "submitted_at": row.submitted_at,
                         "broadcasted_at": row.broadcasted_at,
+                        "metadata": row.metadata,
                     },
                     sort_keys=True,
                 )
@@ -51,6 +53,10 @@ def main() -> None:
         metadata = json.loads(args.metadata_json)
         if not isinstance(metadata, dict):
             raise SystemExit("--metadata-json must decode to an object")
+    if args.actual_network_fee is not None:
+        if metadata is None:
+            metadata = {}
+        metadata["actual_network_fee_amount"] = str(args.actual_network_fee)
     try:
         row = store.update_status(
             args.provider_ref,

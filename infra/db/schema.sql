@@ -57,6 +57,8 @@ CREATE TABLE IF NOT EXISTS withdrawals (
   amount TEXT NOT NULL,
   platform_fee_amount TEXT NOT NULL DEFAULT '0',
   network_fee_amount TEXT NOT NULL DEFAULT '0',
+  network_fee_actual_amount TEXT,
+  network_fee_settled_at TEXT,
   destination_address TEXT NOT NULL,
   status TEXT NOT NULL CHECK(status IN ('pending','submitted','broadcasted','confirmed','failed','signer_retry')),
   txid TEXT,

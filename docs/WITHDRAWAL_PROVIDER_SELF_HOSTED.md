@@ -31,7 +31,8 @@ The DB contains the queued withdrawal request, lifecycle status, and an audit lo
 3. Operator reviews queued withdrawals:
    `python3 scripts/withdrawal_provider_admin.py list --filter-status submitted`
 4. Operator executes the payout externally and marks it broadcasted:
-   `python3 scripts/withdrawal_provider_admin.py set-status --provider-ref <ref> --status broadcasted --txid <txid>`
+   `python3 scripts/withdrawal_provider_admin.py set-status --provider-ref <ref> --status broadcasted --txid <txid> --actual-network-fee <fee>`
+5. If the actual on-chain fee differs from the estimate reserved by EscrowHub, include `--actual-network-fee`; EscrowHub will settle the delta automatically on reconcile/confirmation.
 5. Signer reconcile loop calls `POST /v1/withdrawals/reconcile`
 6. Provider returns the stored state so EscrowHub advances the withdrawal row
 7. After finality, operator marks it confirmed:

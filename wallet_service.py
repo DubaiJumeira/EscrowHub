@@ -172,26 +172,56 @@ class WalletService:
             return
         self.ledger.add_entry("PLATFORM_REVENUE", None, None, row["asset"], fee, "WITHDRAWAL_PLATFORM_FEE", "withdrawal", int(withdrawal_id))
 
-    def _withdrawal_network_fee_booked(self, withdrawal_id: int) -> bool:
-        row = self.conn.execute(
-            "SELECT 1 FROM ledger_entries WHERE account_type='PLATFORM_REVENUE' AND ref_type='withdrawal' AND ref_id=? AND entry_type='WITHDRAWAL_NETWORK_FEE' LIMIT 1",
-            (int(withdrawal_id),),
-        ).fetchone()
-        return bool(row)
+    def _provider_actual_network_fee(self, asset: str, metadata: dict | None) -> Decimal | None:
+        if not isinstance(metadata, dict):
+            return None
+        fee_asset = str(metadata.get("network_fee_asset") or metadata.get("actual_network_fee_asset") or asset).upper().strip()
+        if fee_asset and fee_asset != self._asset(asset):
+            raise RuntimeError("provider actual network fee asset mismatch")
+        for key in ("actual_network_fee_amount", "network_fee_actual_amount", "actual_network_fee"):
+            value = metadata.get(key)
+            if value in {None, ""}:
+                continue
+            try:
+                raw = Decimal(str(value))
+            except Exception as exc:
+                raise RuntimeError("provider actual network fee must be decimal") from exc
+            if raw < Decimal("0"):
+                raise RuntimeError("provider actual network fee must be non-negative")
+            return self._quantize_asset(asset, raw)
+        return None
 
-    def _book_withdrawal_network_fee_if_needed(self, withdrawal_id: int) -> None:
-        if self._withdrawal_network_fee_booked(withdrawal_id):
-            return
+    def _settle_withdrawal_network_fee_if_needed(self, withdrawal_id: int, *, force: bool = False) -> None:
         row = self.conn.execute(
-            "SELECT asset, network_fee_amount FROM withdrawals WHERE id=?",
+            "SELECT user_id, asset, network_fee_amount, network_fee_actual_amount, network_fee_settled_at FROM withdrawals WHERE id=?",
             (int(withdrawal_id),),
         ).fetchone()
         if not row:
             return
-        fee = Decimal(str(row["network_fee_amount"] if "network_fee_amount" in row.keys() else None or "0"))
-        if fee <= Decimal("0"):
+        if row["network_fee_settled_at"] and not force:
             return
-        self.ledger.add_entry("PLATFORM_REVENUE", None, None, row["asset"], fee, "WITHDRAWAL_NETWORK_FEE", "withdrawal", int(withdrawal_id))
+        estimate = self._quantize_asset(row["asset"], Decimal(str(row["network_fee_amount"] or "0")))
+        actual_raw = row["network_fee_actual_amount"]
+        if actual_raw in {None, ""} and not force:
+            return
+        actual = self._quantize_asset(row["asset"], Decimal(str(actual_raw if actual_raw not in {None, ""} else estimate)))
+        delta = self._quantize_asset(row["asset"], actual - estimate)
+        existing = self.conn.execute(
+            "SELECT amount, entry_type FROM ledger_entries WHERE ref_type='withdrawal' AND ref_id=? AND entry_type IN ('WITHDRAWAL_NETWORK_FEE','WITHDRAWAL_NETWORK_FEE_REFUND','WITHDRAWAL_NETWORK_FEE_ADJUSTMENT')",
+            (int(withdrawal_id),),
+        ).fetchall()
+        if existing:
+            return
+        if actual > Decimal("0"):
+            self.ledger.add_entry("PLATFORM_REVENUE", None, None, row["asset"], actual, "WITHDRAWAL_NETWORK_FEE", "withdrawal", int(withdrawal_id))
+        if delta < Decimal("0"):
+            self.ledger.add_entry("USER", row["user_id"], row["user_id"], row["asset"], -delta, "WITHDRAWAL_NETWORK_FEE_REFUND", "withdrawal", int(withdrawal_id))
+        elif delta > Decimal("0"):
+            self.ledger.add_entry("USER", row["user_id"], row["user_id"], row["asset"], -delta, "WITHDRAWAL_NETWORK_FEE_ADJUSTMENT", "withdrawal", int(withdrawal_id))
+        self.conn.execute(
+            "UPDATE withdrawals SET network_fee_settled_at=CURRENT_TIMESTAMP WHERE id=?",
+            (int(withdrawal_id),),
+        )
 
     def _ensure_user_row(self, user_ref: int) -> int:
         by_id = self.conn.execute("SELECT id FROM users WHERE id=?", (user_ref,)).fetchone()
@@ -1028,12 +1058,13 @@ class WalletService:
 
     def mark_withdrawal_broadcasted(self, withdrawal_id: int, txid: str, provider_ref: str | None = None, external_status: str | None = None, broadcasted_at: str | None = None) -> None:
         self._book_withdrawal_platform_fee_if_needed(int(withdrawal_id))
-        self._book_withdrawal_network_fee_if_needed(int(withdrawal_id))
-        self._book_withdrawal_network_fee_if_needed(int(withdrawal_id))
         self.conn.execute(
             "UPDATE withdrawals SET status='broadcasted', txid=?, provider_ref=COALESCE(provider_ref,?), external_status=COALESCE(?, external_status), broadcasted_at=COALESCE(?,broadcasted_at,CURRENT_TIMESTAMP), last_reconciled_at=NULL WHERE id=?",
             (txid, provider_ref, (external_status or 'broadcasted')[:64], broadcasted_at, withdrawal_id),
         )
+        row = self.conn.execute("SELECT network_fee_actual_amount FROM withdrawals WHERE id=?", (int(withdrawal_id),)).fetchone()
+        if row and row["network_fee_actual_amount"] not in {None, ""}:
+            self._settle_withdrawal_network_fee_if_needed(int(withdrawal_id))
 
     def mark_withdrawal_submitted(self, withdrawal_id: int, provider_ref: str | None, external_status: str | None, submitted_at: str | None) -> None:
         self.conn.execute(
@@ -1047,6 +1078,7 @@ class WalletService:
             "UPDATE withdrawals SET status='confirmed', txid=?, provider_ref=COALESCE(provider_ref,?), external_status=?, broadcasted_at=COALESCE(broadcasted_at,CURRENT_TIMESTAMP), last_reconciled_at=CURRENT_TIMESTAMP WHERE id=?",
             (txid, provider_ref, (external_status or "confirmed")[:64], int(withdrawal_id)),
         )
+        self._settle_withdrawal_network_fee_if_needed(int(withdrawal_id), force=True)
 
     def mark_withdrawal_reconciled(self, withdrawal_id: int) -> None:
         self.conn.execute("UPDATE withdrawals SET last_reconciled_at=CURRENT_TIMESTAMP WHERE id=?", (int(withdrawal_id),))
@@ -1101,6 +1133,7 @@ class WalletService:
             raise RuntimeError("provider asset mismatch")
         metadata = getattr(result, "metadata", None)
         metadata_json = None
+        actual_network_fee = None
         if metadata is not None:
             if not isinstance(metadata, dict):
                 # WARNING: malformed provider metadata is rejected to fail closed and avoid persisting untrusted payloads.
@@ -1110,13 +1143,14 @@ class WalletService:
                 # WARNING: oversized provider metadata is rejected to avoid database/log payload abuse.
                 raise RuntimeError("provider metadata too large")
             metadata_json = metadata_json_candidate
+            actual_network_fee = self._provider_actual_network_fee(str(row["asset"]), metadata)
         status = str(getattr(result, "status", "") or "").strip().lower()
         txid = str(getattr(result, "txid", "") or "").strip() or None
         if status in {"broadcasted", "confirmed"} and not self._txid_sane_for_asset(str(row["asset"]), txid):
             # WARNING: malformed txid is rejected and retried to avoid persisting forged or unusable on-chain references.
             raise RuntimeError("malformed txid for on-chain status")
         self.conn.execute(
-            "UPDATE withdrawals SET provider_origin=COALESCE(provider_origin, ?), provider_ref=COALESCE(provider_ref, NULLIF(?,'')), idempotency_key=COALESCE(NULLIF(idempotency_key,''), ?), external_status=?, submitted_at=COALESCE(submitted_at, ?), broadcasted_at=COALESCE(broadcasted_at, ?), tx_metadata_json=COALESCE(?, tx_metadata_json) WHERE id=?",
+            "UPDATE withdrawals SET provider_origin=COALESCE(provider_origin, ?), provider_ref=COALESCE(provider_ref, NULLIF(?,'')), idempotency_key=COALESCE(NULLIF(idempotency_key,''), ?), external_status=?, submitted_at=COALESCE(submitted_at, ?), broadcasted_at=COALESCE(broadcasted_at, ?), tx_metadata_json=COALESCE(?, tx_metadata_json), network_fee_actual_amount=COALESCE(?, network_fee_actual_amount) WHERE id=?",
             (
                 provider_origin,
                 new_ref,
@@ -1125,6 +1159,7 @@ class WalletService:
                 getattr(result, "submitted_at", None),
                 getattr(result, "broadcasted_at", None),
                 metadata_json,
+                str(actual_network_fee) if actual_network_fee is not None else None,
                 int(withdrawal_id),
             ),
         )
